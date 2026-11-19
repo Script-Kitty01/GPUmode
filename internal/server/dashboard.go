@@ -373,44 +373,6 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
 </section>
 
-<!-- 7-Step Causal Chain Breakdown -->
-<section class="card" style="margin-bottom:18px;">
-  <h2>
-    <span>The 7-Step CUDA-to-Economics Causal Chain</span>
-    <span class="badge badge-blue" id="reportMetaBadge">Hardware-Verified on sm_89</span>
-  </h2>
-  <div class="causal-grid">
-    <div class="q-card">
-      <div class="q-title">1. Why is the GPU underutilized?</div>
-      <div class="q-body" id="q1Text">--</div>
-    </div>
-    <div class="q-card">
-      <div class="q-title">2. Which operations are responsible?</div>
-      <div class="q-body" id="q2Text">--</div>
-    </div>
-    <div class="q-card">
-      <div class="q-title">3. What CUDA optimization helps?</div>
-      <div class="q-body" id="q3Text">--</div>
-    </div>
-    <div class="q-card safe">
-      <div class="q-title">4. Is that optimization numerically safe?</div>
-      <div class="q-body" id="q4Text">--</div>
-    </div>
-    <div class="q-card">
-      <div class="q-title">5. How much energy does it save?</div>
-      <div class="q-body" id="q5Text">--</div>
-    </div>
-    <div class="q-card">
-      <div class="q-title">6. Can fewer/cheaper GPUs serve the workload?</div>
-      <div class="q-body" id="q6Text">--</div>
-    </div>
-    <div class="q-card money">
-      <div class="q-title">7. How much money does the business save monthly?</div>
-      <div class="q-body" id="q7Text">--</div>
-    </div>
-  </div>
-</section>
-
 <!-- Visual Roofline Model & Pareto Frontier Plots -->
 <section class="charts-grid">
   <div class="card">
@@ -706,16 +668,6 @@ function renderReport(rep) {
     "$" + fmtNum(ec.annualSavingsUsd, 0) + "/yr • " +
     fmtNum(ec.monthlyKwhSaved, 1) + " kWh & " +
     fmtNum(ec.monthlyCarbonSavedKgCo2e, 1) + " kg CO2e saved";
-
-  // 7 Questions
-  const sa = rep.sevenAnswers || {};
-  document.getElementById("q1Text").textContent = sa.q1WhyUnderutilized || "--";
-  document.getElementById("q2Text").textContent = sa.q2WhichOpsResponsible || "--";
-  document.getElementById("q3Text").textContent = sa.q3WhatOptimizationHelps || "--";
-  document.getElementById("q4Text").textContent = sa.q4IsItNumericallySafe || "--";
-  document.getElementById("q5Text").textContent = sa.q5HowMuchEnergySaved || "--";
-  document.getElementById("q6Text").textContent = sa.q6CanCheaperGpuServe || "--";
-  document.getElementById("q7Text").textContent = sa.q7MonthlyMoneySaved || "--";
 
   document.getElementById("rooflineBadge").textContent = rep.baselineRoofline.classification;
   document.getElementById("tuningBadge").textContent =

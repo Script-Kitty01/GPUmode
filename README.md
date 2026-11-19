@@ -24,24 +24,31 @@ Every optimization and right-sizing run in **gpuMode** is evaluated against thre
 
 ---
 
-## The 7-Question CUDA-to-Economics Causal Chain
+## The 7-Step CUDA-to-Economics Causal Chain (`sm_89` Hardware-Verified Reference)
 
-For every workload, **gpuMode** generates a hardware-verified `CausalChainReport` answering:
+For every workload, **gpuMode** traces the full causal chain from low-level CUDA physics to monthly infrastructure and energy savings:
 
 1. **Why is the GPU underutilized?**
-   Uses the **Roofline Performance Model** ($\text{Arithmetic Intensity} = \text{FLOPs}/\text{Bytes}$ vs. the GPU's hardware ridge point) to classify bottlenecks as `MEMORY_BOUND`, `COMPUTE_BOUND`, or `LAUNCH_BOUND`.
+   - **Roofline Diagnosis:** Uses the **Roofline Performance Model** ($\text{Arithmetic Intensity} = \text{FLOPs}/\text{Bytes}$ vs. the GPU's hardware ridge point) to classify bottlenecks as `MEMORY_BOUND`, `COMPUTE_BOUND`, or `LAUNCH_BOUND`.
+   - *Verified `sm_89` Example:* `[MEMORY_BOUND] Operation has low Arithmetic Intensity (0.25 FLOPs/Byte vs GPU ridge point 54.8 FLOPs/Byte). Floating-point cores sit at 0.0% utilization waiting on DRAM memory transfers (4.3 GB/s achieved of 192.0 GB/s peak).`
 2. **Which operations are responsible?**
-   Attributes latency share, DRAM memory bandwidth consumption, kernel launch overhead, and peak activation VRAM across hotspot operators (`RMSNorm + Residual`, `SwiGLU`, `Online Softmax`, `LayerNorm`).
+   - **Operator Attribution:** Attributes latency share, DRAM memory bandwidth consumption, kernel launch overhead, and peak activation VRAM across hotspot operators (`RMSNorm + Residual`, `SwiGLU`, `Online Softmax`, `LayerNorm`).
+   - *Verified `sm_89` Example:* `Attention Softmax (3-Pass) accounts for 22.5% of memory-bound execution time, issuing multiple unfused kernel launches and transferring 4.3 GB/s across DRAM while keeping FP32 compute units at only 0.0% capacity.`
 3. **What CUDA optimization helps?**
-   Selects and tunes targeted CUDA C++ transformations: kernel fusion (eliminating intermediate global memory round-trips), 128-bit `float4` vectorized memory coalescing, and register-level `__shfl_xor_sync` warp reductions.
+   - **Targeted Kernel Transformation:** Selects and tunes kernel fusion (eliminating intermediate global memory round-trips), 128-bit `float4` vectorized memory coalescing, and register-level `__shfl_xor_sync` warp reductions.
+   - *Verified `sm_89` Example:* `Selected Online Softmax — Fused Scalar + Warp Shuffle (Block 128, VecWidth=float1, 40 registers/thread, 128 B shared mem), fusing intermediate memory round-trips into registers and using __shfl_xor_sync warp reductions to achieve a 2.25× measured speedup (4.880 ms → 2.168 ms).`
 4. **Is that optimization numerically safe?**
-   Gates every candidate kernel through `compute-sanitizer --tool memcheck`, standard batch numerical parity (`atol/rtol` vs. FP64 CPU reference), and odd unaligned edge-case dimensions (`hidden_dim = 1027`, non-divisible by 4).
+   - **Automated Verification Gate:** Gates every candidate kernel through `compute-sanitizer --tool memcheck`, standard batch numerical parity (`atol/rtol` vs. FP64 CPU reference), and odd unaligned edge-case dimensions (`hidden_dim = 1027`, non-divisible by 4).
+   - *Verified `sm_89` Example:* `VERIFIED SAFE: Passed compute-sanitizer memcheck (0 illegal accesses/races), standard batch numerical parity, and odd unaligned dimension (hidden_dim=1027) edge-case verification with max absolute error 2.00e-07 (< 1e-3 threshold).`
 5. **How much energy does it save?**
-   Integrates live GPU power sensors during execution to report board `Joules / 1K inferences`, PUE-adjusted server `kWh/month` saved, Energy-Delay Product ($\text{EDP}$) improvement, and grid carbon reduction ($\text{kg CO}_2\text{e/month}$).
+   - **Live Power Integration:** Integrates live GPU power sensors ($E = \int_{t_0}^{t_1} P(t)\,dt$) during execution to report board `Joules / 1K inferences`, PUE-adjusted server `kWh/month` saved, Energy-Delay Product ($\text{EDP}$) improvement, and grid carbon reduction ($\text{kg CO}_2\text{e/month}$).
+   - *Verified `sm_89` Example:* `Reduces GPU board energy by 69.7% (42.68 J → 12.95 J per 1K inferences at 6.0 W average board power), improves Energy-Delay Product (EDP) by 7.42×, and saves kWh/month (including PUE).`
 6. **Can fewer or cheaper GPUs now serve the workload?**
-   Combines **Multi-Objective Pareto Optimization**, **Digital Twin SKU Simulation**, and **Multi-Workload Bin-Packing** to determine whether throughput gains or VRAM activation savings unlock fewer instances or a cheaper hardware tier.
+   - **Pareto & Digital Twin Right-Sizing:** Combines **Multi-Objective Pareto Optimization**, **Digital Twin SKU Simulation**, and **Multi-Workload Bin-Packing** to determine whether throughput gains or VRAM activation savings unlock fewer instances or a cheaper hardware tier.
+   - *Verified `sm_89` Example:* `YES: Peak activation VRAM drops by 8 MiB (532 → 524 MiB) and single-GPU capacity rises from 205 to 461 req/s (737,644 → 1,660,670 Requests/GPU-hr). Recommended Digital Twin target: Optimized on 1× NVIDIA L4 24GB (CUDA Kernel Speedup (Fusion + float4)); Pareto Balanced winner: Online Softmax — Fused Scalar + Warp Shuffle (Block 128).`
 7. **How much money does the business save monthly?**
-   Quantifies monthly and annual savings (`$/month`, `$/year`) across GPU infrastructure and datacenter electricity under user-configurable tariffs and SLAs.
+   - **Unit & Fleet Economics:** Quantifies unit cost reduction (`$/1M inferences`) and monthly/annual savings (`$/month`, `$/year`) across GPU infrastructure and datacenter electricity under user-configurable tariffs and SLAs.
+   - *Verified `sm_89` Example:* `Cuts unit cost by 55.6% ($2.0443 → $0.9077 per 1M inferences) in combined GPU infrastructure and PUE-adjusted electricity costs.`
 
 ---
 
