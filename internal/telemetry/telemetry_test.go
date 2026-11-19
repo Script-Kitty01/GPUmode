@@ -258,4 +258,41 @@ func TestSimulateDVFSPolicies(t *testing.T) {
 	if eco.EstimatedPowerWatts >= sweetSpot.EstimatedPowerWatts {
 		t.Errorf("expected eco power (%v) < sweetSpot power (%v)", eco.EstimatedPowerWatts, sweetSpot.EstimatedPowerWatts)
 	}
+	if baseline.Provenance != "MEASURED" || sweetSpot.Provenance != "SIMULATED" {
+		t.Errorf("expected baseline=MEASURED and sweetSpot=SIMULATED provenance, got %q and %q", baseline.Provenance, sweetSpot.Provenance)
+	}
+}
+
+func TestAggregateWindowMeasurementsIdleSubtractionAndUncertainty(t *testing.T) {
+	w1 := EnergyMeasurement{
+		DurationSec:         1.0,
+		TotalEnergyJoules:   50.0,
+		AvgPowerWatts:       50.0,
+		JoulesPerRequest:    0.5,
+		JoulesPer1KRequests: 500.0,
+		SampleCount:         3,
+		Provenance:          "MEASURED",
+	}
+	w2 := EnergyMeasurement{
+		DurationSec:         1.0,
+		TotalEnergyJoules:   54.0,
+		AvgPowerWatts:       54.0,
+		JoulesPerRequest:    0.54,
+		JoulesPer1KRequests: 540.0,
+		SampleCount:         3,
+		Provenance:          "MEASURED",
+	}
+	agg := AggregateWindowMeasurements([]EnergyMeasurement{w1, w2}, 10.0, 2000.0, 50*time.Millisecond)
+	if agg.Provenance != "MEASURED" {
+		t.Errorf("expected MEASURED provenance, got %s", agg.Provenance)
+	}
+	if agg.RepeatWindows != 2 {
+		t.Errorf("expected RepeatWindows=2, got %d", agg.RepeatWindows)
+	}
+	if math.Abs(agg.IdlePowerWatts-10.0) > 1e-6 || math.Abs(agg.ActivePowerWatts-42.0) > 1e-6 {
+		t.Errorf("expected Idle=10W and Active=42W, got Idle=%.2f Active=%.2f", agg.IdlePowerWatts, agg.ActivePowerWatts)
+	}
+	if agg.EnergyUncertaintyPct <= 0 || agg.EnergyUncertaintyJoules <= 0 {
+		t.Errorf("expected positive energy uncertainty, got pct=%.2f J=%.2f", agg.EnergyUncertaintyPct, agg.EnergyUncertaintyJoules)
+	}
 }

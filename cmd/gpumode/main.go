@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"gpumode/internal/server"
 	"gpumode/internal/store"
 	"gpumode/internal/telemetry"
+	"gpumode/internal/workload"
 )
 
 func main() {
@@ -32,6 +34,11 @@ func main() {
 
 	fs := flag.NewFlagSet("gpumode", flag.ExitOnError)
 	addr := fs.String("addr", cfg.ListenAddr, "HTTP listen address for the local Web Dashboard")
+	gpuIndex := fs.Int("gpu", cfg.GPUIndex, "NVIDIA GPU device index to probe, benchmark, and monitor")
+	nvccPath := fs.String("nvcc", cfg.NVCCPath, "Path to NVIDIA nvcc compiler")
+	sanitizerPath := fs.String("sanitizer", cfg.SanitizerPath, "Path to NVIDIA compute-sanitizer")
+	nvidiaSMIPath := fs.String("nvidia-smi", cfg.NvidiaSMIPath, "Path to nvidia-smi")
+	presetsPath := fs.String("presets", cfg.PresetsPath, "Path to JSON file of Digital Twin reference GPU presets")
 	op := fs.String("op", "rmsnorm_residual", "Target operation (rmsnorm_residual, rmsnorm, layernorm, softmax, swiglu)")
 	strategy := fs.String("strategy", string(optimizer.StrategyBayesian), "Autotuning strategy (BAYESIAN_UCB or GRID_SEARCH)")
 	batch := fs.Int("batch", 256, "Batch x sequence token count")
@@ -43,10 +50,23 @@ func main() {
 	qps := fs.Float64("qps", cfg.Economics.TargetQPS, "Target workload traffic (requests/sec)")
 	sla := fs.Float64("sla", cfg.Economics.LatencySLAMS, "Latency p95 SLA in milliseconds")
 	pythonPath := fs.String("python", cfg.PythonPath, "Python interpreter for PyTorch profiler bridge")
+	proposerFlag := fs.String("proposer", "deterministic", "Kernel proposer engine (deterministic or deepseek)")
+	deepseekModel := fs.String("deepseek-model", cfg.DeepSeekModelPath, "Path to local GGUF model for -proposer=deepseek or auto-server")
+	llmURL := fs.String("llm-url", "http://127.0.0.1:8081", "OpenAI-compatible local inference server URL (llama-server or Ollama) for workload command")
+	llmModel := fs.String("llm-model", "", "Model name for workload benchmark requests (auto-discovered if empty)")
+	llmReqs := fs.Int("llm-reqs", 4, "Number of streaming inference requests for workload benchmark")
+	llmMaxTok := fs.Int("llm-tokens", 48, "Max tokens per request for workload benchmark")
+	autoServer := fs.Bool("auto-server", true, "Automatically launch temporary llama-server with -deepseek-model if -llm-url is not running")
 	jsonOut := fs.Bool("json", false, "Emit full CausalChainReport as JSON")
 	_ = fs.Parse(os.Args[1:])
 
 	cfg.ListenAddr = *addr
+	cfg.GPUIndex = *gpuIndex
+	cfg.NVCCPath = *nvccPath
+	cfg.SanitizerPath = *sanitizerPath
+	cfg.NvidiaSMIPath = *nvidiaSMIPath
+	cfg.PresetsPath = *presetsPath
+	cfg.DeepSeekModelPath = *deepseekModel
 	cfg.PythonPath = *pythonPath
 	cfg.Economics.GPUHourlyRateUSD = *gpuRate
 	cfg.Economics.ElectricityRateKWh = *kwhRate
@@ -57,16 +77,29 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	hw, err := physics.DetectHardware(ctx, cfg.NVCCPath, cfg.NvidiaSMIPath)
+	hw, err := physics.DetectHardwareForDevice(ctx, cfg.GPUIndex, cfg.NVCCPath, cfg.NvidiaSMIPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[gpumode] hardware probe notice: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[gpumode] CUDA hardware detection failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[gpumode] An NVIDIA GPU, nvidia-smi, and the CUDA toolkit (nvcc) are required.\n")
+		os.Exit(1)
+	}
+	if _, nvccErr := exec.LookPath(cfg.NVCCPath); nvccErr != nil {
+		fmt.Fprintf(os.Stderr, "[gpumode] nvcc not executable at %q (%v); pass -nvcc or set GPUMODE_NVCC\n", cfg.NVCCPath, nvccErr)
+		os.Exit(1)
 	}
 
-	mon := telemetry.NewMonitor(cfg.NvidiaSMIPath, cfg.TelemetryInterval, 300)
+	mon := telemetry.NewMonitorForGPU(cfg.NvidiaSMIPath, cfg.GPUIndex, cfg.TelemetryInterval, 300)
+	mon.SetHardwareDefaults(hw.MaxSMClockMHz, hw.TDPWatts)
 	mon.Start(ctx)
 
 	runner := harness.NewRunner(cfg.NVCCPath, cfg.SanitizerPath, hw.ArchFlag, cfg.CompileWorkers, cfg.KernelTimeout, mon)
+	runner.GPUIndex = cfg.GPUIndex
 	pipe := profiler.NewPipeline(hw, mon, runner, cfg.PythonPath, "scripts/profile_pytorch.py")
+	pipe.PresetsPath = cfg.PresetsPath
+	if *proposerFlag == "deepseek" || cmd == "deepseek" {
+		dsProposer := optimizer.NewLocalDeepSeekProposerForHardware("llama-cli", *deepseekModel, hw)
+		pipe.Autotuner = optimizer.NewAutotuner(dsProposer, runner)
+	}
 	st, err := store.NewStore(cfg.DataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[gpumode] failed to initialize data store: %v\n", err)
@@ -74,7 +107,7 @@ func main() {
 	}
 
 	switch cmd {
-	case "optimize", "analyze":
+	case "optimize", "analyze", "deepseek":
 		strat := optimizer.StrategyBayesian
 		if *strategy == string(optimizer.StrategyGrid) {
 			strat = optimizer.StrategyGrid
@@ -93,6 +126,30 @@ func main() {
 		s, _ := mon.PollOnce(ctx)
 		fmt.Printf("GPU: %s (%s) | Power: %.2f W | Clocks: %.0f / %.0f MHz | Temp: %.1f C | Util: %.0f%% SM / %.0f%% Mem | VRAM: %.0f / %.0f MiB\n",
 			hw.Name, hw.ArchFlag, s.PowerWatts, s.SMClockMHz, s.MemClockMHz, s.TemperatureC, s.GPUUtilPct, s.MemUtilPct, s.VRAMUsedMiB, s.VRAMTotalMiB)
+
+	case "workload":
+		wCfg := workload.DefaultBenchmarkConfig()
+		wCfg.ServerURL = *llmURL
+		wCfg.ModelName = *llmModel
+		wCfg.ModelPath = *deepseekModel
+		wCfg.AutoServer = *autoServer
+		wCfg.NumRequests = *llmReqs
+		wCfg.MaxTokens = *llmMaxTok
+
+		wCtx, wCancel := context.WithTimeout(ctx, 180*time.Second)
+		defer wCancel()
+		wRep, wErr := workload.RunInferenceBenchmark(wCtx, wCfg, mon, cfg.Economics)
+		if wErr != nil {
+			fmt.Fprintf(os.Stderr, "[gpumode] workload benchmark failed: %v\n", wErr)
+			os.Exit(1)
+		}
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(wRep)
+			return
+		}
+		printWorkloadReportCLI(wRep)
 
 	case "dashboard", "serve":
 		// Pre-warm an initial verified causal report if the store has none yet
@@ -119,10 +176,30 @@ func main() {
 		}
 
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|analyze|monitor] [flags]\n")
+		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|monitor] [flags]\n")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
+}
+
+func printWorkloadReportCLI(rep workload.WorkloadBenchmarkReport) {
+	fmt.Printf("================================================================================\n")
+	fmt.Printf(" gpuMode — Real Local LLM Workload Benchmark [%s]\n", rep.Provenance)
+	fmt.Printf("================================================================================\n")
+	fmt.Printf("  • Adapter             : %s\n", rep.Adapter)
+	fmt.Printf("  • Model / Endpoint    : %s @ %s\n", rep.ModelName, rep.ServerURL)
+	fmt.Printf("  • Requests / Tokens   : %d requests | %d output tokens in %.2fs\n",
+		rep.CompletedRequests, rep.TotalOutputTokens, rep.TotalDurationSec)
+	fmt.Printf("  • TTFT (p50 / p95)    : %.1f ms / %.1f ms\n", rep.MedianTTFTMS, rep.P95TTFTMS)
+	fmt.Printf("  • TPOT / Request p50  : %.2f ms/tok | %.1f ms/req\n", rep.MedianTPOTMS, rep.MedianLatencyMS)
+	fmt.Printf("  • Sustained Throughput: %.2f tokens/s (%.2f req/s)\n", rep.ThroughputTokensPerS, rep.ThroughputRPS)
+	fmt.Printf("  • Measured Peak VRAM  : %.0f MiB\n", rep.MeasuredPeakVRAMMiB)
+	fmt.Printf("  • Power & Energy      : %.1f W total (%.1f W active above %.1f W idle) | %.2f J/1K tokens [%s, %s conf, ±%.1f%%]\n",
+		rep.Energy.AvgPowerWatts, rep.Energy.ActivePowerWatts, rep.Energy.IdlePowerWatts,
+		rep.JoulesPer1KTokens, rep.Energy.Provenance, rep.Energy.MeasurementConfidence, rep.Energy.EnergyUncertaintyPct)
+	fmt.Printf("  • Production Cost     : $%.4f / 1M output tokens | $%.4f / 1M requests\n",
+		rep.CostPer1MTokensUSD, rep.Economics.CostPer1MInferencesUSD)
+	fmt.Printf("================================================================================\n")
 }
 
 func printCausalReportCLI(rep profiler.CausalChainReport) {

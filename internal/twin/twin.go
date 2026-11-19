@@ -28,6 +28,9 @@ type DigitalTwinScenario struct {
 	UnlockedByOptimization string  `json:"unlockedByOptimization"` // e.g. "CUDA Fusion + float4" or "VRAM Activation Reduction"
 	Decision               string  `json:"decision"`               // "RECOMMENDED", "VIABLE", "VRAM_EXCEEDED", "SLA_OR_QPS_INSUFFICIENT"
 	ConfidenceScorePct     float64 `json:"confidenceScorePct"`
+	Provenance             string  `json:"provenance"` // "MEASURED" (local GPU) or "SIMULATED" (cross-SKU Roofline projection)
+	CalibrationBasis       string  `json:"calibrationBasis"`
+	PriceAssumptionNote    string  `json:"priceAssumptionNote"`
 }
 
 // WorkloadItem represents an inference service or batch job to be co-located by the bin-packing scheduler.
@@ -75,16 +78,27 @@ type AutoscaleForecast struct {
 	HourlyCostDeltaUSD    float64 `json:"hourlyCostDeltaUsd"`
 }
 
-// SimulateDigitalTwin evaluates the optimized workload across the local hardware physics and reference tiers,
-// separating whether eligibility was unlocked by CUDA compute/bandwidth speedup vs VRAM activation reduction.
+// SimulateDigitalTwin evaluates the optimized workload across the local hardware physics and default reference tiers.
 func SimulateDigitalTwin(
 	localHW physics.GPUHardwareSpec,
 	baseMetrics, optMetrics physics.WorkloadMetrics,
 	memoryBoundFraction float64,
 	econ config.EconomicsConfig,
 ) []DigitalTwinScenario {
-	presets := physics.ReferenceHardwarePresets()
-	// Ensure first preset uses the live detected hardware spec
+	presets := physics.LoadReferenceHardwarePresets("", localHW)
+	return SimulateDigitalTwinWithPresets(localHW, presets, baseMetrics, optMetrics, memoryBoundFraction, econ)
+}
+
+// SimulateDigitalTwinWithPresets evaluates the optimized workload across the local hardware physics
+// and caller-provided reference tiers, separating whether eligibility was unlocked by CUDA
+// compute/bandwidth speedup vs VRAM activation reduction.
+func SimulateDigitalTwinWithPresets(
+	localHW physics.GPUHardwareSpec,
+	presets []physics.GPUHardwareSpec,
+	baseMetrics, optMetrics physics.WorkloadMetrics,
+	memoryBoundFraction float64,
+	econ config.EconomicsConfig,
+) []DigitalTwinScenario {
 	if len(presets) > 0 {
 		presets[0] = localHW
 		if presets[0].HourlyRateHintUSD <= 0 {
@@ -116,7 +130,10 @@ func SimulateDigitalTwin(
 		MonthlySavingsVsBase:   0,
 		UnlockedByOptimization: "None (Baseline)",
 		Decision:               "BASELINE",
-		ConfidenceScorePct:     99.0,
+		ConfidenceScorePct:     98.0,
+		Provenance:             "MEASURED",
+		CalibrationBasis:       fmt.Sprintf("Direct CUDA event timing & nvidia-smi probe on %s (%s)", localHW.Name, localHW.ArchFlag),
+		PriceAssumptionNote:    fmt.Sprintf("User-configured tariff ($%.2f/GPU-hr, $%.3f/kWh, PUE %.2f)", econ.GPUHourlyRateUSD, econ.ElectricityRateKWh, econ.DatacenterPUE),
 	})
 
 	mbFrac := math.Max(0.15, math.Min(0.95, memoryBoundFraction))
@@ -195,9 +212,16 @@ func SimulateDigitalTwin(
 			decision = "SLA_OR_QPS_INSUFFICIENT"
 		}
 
-		confidence := 94.0
+		confidence := 96.0
+		provenance := "MEASURED"
+		calibBasis := fmt.Sprintf("Direct hardware measurement on %s (%.0f GB/s BW, %.1f TFLOPS FP32)", spec.Name, spec.PeakMemBandwidthGBps, spec.PeakFP32TFLOPS)
+		priceNote := fmt.Sprintf("User-configured tariff ($%.2f/GPU-hr)", rate)
 		if idx > 0 {
-			confidence = 84.0 // Cross-SKU Roofline projection
+			provenance = "SIMULATED"
+			confidence = 78.0 // Unvalidated cross-SKU Roofline projection
+			calibBasis = fmt.Sprintf("Cross-SKU Roofline scaling (%.0f%% memory-BW ratio %.2fx + %.0f%% FP32 ratio %.2fx); requires target-GPU benchmark to validate",
+				mbFrac*100.0, bwRatio, cbFrac*100.0, fpRatio)
+			priceNote = fmt.Sprintf("Reference cloud on-demand SKU rate ($%.2f/GPU-hr) — compare apples-to-apples only against cloud deployment rates", rate)
 		}
 
 		sc := DigitalTwinScenario{
@@ -218,6 +242,9 @@ func SimulateDigitalTwin(
 			UnlockedByOptimization: unlockedBy,
 			Decision:               decision,
 			ConfidenceScorePct:     confidence,
+			Provenance:             provenance,
+			CalibrationBasis:       calibBasis,
+			PriceAssumptionNote:    priceNote,
 		}
 		scenarios = append(scenarios, sc)
 
@@ -238,7 +265,13 @@ func SimulateDigitalTwin(
 // subject to VRAM, compute, and bandwidth headroom constraints, minimizing J = αC + βE + γL.
 func ScheduleWorkloads(workloads []WorkloadItem, vramCapMiB float64, econ config.EconomicsConfig) SchedulePlan {
 	if vramCapMiB <= 0 {
-		vramCapMiB = 6141.0
+		return SchedulePlan{
+			SeparateGPUsBefore: len(workloads),
+			Bins:               nil,
+			OffPeakDeferralNotes: []string{
+				"No workload schedule calculated: live GPU VRAM capacity is unavailable.",
+			},
+		}
 	}
 	if len(workloads) == 0 {
 		workloads = DefaultWorkloadMix(vramCapMiB)

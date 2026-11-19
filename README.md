@@ -10,6 +10,15 @@ Observe → Diagnose (Roofline) → Optimize (CUDA + Bayesian) → Verify (Sanit
 
 Unlike standard GPU dashboards that merely report utilization percentages, **gpuMode** compiles, sanitizes, verifies, and benchmarks parameterized CUDA C++ kernels on physical NVIDIA hardware while integrating live GPU power draw $E = \int_{t_0}^{t_1} P(t)\,dt$ to answer seven causal engineering and financial questions.
 
+gpuMode is NVIDIA-CUDA dynamic:
+
+- It requires a live NVIDIA GPU, `nvidia-smi`, `nvcc`, and `compute-sanitizer`.
+- GPU name, compute capability, SM count, clocks, VRAM, bus width, L2 cache, FP32 ceiling, and memory bandwidth are detected at runtime.
+- It does not use a fabricated RTX 4050, `sm_89`, VRAM, power, or clock fallback.
+- The target GPU architecture is passed to `nvcc`; use `-gpu <index>` to select another NVIDIA GPU in a multi-GPU system.
+- CUDA binaries are resolved through CLI flags, `GPUMODE_*` environment variables, `PATH`, `CUDA_HOME`/`CUDA_PATH`, and standard install paths.
+- Reference GPU SKUs used in the Digital Twin remain clearly labeled as **SIMULATED** and can be overridden with `-presets <path>`.
+
 ---
 
 ## Headline Business & Systems KPIs
@@ -24,7 +33,7 @@ Every optimization and right-sizing run in **gpuMode** is evaluated against thre
 
 ---
 
-## The 7-Step CUDA-to-Economics Causal Chain (`sm_89` Hardware-Verified Reference)
+## The 7-Step CUDA-to-Economics Causal Chain (Live NVIDIA GPU Reference)
 
 For every workload, **gpuMode** traces the full causal chain from low-level CUDA physics to monthly infrastructure and energy savings:
 
@@ -67,7 +76,7 @@ For every workload, **gpuMode** traces the full causal chain from low-level CUDA
                                           ▼
                         4. CUDA & MEMORY OPTIMIZATION ENGINE
                            - Bottleneck-Driven Kernel Selector
-                           - Parameterized CUDA C++ Kernels (sm_89)
+                           - Parameterized CUDA C++ Kernels for the detected NVIDIA architecture
                            - Parallel nvcc Worker Pool + Serialized GPU Queue
                            - Grid Search + Bayesian Autotuner J(θ)=αT+βE+γM
                            - VRAM Activation & Fusion Memory Analyzer
@@ -78,7 +87,7 @@ For every workload, **gpuMode** traces the full causal chain from low-level CUDA
                            - nvcc + -Xptxas -v (Registers, Shared Mem, Spills)
                            - compute-sanitizer (memcheck)
                            - Multi-shape Edge-Case Numerical Parity (atol/rtol)
-                           - Interleaved CUDA Events + 32 MiB L2 Flush + Power Sync
+                           - Interleaved CUDA Events + Dynamic 2x L2-Cache Flush + Power Sync
                                           │
                                           ▼
                         6. MULTI-OBJECTIVE & DIGITAL TWIN ENGINE
@@ -111,6 +120,7 @@ gpuMode/
 │   ├── physics/
 │   │   ├── physics.go                 # Live CUDA cudaGetDeviceProperties + nvidia-smi hardware probe
 │   │   ├── economics.go               # $/1M inferences, Joules/1K, Requests/GPU-hr, and monthly ROI
+│   │   ├── presets.json               # Reference NVIDIA SKU presets for the Digital Twin
 │   │   └── physics_test.go
 │   ├── telemetry/
 │   │   ├── telemetry.go               # Concurrent ring-buffer, SSE pub/sub, E = ∫P(t)dt, & DVFS simulator
@@ -124,6 +134,7 @@ gpuMode/
 │   ├── optimizer/
 │   │   ├── catalog.go                 # Parameterized CUDA C++ kernels (RMSNorm, LayerNorm, Softmax, SwiGLU)
 │   │   ├── autotuner.go               # Gaussian-Surrogate Bayesian UCB & Grid Search autotuner
+│   │   ├── deepseek_local.go          # Optional hardware-aware local GGUF proposer
 │   │   ├── optimizer_test.go
 │   │   └── deepseek_fixture_test.go   # Pluggable KernelProposer verification with DeepSeek-9B fixture
 │   ├── pareto/
@@ -142,6 +153,8 @@ gpuMode/
 │       ├── server.go                  # REST API (/api/state, /api/optimize, /api/recompute) & SSE stream
 │       ├── dashboard.go               # Embedded zero-dependency interactive Web Dashboard
 │       └── server_test.go
+│   └── workload/
+│       └── workload.go                # Optional llama-server / Ollama streaming benchmark
 ├── scripts/
 │   └── profile_pytorch.py             # PyTorch operator profiler bridge with standalone fallback
 ├── run.sh                             # One-command build & launch script
@@ -174,6 +187,12 @@ You can also run specific modes directly via `./run.sh` or `./gpumode`:
 # Optimize other LLM hotspot operations (swiglu, softmax, layernorm, rmsnorm)
 ./run.sh optimize -op swiglu -strategy BAYESIAN_UCB
 
+# Run live optimization using your local DeepSeek-V4-9B GGUF model via llama-cli
+./run.sh deepseek -op rmsnorm_residual -batch 256 -hidden 4096 -iters 40 -qps 350
+
+# Benchmark real end-to-end streaming inference on your local DeepSeek-V4-9B / Ollama server (TTFT, TPOT, VRAM, J/1K tokens)
+./run.sh workload -llm-reqs 3 -llm-tokens 48
+
 # Print a live GPU hardware & power telemetry snapshot
 ./run.sh monitor
 
@@ -181,9 +200,75 @@ You can also run specific modes directly via `./run.sh` or `./gpumode`:
 ./run.sh test
 ```
 
+### Dynamic NVIDIA/CUDA Configuration
+
+The running GPU is detected from `nvidia-smi` and `cudaGetDeviceProperties`; no GPU-specific values are
+used as runtime fallbacks. If hardware probing fails, gpuMode exits instead of reporting fabricated
+hardware.
+
+```bash
+# Select a GPU and override CUDA tools
+./gpumode dashboard \
+  -gpu 0 \
+  -nvcc /path/to/nvcc \
+  -sanitizer /path/to/compute-sanitizer \
+  -nvidia-smi /usr/bin/nvidia-smi
+
+# Override common paths with environment variables
+GPUMODE_GPU_INDEX=0 \
+GPUMODE_NVCC=/path/to/nvcc \
+GPUMODE_SANITIZER=/path/to/compute-sanitizer \
+GPUMODE_NVIDIA_SMI=/usr/bin/nvidia-smi \
+./gpumode monitor
+```
+
+The following environment variables are supported:
+
+| Variable | Purpose |
+|---|---|
+| `GPUMODE_GPU_INDEX` | NVIDIA GPU index passed to CUDA and `nvidia-smi` |
+| `GPUMODE_NVCC` | `nvcc` executable override |
+| `GPUMODE_SANITIZER` | `compute-sanitizer` executable override |
+| `GPUMODE_NVIDIA_SMI` | `nvidia-smi` executable override |
+| `GPUMODE_PYTHON` | Python interpreter for PyTorch profiling |
+| `GPUMODE_PRESETS_PATH` | External Digital Twin GPU preset JSON |
+| `GPUMODE_MODEL_PATH` | GGUF model file override |
+| `GPUMODE_MODEL_DIR` | Directory containing a discoverable GGUF model |
+| `GPUMODE_NGL` | GPU layers passed to `llama-server`/`llama-cli` |
+| `GPUMODE_PASSES_PER_REQ` | Configurable layer passes used in kernel benchmark harnesses |
+
+### Optional End-to-End LLM Workload Benchmark
+
+The main gpuMode dashboard is available on port `8080`. The LLM benchmark is optional and expects a
+running OpenAI-compatible inference server or an Ollama server. It does not require a separate dashboard.
+
+When no server is running, gpuMode can start `llama-server` for a configured local GGUF model:
+
+```bash
+GPUMODE_MODEL_PATH=/path/to/model.gguf ./gpumode workload \
+  -llm-url http://127.0.0.1:8081 \
+  -llm-reqs 3 \
+  -llm-tokens 48
+```
+
+Or start the server separately:
+
+```bash
+llama-server -m /path/to/model.gguf -ngl 24 -c 1024 \
+  --host 127.0.0.1 --port 8081
+```
+
+The blue graph in the dashboard is a live power sparkline: the latest 60 `nvidia-smi` power samples
+display recent GPU power changes and idle/load transitions. It is separate from the cumulative trapezoidal
+Joules energy measurement and workload economics.
+
 ---
 
-## Example Verified Output (NVIDIA GeForce RTX 4050 Laptop GPU / `sm_89`)
+## Example Verified Output (on an NVIDIA GPU)
+
+The following values are a historical verification example from an RTX 4050 Laptop GPU. They are
+not defaults or runtime fallbacks: gpuMode reports the live GPU name and architecture detected on the
+current machine.
 
 ```text
 ================================================================================

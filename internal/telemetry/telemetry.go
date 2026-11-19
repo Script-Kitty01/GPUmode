@@ -32,21 +32,31 @@ type Sample struct {
 	VRAMTotalMiB float64   `json:"vramTotalMib"`
 }
 
-// EnergyMeasurement captures integrated energy and efficiency metrics over a workload execution window.
+// EnergyMeasurement captures integrated energy, idle-baseline subtraction, uncertainty, and provenance over execution windows.
 type EnergyMeasurement struct {
-	DurationSec          float64 `json:"durationSec"`
-	TotalEnergyJoules    float64 `json:"totalEnergyJoules"`
-	AvgPowerWatts        float64 `json:"avgPowerWatts"`
-	PeakPowerWatts       float64 `json:"peakPowerWatts"`
-	AvgSMClockMHz        float64 `json:"avgSmClockMhz"`
-	AvgMemClockMHz       float64 `json:"avgMemClockMhz"`
-	PeakTempC            float64 `json:"peakTempC"`
-	PeakVRAMMiB          float64 `json:"peakVramMib"`
-	JoulesPerRequest     float64 `json:"joulesPerRequest"`
-	JoulesPer1KRequests  float64 `json:"joulesPer1kRequests"`
-	EnergyDelayProduct   float64 `json:"energyDelayProduct"`
-	PerformancePerWatt   float64 `json:"performancePerWatt"`
-	SampleCount          int     `json:"sampleCount"`
+	DurationSec             float64 `json:"durationSec"`
+	TotalEnergyJoules       float64 `json:"totalEnergyJoules"`
+	AvgPowerWatts           float64 `json:"avgPowerWatts"`
+	IdlePowerWatts          float64 `json:"idlePowerWatts"`
+	ActivePowerWatts        float64 `json:"activePowerWatts"`
+	ActiveEnergyJoules      float64 `json:"activeEnergyJoules"`
+	ActiveJoulesPer1K       float64 `json:"activeJoulesPer1k"`
+	PeakPowerWatts          float64 `json:"peakPowerWatts"`
+	AvgSMClockMHz           float64 `json:"avgSmClockMhz"`
+	AvgMemClockMHz          float64 `json:"avgMemClockMhz"`
+	PeakTempC               float64 `json:"peakTempC"`
+	PeakVRAMMiB             float64 `json:"peakVramMib"`
+	JoulesPerRequest        float64 `json:"joulesPerRequest"`
+	JoulesPer1KRequests     float64 `json:"joulesPer1kRequests"`
+	EnergyDelayProduct      float64 `json:"energyDelayProduct"`
+	PerformancePerWatt      float64 `json:"performancePerWatt"`
+	SampleCount             int     `json:"sampleCount"`
+	RepeatWindows           int     `json:"repeatWindows"`
+	TotalKernelTimeMS       float64 `json:"totalKernelTimeMs"`
+	EnergyUncertaintyPct    float64 `json:"energyUncertaintyPct"`
+	EnergyUncertaintyJoules float64 `json:"energyUncertaintyJoules"`
+	MeasurementConfidence   string  `json:"measurementConfidence"` // "HIGH", "MEDIUM", "LOW"
+	Provenance              string  `json:"provenance"`            // "MEASURED", "INTERPOLATED", "ESTIMATED"
 }
 
 // DVFSCandidatePolicy represents a simulated Dynamic Voltage and Frequency Scaling (DVFS) operating point.
@@ -60,6 +70,7 @@ type DVFSCandidatePolicy struct {
 	PowerChangePct         float64 `json:"powerChangePct"`
 	ThroughputChangePct    float64 `json:"throughputChangePct"`
 	MeetsLatencySLA        bool    `json:"meetsLatencySla"`
+	Provenance             string  `json:"provenance"` // "MEASURED" or "SIMULATED"
 	Note                   string  `json:"note"`
 }
 
@@ -71,11 +82,15 @@ type SamplerFunc func(ctx context.Context) (Sample, error)
 type Monitor struct {
 	mu            sync.RWMutex
 	nvidiaSMIPath string
+	gpuIndex      int
 	interval      time.Duration
 	capacity      int
 	ring          []Sample
 	head          int
 	count         int
+
+	defaultMaxClockMHz float64
+	defaultPowerWatts  float64
 
 	subMu       sync.Mutex
 	nextSubID   int
@@ -84,10 +99,18 @@ type Monitor struct {
 	sampler SamplerFunc
 }
 
-// NewMonitor creates a new GPU telemetry monitor with a ring buffer of capacity items.
+// NewMonitor creates a new GPU telemetry monitor for GPU 0 with a ring buffer of capacity items.
 func NewMonitor(nvidiaSMIPath string, interval time.Duration, capacity int) *Monitor {
+	return NewMonitorForGPU(nvidiaSMIPath, 0, interval, capacity)
+}
+
+// NewMonitorForGPU creates a new GPU telemetry monitor targeting a specific NVIDIA GPU index.
+func NewMonitorForGPU(nvidiaSMIPath string, gpuIndex int, interval time.Duration, capacity int) *Monitor {
 	if strings.TrimSpace(nvidiaSMIPath) == "" {
 		nvidiaSMIPath = "nvidia-smi"
+	}
+	if gpuIndex < 0 {
+		gpuIndex = 0
 	}
 	if interval <= 0 {
 		interval = DefaultPollInterval
@@ -97,6 +120,7 @@ func NewMonitor(nvidiaSMIPath string, interval time.Duration, capacity int) *Mon
 	}
 	m := &Monitor{
 		nvidiaSMIPath: nvidiaSMIPath,
+		gpuIndex:      gpuIndex,
 		interval:      interval,
 		capacity:      capacity,
 		ring:          make([]Sample, capacity),
@@ -104,6 +128,15 @@ func NewMonitor(nvidiaSMIPath string, interval time.Duration, capacity int) *Mon
 	}
 	m.sampler = m.queryNvidiaSMI
 	return m
+}
+
+// SetHardwareDefaults configures the detected GPU's max SM clock and TDP/idle power
+// so DVFS simulation scales from actual hardware properties rather than fixed defaults.
+func (m *Monitor) SetHardwareDefaults(maxClockMHz, tdpWatts float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.defaultMaxClockMHz = maxClockMHz
+	m.defaultPowerWatts = tdpWatts
 }
 
 // SetSampler overrides the hardware polling function (useful for deterministic testing).
@@ -241,7 +274,7 @@ func (m *Monitor) History(limit int) []Sample {
 	return out
 }
 
-// queryNvidiaSMI runs nvidia-smi and parses the first GPU's CSV telemetry line.
+// queryNvidiaSMI runs nvidia-smi and parses the target GPU's CSV telemetry line.
 func (m *Monitor) queryNvidiaSMI(ctx context.Context) (Sample, error) {
 	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -249,13 +282,14 @@ func (m *Monitor) queryNvidiaSMI(ctx context.Context) (Sample, error) {
 	cmd := exec.CommandContext(
 		queryCtx,
 		m.nvidiaSMIPath,
+		"-i", strconv.Itoa(m.gpuIndex),
 		"--query-gpu="+nvidiaSMIQueryArgs,
 		"--format=csv,noheader,nounits",
 	)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return Sample{}, fmt.Errorf("nvidia-smi poll failed: %w", err)
+		return Sample{}, fmt.Errorf("nvidia-smi poll failed for GPU %d: %w", m.gpuIndex, err)
 	}
 	return ParseNvidiaSMICSVLine(out.String(), time.Now())
 }
@@ -313,17 +347,59 @@ func parseFlexibleFloat(s string) float64 {
 	return v
 }
 
+// Interval returns the configured polling interval.
+func (m *Monitor) Interval() time.Duration {
+	return m.interval
+}
+
+// MeasureIdleBaseline polls a few samples when idle (or uses recent low-utilization samples)
+// to establish an idle GPU board power baseline for active-power subtraction.
+func (m *Monitor) MeasureIdleBaseline(ctx context.Context, numPolls int) float64 {
+	if numPolls <= 0 {
+		numPolls = 2
+	}
+	var sum float64
+	var cnt int
+	for i := 0; i < numPolls; i++ {
+		if s, err := m.PollOnce(ctx); err == nil && s.PowerWatts > 0 {
+			sum += s.PowerWatts
+			cnt++
+		}
+		if i < numPolls-1 {
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(45 * time.Millisecond):
+			}
+		}
+	}
+	if cnt > 0 {
+		return sum / float64(cnt)
+	}
+	latest := m.Latest()
+	return latest.PowerWatts
+}
+
 // MeasureWindow computes integrated energy E = ∫ P(t) dt over [start, end] using trapezoidal integration,
 // along with average/peak clocks, temperature, VRAM, EDP, Joules/1K requests, and Perf/Watt.
 func (m *Monitor) MeasureWindow(start, end time.Time, completedRequests int, latencyMS float64) EnergyMeasurement {
 	all := m.History(0)
-	return IntegrateSamplesWindow(all, start, end, completedRequests, latencyMS)
+	em := IntegrateSamplesWindow(all, start, end, completedRequests, latencyMS)
+	if em.Provenance == "INTERPOLATED" && m.interval > 0 {
+		// Aliasing uncertainty grows when the measurement window is shorter than the polling period
+		winMS := end.Sub(start).Seconds() * 1000.0
+		pollMS := float64(m.interval.Milliseconds())
+		if pollMS > 0 && winMS < pollMS {
+			em.EnergyUncertaintyPct = math.Min(45.0, math.Round((12.0+25.0*(1.0-winMS/pollMS))*10.0)/10.0)
+			em.EnergyUncertaintyJoules = em.JoulesPer1KRequests * (em.EnergyUncertaintyPct / 100.0)
+		}
+	}
+	return em
 }
 
 // IntegrateSamplesWindow performs trapezoidal integration over a slice of chronological samples for [start, end].
 // If the window is shorter than the polling interval or contains fewer than 2 samples inside [start, end],
-// it interpolates/clamps boundary power from nearest surrounding or latest samples so microbenchmarks always
-// receive accurate AvgPowerWatts * DurationSec energy measurements.
+// it explicitly labels the measurement as INTERPOLATED with LOW/MEDIUM confidence rather than pretending it is a high-confidence direct measurement.
 func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedRequests int, latencyMS float64) EnergyMeasurement {
 	durationSec := end.Sub(start).Seconds()
 	if durationSec <= 0 {
@@ -339,7 +415,11 @@ func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedReq
 
 	if len(samples) == 0 {
 		return finalizeEnergyMeasurement(EnergyMeasurement{
-			DurationSec: durationSec,
+			DurationSec:           durationSec,
+			RepeatWindows:         1,
+			MeasurementConfidence: "LOW",
+			Provenance:            "ESTIMATED",
+			EnergyUncertaintyPct:  35.0,
 		}, completedRequests, latencyMS)
 	}
 
@@ -382,7 +462,6 @@ func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedReq
 	var peakTemp float64
 	var peakVRAM float64
 
-	// Track peaks across actual window samples (or boundary points if inWindow is empty).
 	statSamples := inWindow
 	if len(statSamples) == 0 {
 		statSamples = points
@@ -420,22 +499,170 @@ func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedReq
 	}
 
 	sampleCount := len(inWindow)
-	if sampleCount == 0 && len(samples) > 0 {
-		sampleCount = 1
+	provenance := "MEASURED"
+	confidence := "HIGH"
+	uncertaintyPct := 5.0
+	if sampleCount >= 2 {
+		provenance = "MEASURED"
+		if sampleCount >= 3 {
+			confidence = "HIGH"
+			uncertaintyPct = 5.0
+		} else {
+			confidence = "MEDIUM"
+			uncertaintyPct = 10.0
+		}
+	} else {
+		provenance = "INTERPOLATED"
+		confidence = "LOW"
+		uncertaintyPct = 22.0
+		if sampleCount == 0 && len(samples) > 0 {
+			sampleCount = 1
+		}
 	}
 
 	em := EnergyMeasurement{
-		DurationSec:       durationSec,
-		TotalEnergyJoules: totalEnergyJoules,
-		AvgPowerWatts:     avgPower,
-		PeakPowerWatts:    peakPower,
-		AvgSMClockMHz:     avgSMClock,
-		AvgMemClockMHz:    avgMemClock,
-		PeakTempC:         peakTemp,
-		PeakVRAMMiB:       peakVRAM,
-		SampleCount:       sampleCount,
+		DurationSec:           durationSec,
+		TotalEnergyJoules:     totalEnergyJoules,
+		AvgPowerWatts:         avgPower,
+		PeakPowerWatts:        peakPower,
+		AvgSMClockMHz:         avgSMClock,
+		AvgMemClockMHz:        avgMemClock,
+		PeakTempC:             peakTemp,
+		PeakVRAMMiB:           peakVRAM,
+		SampleCount:           sampleCount,
+		RepeatWindows:         1,
+		EnergyUncertaintyPct:  uncertaintyPct,
+		MeasurementConfidence: confidence,
+		Provenance:            provenance,
 	}
 	return finalizeEnergyMeasurement(em, completedRequests, latencyMS)
+}
+
+// AggregateWindowMeasurements combines repeated benchmark windows, subtracts idle baseline power,
+// and reports inter-window uncertainty and measurement confidence.
+func AggregateWindowMeasurements(
+	windows []EnergyMeasurement,
+	idlePowerW float64,
+	totalKernelTimeMS float64,
+	pollInterval time.Duration,
+) EnergyMeasurement {
+	if len(windows) == 0 {
+		return EnergyMeasurement{
+			IdlePowerWatts:        idlePowerW,
+			MeasurementConfidence: "LOW",
+			Provenance:            "ESTIMATED",
+		}
+	}
+
+	var sumPower, sumPeakPower, sumSM, sumMem, sumTemp, sumVRAM float64
+	var sumJ1K, sumJReq, sumEDP, sumPerfW, sumDur, sumTotJ float64
+	var totalSamples int
+	measuredCount := 0
+
+	for _, w := range windows {
+		sumPower += w.AvgPowerWatts
+		if w.PeakPowerWatts > sumPeakPower {
+			sumPeakPower = w.PeakPowerWatts
+		}
+		sumSM += w.AvgSMClockMHz
+		sumMem += w.AvgMemClockMHz
+		if w.PeakTempC > sumTemp {
+			sumTemp = w.PeakTempC
+		}
+		if w.PeakVRAMMiB > sumVRAM {
+			sumVRAM = w.PeakVRAMMiB
+		}
+		sumJ1K += w.JoulesPer1KRequests
+		sumJReq += w.JoulesPerRequest
+		sumEDP += w.EnergyDelayProduct
+		sumPerfW += w.PerformancePerWatt
+		sumDur += w.DurationSec
+		sumTotJ += w.TotalEnergyJoules
+		totalSamples += w.SampleCount
+		if w.Provenance == "MEASURED" {
+			measuredCount++
+		}
+	}
+
+	n := float64(len(windows))
+	meanPower := sumPower / n
+	meanJ1K := sumJ1K / n
+	meanJReq := sumJReq / n
+	meanDur := sumDur / n
+
+	// Inter-window sample standard deviation on Joules/1K
+	var varianceSum float64
+	for _, w := range windows {
+		diff := w.JoulesPer1KRequests - meanJ1K
+		varianceSum += diff * diff
+	}
+	cvPct := 0.0
+	if len(windows) > 1 && meanJ1K > 0 {
+		stddev := math.Sqrt(varianceSum / float64(len(windows)-1))
+		// 95% confidence half-width approximation (~2 * SE)
+		se := stddev / math.Sqrt(n)
+		cvPct = (1.96 * se / meanJ1K) * 100.0
+	}
+
+	// Aliasing uncertainty if CUDA kernel duration per window is shorter than nvidia-smi polling period
+	pollMS := float64(pollInterval.Milliseconds())
+	if pollMS <= 0 {
+		pollMS = 150.0
+	}
+	perWinKernelMS := totalKernelTimeMS / n
+	aliasingPct := 3.5
+	if perWinKernelMS > 0 && perWinKernelMS < pollMS {
+		aliasingPct = math.Min(30.0, 6.0+18.0*(1.0-perWinKernelMS/pollMS))
+	}
+	totalUncPct := math.Round(math.Sqrt(cvPct*cvPct+aliasingPct*aliasingPct)*10.0) / 10.0
+
+	activePower := math.Max(0, meanPower-idlePowerW)
+	activeRatio := 0.0
+	if meanPower > 0 {
+		activeRatio = activePower / meanPower
+	}
+	activeJ1K := meanJ1K * activeRatio
+	activeTotJ := sumTotJ * activeRatio
+
+	provenance := "INTERPOLATED"
+	if measuredCount == len(windows) || totalSamples >= 3 {
+		provenance = "MEASURED"
+	} else if totalSamples == 0 {
+		provenance = "ESTIMATED"
+	}
+
+	confidence := "LOW"
+	if totalSamples >= 4 && totalUncPct <= 15.0 {
+		confidence = "HIGH"
+	} else if totalSamples >= 2 && totalUncPct <= 25.0 {
+		confidence = "MEDIUM"
+	}
+
+	return EnergyMeasurement{
+		DurationSec:             meanDur,
+		TotalEnergyJoules:       sumTotJ / n,
+		AvgPowerWatts:           meanPower,
+		IdlePowerWatts:          idlePowerW,
+		ActivePowerWatts:        activePower,
+		ActiveEnergyJoules:      activeTotJ / n,
+		ActiveJoulesPer1K:       activeJ1K,
+		PeakPowerWatts:          sumPeakPower,
+		AvgSMClockMHz:           sumSM / n,
+		AvgMemClockMHz:          sumMem / n,
+		PeakTempC:               sumTemp,
+		PeakVRAMMiB:             sumVRAM,
+		JoulesPerRequest:        meanJReq,
+		JoulesPer1KRequests:     meanJ1K,
+		EnergyDelayProduct:      sumEDP / n,
+		PerformancePerWatt:      sumPerfW / n,
+		SampleCount:             totalSamples,
+		RepeatWindows:           len(windows),
+		TotalKernelTimeMS:       totalKernelTimeMS,
+		EnergyUncertaintyPct:    totalUncPct,
+		EnergyUncertaintyJoules: meanJ1K * (totalUncPct / 100.0),
+		MeasurementConfidence:   confidence,
+		Provenance:              provenance,
+	}
 }
 
 func interpolateBoundarySample(target time.Time, before *Sample, inWindow []Sample, after *Sample, all []Sample) Sample {
@@ -527,6 +754,17 @@ func finalizeEnergyMeasurement(em EnergyMeasurement, completedRequests int, late
 		rps := reqs / em.DurationSec
 		em.PerformancePerWatt = rps / em.AvgPowerWatts
 	}
+	if em.EnergyUncertaintyPct > 0 && em.EnergyUncertaintyJoules == 0 {
+		em.EnergyUncertaintyJoules = em.JoulesPer1KRequests * (em.EnergyUncertaintyPct / 100.0)
+	}
+	if em.IdlePowerWatts > 0 {
+		em.ActivePowerWatts = math.Max(0, em.AvgPowerWatts-em.IdlePowerWatts)
+		if em.AvgPowerWatts > 0 {
+			ratio := em.ActivePowerWatts / em.AvgPowerWatts
+			em.ActiveEnergyJoules = em.TotalEnergyJoules * ratio
+			em.ActiveJoulesPer1K = em.JoulesPer1KRequests * ratio
+		}
+	}
 	return em
 }
 
@@ -535,21 +773,37 @@ func finalizeEnergyMeasurement(em EnergyMeasurement, completedRequests int, late
 // sensitivity (memory-bound ops depend primarily on HBM/GDDR bandwidth rather than SM clock,
 // losing very little throughput when SM clock drops by 15-20% while saving 22-30% power).
 func (m *Monitor) SimulateDVFSPolicies(base EnergyMeasurement, baseLatencyMS float64, slaMS float64, memoryBoundFraction float64) []DVFSCandidatePolicy {
-	return ComputeDVFSPolicies(base, baseLatencyMS, slaMS, memoryBoundFraction)
+	m.mu.RLock()
+	defClock := m.defaultMaxClockMHz
+	defPower := m.defaultPowerWatts
+	m.mu.RUnlock()
+	return ComputeDVFSPoliciesWithDefaults(base, baseLatencyMS, slaMS, memoryBoundFraction, defClock, defPower)
 }
 
 // ComputeDVFSPolicies is a package-level helper for simulating DVFS power/clock policies.
 func ComputeDVFSPolicies(base EnergyMeasurement, baseLatencyMS float64, slaMS float64, memoryBoundFraction float64) []DVFSCandidatePolicy {
+	return ComputeDVFSPoliciesWithDefaults(base, baseLatencyMS, slaMS, memoryBoundFraction, 0, 0)
+}
+
+// ComputeDVFSPoliciesWithDefaults models DVFS operating points using detected GPU clock/power defaults when live averages are absent.
+func ComputeDVFSPoliciesWithDefaults(base EnergyMeasurement, baseLatencyMS float64, slaMS float64, memoryBoundFraction float64, defaultClockMHz, defaultPowerW float64) []DVFSCandidatePolicy {
 	memFrac := math.Max(0.0, math.Min(1.0, memoryBoundFraction))
 	computeFrac := 1.0 - memFrac
 
 	baseClock := base.AvgSMClockMHz
 	if baseClock <= 0 {
-		baseClock = 2355.0 // Typical Ada Lovelace RTX 4050 boost SM clock MHz
+		baseClock = defaultClockMHz
+	}
+	if baseClock <= 0 {
+		return nil
 	}
 	basePower := base.AvgPowerWatts
 	if basePower <= 0 {
-		basePower = 45.0
+		if defaultPowerW > 0 {
+			basePower = defaultPowerW * 0.65
+		} else {
+			return nil
+		}
 	}
 	if baseLatencyMS <= 0 {
 		baseLatencyMS = 1.0
@@ -618,6 +872,10 @@ func ComputeDVFSPolicies(base EnergyMeasurement, baseLatencyMS float64, slaMS fl
 		powerChangePct := ((estPower - basePower) / basePower) * 100.0
 		throughputChangePct := ((estRPS - baseRPS) / baseRPS) * 100.0
 
+		prov := "SIMULATED"
+		if sp.clockScale == 1.0 {
+			prov = "MEASURED"
+		}
 		out = append(out, DVFSCandidatePolicy{
 			PolicyName:             sp.name,
 			TargetSMClockMHz:       targetClock,
@@ -628,6 +886,7 @@ func ComputeDVFSPolicies(base EnergyMeasurement, baseLatencyMS float64, slaMS fl
 			PowerChangePct:         powerChangePct,
 			ThroughputChangePct:    throughputChangePct,
 			MeetsLatencySLA:        estLatencyMS <= slaMS,
+			Provenance:             prov,
 			Note:                   sp.note,
 		})
 	}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"time"
 
@@ -21,18 +22,25 @@ import (
 
 // HotspotOp represents an operation identified in a PyTorch/LLM inference profile.
 type HotspotOp struct {
-	Name      string  `json:"name"`
-	Category  string  `json:"category"`
-	SharePct  float64 `json:"sharePct"`
-	Launches  int     `json:"launches"`
+	Name              string  `json:"name"`
+	Category          string  `json:"category"`
+	SharePct          float64 `json:"sharePct"`
+	Launches          int     `json:"launches"`
+	MeasuredLatencyMS float64 `json:"measuredLatencyMs,omitempty"`
+	CUDAMemoryBytes   int64   `json:"cudaMemoryBytes,omitempty"`
+	InputShapes       [][]int `json:"inputShapes,omitempty"`
+	Provenance        string  `json:"provenance"` // "MEASURED" or "ESTIMATED"
 }
 
 // PyTorchTrace holds the operator breakdown from scripts/profile_pytorch.py.
 type PyTorchTrace struct {
 	TorchAvailable bool        `json:"torchAvailable"`
+	TorchVersion   string      `json:"torchVersion,omitempty"`
 	Device         string      `json:"device"`
 	BatchSize      int         `json:"batchSize"`
 	HiddenDim      int         `json:"hiddenDim"`
+	Provenance     string      `json:"provenance"` // "MEASURED" (torch.profiler) or "ESTIMATED"
+	SourceNote     string      `json:"sourceNote,omitempty"`
 	Hotspots       []HotspotOp `json:"hotspots"`
 }
 
@@ -74,12 +82,13 @@ type CausalChainReport struct {
 
 // Pipeline coordinates all 7 engines to produce a hardware-verified CausalChainReport.
 type Pipeline struct {
-	Hardware   physics.GPUHardwareSpec
-	Monitor    *telemetry.Monitor
-	Runner     *harness.Runner
-	Autotuner  *optimizer.Autotuner
-	PythonPath string
-	ScriptPath string
+	Hardware    physics.GPUHardwareSpec
+	Monitor     *telemetry.Monitor
+	Runner      *harness.Runner
+	Autotuner   *optimizer.Autotuner
+	PythonPath  string
+	ScriptPath  string
+	PresetsPath string
 }
 
 func NewPipeline(
@@ -89,7 +98,7 @@ func NewPipeline(
 	pythonPath, scriptPath string,
 ) *Pipeline {
 	if pythonPath == "" {
-		pythonPath = "python3"
+		pythonPath = config.ResolvePythonPath()
 	}
 	if scriptPath == "" {
 		scriptPath = "scripts/profile_pytorch.py"
@@ -98,7 +107,7 @@ func NewPipeline(
 		Hardware:   hw,
 		Monitor:    mon,
 		Runner:     runner,
-		Autotuner:  optimizer.NewAutotuner(optimizer.NewDeterministicProposer(), runner),
+		Autotuner:  optimizer.NewAutotuner(optimizer.NewDeterministicProposerForHardware(hw), runner),
 		PythonPath: pythonPath,
 		ScriptPath: scriptPath,
 	}
@@ -197,11 +206,13 @@ func (p *Pipeline) Execute(
 	if p.Monitor != nil {
 		dvfsPolicies = p.Monitor.SimulateDVFSPolicies(bestRes.Energy, bestRes.MedianLatencyMS, econ.LatencySLAMS, memBoundFrac)
 	} else {
-		tmpMon := telemetry.NewMonitor("nvidia-smi", 200*time.Millisecond, 30)
+		tmpMon := telemetry.NewMonitorForGPU(config.ResolveNvidiaSMIPath(), p.Hardware.GPUIndex, 200*time.Millisecond, 30)
+		tmpMon.SetHardwareDefaults(p.Hardware.MaxSMClockMHz, p.Hardware.TDPWatts)
 		dvfsPolicies = tmpMon.SimulateDVFSPolicies(bestRes.Energy, bestRes.MedianLatencyMS, econ.LatencySLAMS, memBoundFrac)
 	}
 
-	twinScenarios := twin.SimulateDigitalTwin(p.Hardware, baseMetrics, optMetrics, memBoundFrac, econ)
+	presets := physics.LoadReferenceHardwarePresets(p.PresetsPath, p.Hardware)
+	twinScenarios := twin.SimulateDigitalTwinWithPresets(p.Hardware, presets, baseMetrics, optMetrics, memBoundFrac, econ)
 	schedPlan := twin.ScheduleWorkloads(nil, p.Hardware.TotalVRAMMiB, econ)
 	autoscale := twin.ForecastAutoscaling(nil, optMetrics.ThroughputRPS, econ)
 
@@ -290,10 +301,20 @@ func RecomputeEconomics(rep CausalChainReport, econ config.EconomicsConfig) Caus
 }
 
 func (p *Pipeline) collectPyTorchTrace(ctx context.Context, batchSize, hiddenDim int) PyTorchTrace {
-	tCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(tCtx, p.PythonPath, p.ScriptPath)
+	cmd := exec.CommandContext(
+		tCtx,
+		p.PythonPath,
+		p.ScriptPath,
+		"--batch", fmt.Sprintf("%d", batchSize),
+		"--hidden", fmt.Sprintf("%d", hiddenDim),
+		"--iters", "10",
+	)
+	if os.Getenv("CUDA_VISIBLE_DEVICES") == "" && p.Hardware.GPUIndex >= 0 {
+		cmd.Env = append(os.Environ(), fmt.Sprintf("CUDA_VISIBLE_DEVICES=%d", p.Hardware.GPUIndex))
+	}
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err == nil {
@@ -301,6 +322,13 @@ func (p *Pipeline) collectPyTorchTrace(ctx context.Context, batchSize, hiddenDim
 		if json.Unmarshal(bytes.TrimSpace(out.Bytes()), &tr) == nil && len(tr.Hotspots) > 0 {
 			tr.BatchSize = batchSize
 			tr.HiddenDim = hiddenDim
+			if tr.Provenance == "" {
+				if tr.TorchAvailable {
+					tr.Provenance = "MEASURED"
+				} else {
+					tr.Provenance = "ESTIMATED"
+				}
+			}
 			return tr
 		}
 	}
@@ -310,11 +338,13 @@ func (p *Pipeline) collectPyTorchTrace(ctx context.Context, batchSize, hiddenDim
 		Device:         p.Hardware.Name + " (" + p.Hardware.ArchFlag + ")",
 		BatchSize:      batchSize,
 		HiddenDim:      hiddenDim,
+		Provenance:     "ESTIMATED",
+		SourceNote:     "ESTIMATED analytical fallback trace (Python torch.profiler unavailable).",
 		Hotspots: []HotspotOp{
-			{Name: "RMSNorm + Residual Add (Unfused)", Category: "rmsnorm_residual", SharePct: 34.5, Launches: 4},
-			{Name: "SwiGLU FFN Activation (SiLU * Gate)", Category: "swiglu", SharePct: 24.0, Launches: 3},
-			{Name: "Attention Softmax (3-Pass)", Category: "softmax", SharePct: 22.5, Launches: 3},
-			{Name: "LayerNorm (Unfused Mean/Var)", Category: "layernorm", SharePct: 19.0, Launches: 4},
+			{Name: "RMSNorm + Residual Add (Unfused)", Category: "rmsnorm_residual", SharePct: 34.5, Launches: 4, Provenance: "ESTIMATED"},
+			{Name: "SwiGLU FFN Activation (SiLU * Gate)", Category: "swiglu", SharePct: 24.0, Launches: 3, Provenance: "ESTIMATED"},
+			{Name: "Attention Softmax (3-Pass)", Category: "softmax", SharePct: 22.5, Launches: 3, Provenance: "ESTIMATED"},
+			{Name: "LayerNorm (Unfused Mean/Var)", Category: "layernorm", SharePct: 19.0, Launches: 4, Provenance: "ESTIMATED"},
 		},
 	}
 }
@@ -340,8 +370,8 @@ func buildSevenAnswers(
 		}
 	}
 	q2 := fmt.Sprintf(
-		"%s accounts for %.1f%% of memory-bound execution time, issuing multiple unfused kernel launches and transferring %.1f GB/s across DRAM while keeping FP32 compute units at only %.1f%% capacity.",
-		topOp, topShare, baseDiag.AchievedBandwidthGBps, baseDiag.ComputeUtilizationPct,
+		"[%s] %s accounts for %.1f%% of memory-bound execution time, issuing multiple unfused kernel launches and transferring %.1f GB/s across DRAM while keeping FP32 compute units at only %.1f%% capacity.",
+		trace.Provenance, topOp, topShare, baseDiag.AchievedBandwidthGBps, baseDiag.ComputeUtilizationPct,
 	)
 
 	q3 := fmt.Sprintf(
@@ -360,11 +390,17 @@ func buildSevenAnswers(
 	edpAfter := math.Max(1e-9, bestRes.Energy.EnergyDelayProduct)
 	edpRatio := edpBefore / edpAfter
 	q5 := fmt.Sprintf(
-		"Reduces GPU board energy by %.1f%% (%.2f J → %.2f J per 1K inferences at %.1f W average board power), improves Energy-Delay Product (EDP) by %.2f×, and saves %.1f kWh/month (%.1f kg CO2e/month including PUE).",
+		"[%s, %s confidence, ±%.1f%% uncertainty across %d windows] Reduces GPU board energy by %.1f%% (%.2f J → %.2f J per 1K inferences at %.1f W total / %.1f W active above %.1f W idle), improves EDP by %.2f×, and saves %.1f kWh/month (%.1f kg CO2e/month including PUE).",
+		bestRes.Energy.Provenance,
+		bestRes.Energy.MeasurementConfidence,
+		bestRes.Energy.EnergyUncertaintyPct,
+		bestRes.Energy.RepeatWindows,
 		econComp.EnergySavedPct,
 		econComp.Baseline.JoulesPer1KInferences,
 		econComp.Optimized.JoulesPer1KInferences,
 		bestRes.Energy.AvgPowerWatts,
+		bestRes.Energy.ActivePowerWatts,
+		bestRes.Energy.IdlePowerWatts,
 		edpRatio,
 		econComp.MonthlyKWhSaved,
 		econComp.MonthlyCarbonSavedKgCO2e,
@@ -373,12 +409,12 @@ func buildSevenAnswers(
 	recTwin := "current GPU fleet with fewer instances"
 	for _, sc := range twinScenarios {
 		if sc.Decision == "RECOMMENDED" {
-			recTwin = fmt.Sprintf("%s (%s)", sc.ScenarioName, sc.UnlockedByOptimization)
+			recTwin = fmt.Sprintf("[%s, %.0f%% conf] %s (%s; %s)", sc.Provenance, sc.ConfidenceScorePct, sc.ScenarioName, sc.UnlockedByOptimization, sc.PriceAssumptionNote)
 			break
 		}
 	}
 	q6 := fmt.Sprintf(
-		"YES: Peak activation VRAM drops by %.0f MiB (%.0f → %.0f MiB) and single-GPU capacity rises from %.0f to %.0f req/s (%.0f → %.0f Requests/GPU-hr). Fleet requirement drops from %d to %d GPU(s) (Recommended Digital Twin target: %s; Pareto Balanced winner: %s).",
+		"[MEASURED local / SIMULATED cross-SKU] Peak activation VRAM drops by %.0f MiB (%.0f → %.0f MiB) and single-GPU capacity rises from %.0f to %.0f req/s (%.0f → %.0f Requests/GPU-hr). Fleet requirement drops from %d to %d GPU(s) (Recommended Digital Twin target: %s; Pareto Balanced winner: %s).",
 		econComp.VRAMReductionMiB, baseRes.PeakVRAMMiB, bestRes.PeakVRAMMiB,
 		baseRes.ThroughputRPS, bestRes.ThroughputRPS,
 		econComp.Baseline.RequestsPerGPUHour, econComp.Optimized.RequestsPerGPUHour,

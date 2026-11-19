@@ -19,6 +19,16 @@ case "$MODE" in
     shift || true
     ./gpumode optimize "$@"
     ;;
+  deepseek)
+    shift || true
+    echo "[gpuMode] Querying local DeepSeek-V4-9B GGUF model & running live GPU verification..."
+    ./gpumode deepseek -proposer deepseek "$@"
+    ;;
+  workload)
+    shift || true
+    echo "[gpuMode] Running real streaming inference workload benchmark against local DeepSeek/Ollama server..."
+    ./gpumode workload "$@"
+    ;;
   monitor)
     ./gpumode monitor
     ;;

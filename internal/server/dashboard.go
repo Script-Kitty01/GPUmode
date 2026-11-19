@@ -376,16 +376,17 @@ const dashboardHTML = `<!DOCTYPE html>
 <!-- Digital Twin SKU Right-Sizing & DVFS Power-Clock Policies -->
 <section class="two-col">
   <div class="card">
-    <h2>GPU Digital Twin &amp; Fleet Right-Sizing Simulator</h2>
+    <h2>GPU Digital Twin &amp; Fleet Right-Sizing Simulator <span class="badge badge-amber" id="twinProvBadge">LOCAL MEASURED / CROSS-SKU SIMULATED</span></h2>
     <table>
       <thead>
         <tr>
           <th>Scenario</th>
+          <th>Source</th>
           <th>Latency</th>
           <th>Fleet Cap (RPS)</th>
           <th>VRAM Fit</th>
           <th>Monthly Cost</th>
-          <th>Unlocked By</th>
+          <th>Calibration / Price Basis</th>
           <th>Decision</th>
         </tr>
       </thead>
@@ -399,6 +400,7 @@ const dashboardHTML = `<!DOCTYPE html>
       <thead>
         <tr>
           <th>DVFS Clock Policy</th>
+          <th>Source</th>
           <th>Target Clock</th>
           <th>Est. Power</th>
           <th>Throughput</th>
@@ -412,10 +414,36 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
 </section>
 
+<!-- Real Local OpenAI-Compatible / Ollama Inference Workload Adapter -->
+<section class="card" style="margin-bottom:18px;">
+  <h2>3. Production LLM Workload Adapter (Local llama-server / Ollama Streaming Benchmark) <span class="badge badge-blue" id="workloadProvBadge">MEASURED END-TO-END</span></h2>
+  <div class="form-row">
+    <div>
+      <label for="llmUrl">Inference Server URL (llama-server / Ollama)</label>
+      <input type="text" id="llmUrl" value="http://127.0.0.1:8081" style="width:100%;background:#0d131f;border:1px solid var(--border);color:var(--text);padding:7px 9px;border-radius:6px;font-size:0.84rem;">
+    </div>
+    <div>
+      <label for="llmReqs">Streaming Requests</label>
+      <input type="number" id="llmReqs" value="3" min="1" max="16">
+    </div>
+    <div>
+      <label for="llmTokens">Max Output Tokens / Req</label>
+      <input type="number" id="llmTokens" value="48" min="16" max="256">
+    </div>
+  </div>
+  <div class="btn-row">
+    <button id="runWorkloadBtn" onclick="triggerWorkload()">Benchmark Local Inference Server (TTFT, TPOT, VRAM, J/1K Tok)</button>
+    <span class="status-msg" id="workloadStatus"></span>
+  </div>
+  <div id="workloadResultBox" style="margin-top:10px;font-size:0.82rem;color:var(--muted);">
+    Click above to measure real streaming TTFT, TPOT, tokens/sec, peak VRAM, and Joules/1K tokens against your local OpenAI-compatible or Ollama server.
+  </div>
+</section>
+
 <!-- Verified CUDA C++ Kernel Comparison & Drop-In PyTorch Extension -->
 <section class="two-col">
   <div class="card">
-    <h2>Verified Winning CUDA C++ Kernel (sm_89)</h2>
+    <h2 id="optCodeHeading">Verified Winning CUDA C++ Kernel</h2>
     <pre class="code-box" id="optCodeBox">// Run optimization to view verified CUDA C++ kernel</pre>
   </div>
   <div class="card">
@@ -471,6 +499,10 @@ function renderHardware(hw) {
     fmtNum(hw.peakMemBandwidthGbps, 0) + " GB/s BW &bull; " +
     fmtNum(hw.totalVramMib, 0) + " MiB VRAM";
   document.getElementById("tRidge").textContent = fmtNum(hw.ridgePointFlopsPerByte, 1) + " FLOP/B";
+  const heading = document.getElementById("optCodeHeading");
+  if (heading && hw.archFlag) {
+    heading.textContent = "Verified Winning CUDA C++ Kernel (" + hw.archFlag + ")";
+  }
 }
 
 function updateTelemetryUI(s, redraw = true) {
@@ -599,10 +631,14 @@ function renderReport(rep) {
     "Baseline: $" + fmtNum(ec.baseline.costPer1mInferencesUsd, 4) +
     " (-" + fmtNum(ec.costPer1mReductionPct, 1) + "%)";
 
+  const eng = (rep.autotune && rep.autotune.bestResult && rep.autotune.bestResult.energy) || {};
+  const prov = eng.provenance || "MEASURED";
+  const conf = eng.measurementConfidence || "MEDIUM";
+  const unc = eng.energyUncertaintyPct ? ("±" + fmtNum(eng.energyUncertaintyPct, 1) + "%") : "";
   document.getElementById("kpiJoules").textContent = fmtNum(ec.optimized.joulesPer1kInferences, 1) + " J";
   document.getElementById("kpiJoulesSub").textContent =
-    "Baseline: " + fmtNum(ec.baseline.joulesPer1kInferences, 1) +
-    " J (-" + fmtNum(ec.energySavedPct, 1) + "% GPU energy)";
+    "[" + prov + " • " + conf + " " + unc + "] Active " + fmtNum(eng.activePowerWatts, 1) + "W (Idle " + fmtNum(eng.idlePowerWatts, 1) + "W) • Baseline: " +
+    fmtNum(ec.baseline.joulesPer1kInferences, 1) + " J (-" + fmtNum(ec.energySavedPct, 1) + "%)";
 
   document.getElementById("kpiReqHr").textContent = Number(Math.round(ec.optimized.requestsPerGpuHour)).toLocaleString();
   document.getElementById("kpiReqHrSub").textContent =
@@ -622,13 +658,15 @@ function renderReport(rep) {
     if (sc.decision === "RECOMMENDED") bcls = "badge-green";
     else if (sc.decision === "BASELINE") bcls = "badge-amber";
     else if (sc.decision.includes("EXCEEDED") || sc.decision.includes("INSUFFICIENT")) bcls = "badge-red";
+    const provCls = sc.provenance === "MEASURED" ? "badge-green" : "badge-amber";
     return "<tr>" +
       "<td><strong>" + sc.scenarioName + "</strong></td>" +
+      "<td><span class='badge " + provCls + "'>" + (sc.provenance || "SIMULATED") + " (" + fmtNum(sc.confidenceScorePct, 0) + "%)</span></td>" +
       "<td>" + fmtNum(sc.estimatedLatencyMs, 2) + " ms</td>" +
       "<td>" + fmtNum(sc.estimatedThroughputRps, 0) + " req/s</td>" +
       "<td>" + fmtNum(sc.requiredVramMib, 0) + " / " + fmtNum(sc.availableVramMib, 0) + " MiB</td>" +
       "<td>$" + fmtNum(sc.monthlyTotalCostUsd, 0) + "/mo</td>" +
-      "<td>" + sc.unlockedByOptimization + "</td>" +
+      "<td style='font-size:0.74rem;color:var(--muted);'>" + (sc.calibrationBasis || sc.unlockedByOptimization) + "</td>" +
       "<td><span class='badge " + bcls + "'>" + sc.decision + "</span></td>" +
       "</tr>";
   }).join("");
@@ -636,8 +674,10 @@ function renderReport(rep) {
   // DVFS Table
   const dvfsBody = document.getElementById("dvfsBody");
   dvfsBody.innerHTML = (rep.dvfsPolicies || []).map(p => {
+    const pCls = p.provenance === "MEASURED" ? "badge-green" : "badge-amber";
     return "<tr>" +
       "<td>" + p.policyName + "</td>" +
+      "<td><span class='badge " + pCls + "'>" + (p.provenance || "SIMULATED") + "</span></td>" +
       "<td>" + fmtNum(p.targetSmClockMhz, 0) + " MHz</td>" +
       "<td>" + fmtNum(p.estimatedPowerWatts, 1) + " W (" + fmtNum(p.powerChangePct, 1) + "%)</td>" +
       "<td>" + fmtNum(p.estimatedThroughputRps, 0) + " req/s</td>" +
@@ -664,6 +704,41 @@ function renderReport(rep) {
     document.getElementById("optCodeBox").textContent = rep.autotune.bestResult.spec.displayKernel;
   }
   document.getElementById("torchExtBox").textContent = rep.pytorchExtensionCode || "";
+}
+
+async function triggerWorkload() {
+  const btn = document.getElementById("runWorkloadBtn");
+  const status = document.getElementById("workloadStatus");
+  const box = document.getElementById("workloadResultBox");
+  btn.disabled = true;
+  status.textContent = "Launching/querying local DeepSeek-V4-9B inference server & measuring live power/VRAM...";
+  try {
+    const res = await fetch("/api/workload", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        serverUrl: document.getElementById("llmUrl").value,
+        numRequests: parseInt(document.getElementById("llmReqs").value) || 3,
+        maxTokens: parseInt(document.getElementById("llmTokens").value) || 48,
+        autoServer: true
+      })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const w = await res.json();
+    status.textContent = "Measured " + fmtNum(w.throughputTokensPerS, 1) + " tok/s";
+    box.innerHTML =
+      "<strong>[" + w.provenance + "]</strong> " + w.modelName + " &bull; " +
+      "<strong>TTFT (p50/p95):</strong> " + fmtNum(w.medianTtftMs, 1) + " / " + fmtNum(w.p95TtftMs, 1) + " ms &bull; " +
+      "<strong>TPOT:</strong> " + fmtNum(w.medianTpotMs, 2) + " ms/tok &bull; " +
+      "<strong>Throughput:</strong> " + fmtNum(w.throughputTokensPerS, 2) + " tok/s &bull; " +
+      "<strong>Peak VRAM:</strong> " + fmtNum(w.measuredPeakVramMib, 0) + " MiB &bull; " +
+      "<strong>Energy:</strong> " + fmtNum(w.joulesPer1kTokens, 1) + " J/1K tokens (" + fmtNum(w.energy.activePowerWatts, 1) + "W active) &bull; " +
+      "<strong>Cost:</strong> $" + fmtNum(w.costPer1mTokensUsd, 4) + " / 1M tokens";
+  } catch (e) {
+    status.textContent = "Error: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 window.addEventListener("DOMContentLoaded", () => {

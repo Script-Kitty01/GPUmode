@@ -2,66 +2,88 @@ package physics
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"gpumode/internal/config"
 )
 
-func TestDetectHardwareLiveAndFallback(t *testing.T) {
+func TestDetectHardwareLiveAndFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	nvccPath := config.ResolveNVCCPath()
+	smiPath := config.ResolveNvidiaSMIPath()
+
 	// 1. Test live hardware detection on the host machine
-	spec, err := DetectHardware(ctx, "/opt/cuda/bin/nvcc", "nvidia-smi")
+	spec, err := DetectHardwareForDevice(ctx, config.DefaultGPUIndex(), nvccPath, smiPath)
 	if err != nil {
-		t.Logf("DetectHardware returned fallback error (expected if GPU unavailable): %v", err)
+		if _, lookErr := exec.LookPath(nvccPath); lookErr != nil {
+			t.Skipf("skipping live GPU assertions (CUDA toolchain/GPU unavailable: %v)", err)
+		}
+		t.Fatalf("DetectHardwareForDevice failed on CUDA host: %v", err)
 	}
 
 	if spec.Name == "" {
 		t.Fatalf("expected non-empty GPU Name")
 	}
-	if spec.ComputeCapability != "8.9" {
-		t.Errorf("expected ComputeCapability 8.9 on RTX 4050 host, got %s", spec.ComputeCapability)
+	if spec.ComputeCapability == "" {
+		t.Errorf("expected non-empty ComputeCapability")
 	}
-	if spec.ArchFlag != "sm_89" {
-		t.Errorf("expected ArchFlag sm_89, got %s", spec.ArchFlag)
+	if !strings.HasPrefix(spec.ArchFlag, "sm_") {
+		t.Errorf("expected ArchFlag starting with sm_, got %s", spec.ArchFlag)
 	}
 	if spec.SMCount <= 0 {
 		t.Errorf("expected positive SMCount, got %d", spec.SMCount)
 	}
-	if spec.PeakFP32TFLOPS <= 5.0 {
-		t.Errorf("expected PeakFP32TFLOPS > 5.0, got %.2f", spec.PeakFP32TFLOPS)
+	if spec.PeakFP32TFLOPS <= 0 {
+		t.Errorf("expected PeakFP32TFLOPS > 0, got %.2f", spec.PeakFP32TFLOPS)
 	}
-	if spec.PeakMemBandwidthGBps <= 50.0 {
-		t.Errorf("expected PeakMemBandwidthGBps > 50.0, got %.2f", spec.PeakMemBandwidthGBps)
+	if spec.PeakMemBandwidthGBps <= 0 {
+		t.Errorf("expected PeakMemBandwidthGBps > 0, got %.2f", spec.PeakMemBandwidthGBps)
 	}
-	if spec.RidgePointFLOPsPerByte <= 10.0 {
-		t.Errorf("expected RidgePointFLOPsPerByte > 10.0, got %.2f", spec.RidgePointFLOPsPerByte)
+	if spec.RidgePointFLOPsPerByte <= 0 {
+		t.Errorf("expected RidgePointFLOPsPerByte > 0, got %.2f", spec.RidgePointFLOPsPerByte)
 	}
-	if spec.TotalVRAMMiB < 4000 {
-		t.Errorf("expected TotalVRAMMiB >= 4000, got %.1f", spec.TotalVRAMMiB)
+	if spec.TotalVRAMMiB <= 0 {
+		t.Errorf("expected TotalVRAMMiB > 0, got %.1f", spec.TotalVRAMMiB)
 	}
 
-	// 2. Test graceful fallback when invalid binary paths are provided
-	fbSpec, fbErr := DetectHardware(ctx, "/nonexistent/nvcc", "/nonexistent/nvidia-smi")
+	// 2. Invalid paths must return an error and no fabricated GPU spec.
+	invalidSpec, fbErr := DetectHardware(ctx, "/nonexistent/nvcc", "/nonexistent/nvidia-smi")
 	if fbErr == nil {
 		t.Errorf("expected non-nil error when both nvcc and nvidia-smi paths fail")
 	}
-	if fbSpec.ArchFlag != "sm_89" || fbSpec.SMCount != 20 || fbSpec.PeakMemBandwidthGBps != 192.0 {
-		t.Errorf("unexpected fallback spec: %+v", fbSpec)
+	if invalidSpec.Name != "" || invalidSpec.ArchFlag != "" || invalidSpec.SMCount != 0 ||
+		invalidSpec.PeakFP32TFLOPS != 0 || invalidSpec.PeakMemBandwidthGBps != 0 {
+		t.Errorf("expected no fabricated hardware spec on probe failure, got %+v", invalidSpec)
 	}
 }
 
 func TestReferenceHardwarePresets(t *testing.T) {
 	presets := ReferenceHardwarePresets()
-	if len(presets) != 4 {
-		t.Fatalf("expected 4 reference hardware presets, got %d", len(presets))
+	if len(presets) < 2 {
+		t.Fatalf("expected at least 2 reference hardware presets, got %d", len(presets))
 	}
 	for i, p := range presets {
 		if p.Name == "" || p.PeakFP32TFLOPS <= 0 || p.PeakMemBandwidthGBps <= 0 || p.RidgePointFLOPsPerByte <= 0 {
 			t.Errorf("preset[%d] has invalid physics fields: %+v", i, p)
 		}
+	}
+
+	// Verify external JSON presets loading overrides embedded list
+	customPath := filepath.Join(t.TempDir(), "custom_presets.json")
+	customJSON := `[{"name":"Custom NVIDIA H200","computeCapability":"9.0","archFlag":"sm_90","smCount":132,"totalVramMib":144384,"peakFp32Tflops":67.0,"peakMemBandwidthGbps":4800.0,"tdpWatts":700.0,"hourlyRateHintUsd":5.50}]`
+	if err := os.WriteFile(customPath, []byte(customJSON), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	custom := LoadReferenceHardwarePresets(customPath, presets[0])
+	if len(custom) != 2 || custom[1].Name != "Custom NVIDIA H200" {
+		t.Fatalf("expected custom preset to load, got %+v", custom)
 	}
 }
 
@@ -90,7 +112,7 @@ func TestComputeBusinessKPIsAndCompareEconomics(t *testing.T) {
 		PeakVRAMMiB:        3200.0,
 	}
 
-	// Optimized: fused sm_89 kernel (10ms latency, 100 RPS/GPU, 48W power, meets 20ms SLA, requires 2 GPUs for 150 QPS)
+	// Optimized: fused CUDA kernel (10ms latency, 100 RPS/GPU, 48W power, meets 20ms SLA, requires 2 GPUs for 150 QPS)
 	optimized := WorkloadMetrics{
 		LatencyMS:          10.0,
 		P95LatencyMS:       12.5,

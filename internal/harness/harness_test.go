@@ -2,8 +2,11 @@ package harness
 
 import (
 	"context"
+	"os/exec"
 	"testing"
 	"time"
+
+	"gpumode/internal/config"
 )
 
 func TestParsePTXASOutput(t *testing.T) {
@@ -25,7 +28,13 @@ ptxas info    : Used 32 registers, 1024 bytes smem, 384 bytes cmem[0]`
 	}
 }
 
-func TestLiveNVCCCompileAndExecuteOnRTX4050(t *testing.T) {
+func TestLiveNVCCCompileAndExecuteOnCUDA(t *testing.T) {
+	nvccPath := config.ResolveNVCCPath()
+	if _, err := exec.LookPath(nvccPath); err != nil {
+		t.Skipf("nvcc not available (%v); skipping live CUDA test", err)
+	}
+	sanitizerPath := config.ResolveSanitizerPath()
+
 	src := `#include <cuda_runtime.h>
 #include <stdio.h>
 #include <math.h>
@@ -36,6 +45,11 @@ __global__ void test_kern(const float* a, float* b, int n) {
 }
 
 int main(int argc, char** argv) {
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) {
+        fprintf(stderr, "no CUDA device available\n");
+        return 1;
+    }
     int n = 1027;
     float *d_a, *d_b;
     cudaMalloc(&d_a, n * sizeof(float));
@@ -49,7 +63,7 @@ int main(int argc, char** argv) {
     return 0;
 }
 `
-	r := NewRunner("/opt/cuda/bin/nvcc", "/opt/cuda/bin/compute-sanitizer", "sm_89", 2, 20*time.Second, nil)
+	r := NewRunner(nvccPath, sanitizerPath, "native", 2, 20*time.Second, nil)
 	r.RunSanitizer = false // Fast unit test; sanitizer is tested in integration
 
 	results := r.EvaluateBatch(context.Background(), []KernelSpec{

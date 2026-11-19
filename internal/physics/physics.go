@@ -2,6 +2,8 @@ package physics
 
 import (
 	"context"
+	_ "embed"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -10,11 +12,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"gpumode/internal/config"
 )
 
+//go:embed presets.json
+var embeddedPresetsJSON []byte
+
 // GPUHardwareSpec captures the hardware physics ceiling and architecture traits
-// of a physical or reference GPU device.
+// of a physical or reference NVIDIA GPU device.
 type GPUHardwareSpec struct {
+	GPUIndex               int     `json:"gpuIndex"`
 	Name                   string  `json:"name"`
 	ComputeCapability      string  `json:"computeCapability"`
 	ArchFlag               string  `json:"archFlag"`
@@ -34,22 +42,28 @@ type GPUHardwareSpec struct {
 
 const cudaDevQuerySource = `#include <cuda_runtime.h>
 #include <stdio.h>
-int main() {
+#include <stdlib.h>
+int main(int argc, char** argv) {
+    int dev = (argc > 1) ? atoi(argv[1]) : 0;
+    int count = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || count <= 0) return 1;
+    if (dev < 0 || dev >= count) return 2;
+    if (cudaSetDevice(dev) != cudaSuccess) return 3;
     cudaDeviceProp p;
-    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) return 1;
+    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 4;
     int clockKHz = 0, memClockKHz = 0, busWidth = 0;
-    cudaDeviceGetAttribute(&clockKHz, cudaDevAttrClockRate, 0);
-    cudaDeviceGetAttribute(&memClockKHz, cudaDevAttrMemoryClockRate, 0);
-    cudaDeviceGetAttribute(&busWidth, cudaDevAttrGlobalMemoryBusWidth, 0);
-    printf("name=%s\nmajor=%d\nminor=%d\nsm=%d\nclockKHz=%d\nmemClockKHz=%d\nbusWidth=%d\nl2=%d\nvram=%zu\n",
-        p.name, p.major, p.minor, p.multiProcessorCount, clockKHz, memClockKHz, busWidth, p.l2CacheSize, p.totalGlobalMem);
+    cudaDeviceGetAttribute(&clockKHz, cudaDevAttrClockRate, dev);
+    cudaDeviceGetAttribute(&memClockKHz, cudaDevAttrMemoryClockRate, dev);
+    cudaDeviceGetAttribute(&busWidth, cudaDevAttrGlobalMemoryBusWidth, dev);
+    printf("name=%s\nmajor=%d\nminor=%d\nsm=%d\nclockKHz=%d\nmemClockKHz=%d\nbusWidth=%d\nl2=%d\nvram=%zu\ndeviceCount=%d\n",
+        p.name, p.major, p.minor, p.multiProcessorCount, clockKHz, memClockKHz, busWidth, p.l2CacheSize, p.totalGlobalMem, count);
     return 0;
 }
 `
 
 var (
 	devQueryMu     sync.Mutex
-	cachedProbeVal *cudaProbeResult
+	cachedProbeMap = make(map[int]*cudaProbeResult)
 )
 
 type cudaProbeResult struct {
@@ -62,44 +76,33 @@ type cudaProbeResult struct {
 	BusWidth    int
 	L2Bytes     int
 	VRAMBytes   int64
+	DeviceCount int
 }
 
-// FallbackRTX4050Spec returns the realistic fallback spec for an NVIDIA GeForce RTX 4050 Laptop GPU (sm_89).
-func FallbackRTX4050Spec() GPUHardwareSpec {
-	spec := GPUHardwareSpec{
-		Name:                 "NVIDIA GeForce RTX 4050 Laptop GPU",
-		ComputeCapability:    "8.9",
-		ArchFlag:             "sm_89",
-		SMCount:              20,
-		MaxSMClockMHz:        2355.0,
-		MaxMemClockMHz:       8001.0,
-		MemoryBusWidthBits:   96,
-		TotalVRAMMiB:         6141.0,
-		L2CacheBytes:         24 * 1024 * 1024, // 24 MiB
-		PeakFP32TFLOPS:       12.0,
-		PeakMemBandwidthGBps: 192.0,
-		IdlePowerWatts:       8.0,
-		TDPWatts:             65.0,
-		HourlyRateHintUSD:    0.35,
-	}
-	spec.RidgePointFLOPsPerByte = computeRidgePoint(spec.PeakFP32TFLOPS, spec.PeakMemBandwidthGBps)
-	return spec
-}
-
-// DetectHardware probes the live system GPU using nvidia-smi and an optional compiled CUDA
-// device property probe via nvcc. If neither tool succeeds, it gracefully falls back to a
-// realistic RTX 4050 Laptop GPU (sm_89) specification.
+// DetectHardware probes GPU 0 using nvidia-smi and a compiled CUDA device property probe.
 func DetectHardware(ctx context.Context, nvccPath, nvidiaSMIPath string) (GPUHardwareSpec, error) {
-	fallback := FallbackRTX4050Spec()
+	return DetectHardwareForDevice(ctx, 0, nvccPath, nvidiaSMIPath)
+}
 
-	smiData, smiErr := queryNvidiaSMI(ctx, nvidiaSMIPath)
-	probeData, probeErr := runCUDAProbe(ctx, nvccPath)
+// DetectHardwareForDevice probes the specified NVIDIA GPU index using nvidia-smi and a compiled CUDA
+// device property probe via nvcc. Both sources must provide a valid live GPU specification.
+func DetectHardwareForDevice(ctx context.Context, gpuIndex int, nvccPath, nvidiaSMIPath string) (GPUHardwareSpec, error) {
+	if gpuIndex < 0 {
+		gpuIndex = 0
+	}
+	smiData, smiErr := queryNvidiaSMIForDevice(ctx, gpuIndex, nvidiaSMIPath)
+	probeData, probeErr := runCUDAProbeForDevice(ctx, gpuIndex, nvccPath)
 
 	if smiErr != nil && probeErr != nil {
-		return fallback, fmt.Errorf("hardware probe fallback used (nvidia-smi err: %v, nvcc err: %v)", smiErr, probeErr)
+		return GPUHardwareSpec{GPUIndex: gpuIndex}, fmt.Errorf(
+			"hardware probe failed for NVIDIA GPU %d (nvidia-smi err: %v, nvcc err: %v)",
+			gpuIndex, smiErr, probeErr,
+		)
 	}
 
-	spec := fallback
+	spec := GPUHardwareSpec{
+		GPUIndex: gpuIndex,
+	}
 
 	if probeErr == nil && probeData != nil {
 		if probeData.Name != "" {
@@ -143,8 +146,8 @@ func DetectHardware(ctx context.Context, nvccPath, nvidiaSMIPath string) (GPUHar
 		if smiData.TotalVRAMMiB > 0 {
 			spec.TotalVRAMMiB = smiData.TotalVRAMMiB
 		}
-		// Prefer boost clock from CUDA device properties if reasonable, or use nvidia-smi clock
-		if probeErr != nil && smiData.MaxSMClockMHz > 0 {
+		// Prefer boost clock from CUDA device properties if available, else nvidia-smi clock
+		if (probeErr != nil || spec.MaxSMClockMHz <= 0) && smiData.MaxSMClockMHz > 0 {
 			spec.MaxSMClockMHz = smiData.MaxSMClockMHz
 		}
 		if smiData.MaxMemClockMHz > 0 {
@@ -172,75 +175,60 @@ func DetectHardware(ctx context.Context, nvccPath, nvidiaSMIPath string) (GPUHar
 	}
 
 	spec.RidgePointFLOPsPerByte = computeRidgePoint(spec.PeakFP32TFLOPS, spec.PeakMemBandwidthGBps)
+	if spec.Name == "" || spec.ComputeCapability == "" || spec.ArchFlag == "" ||
+		spec.SMCount <= 0 || spec.TotalVRAMMiB <= 0 ||
+		spec.PeakFP32TFLOPS <= 0 || spec.PeakMemBandwidthGBps <= 0 ||
+		spec.RidgePointFLOPsPerByte <= 0 {
+		return GPUHardwareSpec{GPUIndex: gpuIndex}, fmt.Errorf(
+			"hardware probe produced incomplete NVIDIA GPU %d specification: %+v",
+			gpuIndex, spec,
+		)
+	}
 	return spec, nil
 }
 
-// ReferenceHardwarePresets returns 4 reference hardware specs:
-// 1. Local Detected GPU (or RTX 4050 Laptop GPU fallback)
-// 2. NVIDIA L4 24GB
-// 3. NVIDIA L40S 48GB
-// 4. NVIDIA A100 80GB
+// LoadReferenceHardwarePresets returns localHW followed by reference SKUs loaded from
+// presetsPath (or GPUMODE_PRESETS_PATH, or the embedded presets.json if unset).
+func LoadReferenceHardwarePresets(presetsPath string, localHW GPUHardwareSpec) []GPUHardwareSpec {
+	if localHW.HourlyRateHintUSD <= 0 {
+		localHW.HourlyRateHintUSD = 0
+	}
+
+	raw := embeddedPresetsJSON
+	if strings.TrimSpace(presetsPath) == "" {
+		presetsPath = strings.TrimSpace(os.Getenv("GPUMODE_PRESETS_PATH"))
+	}
+	if presetsPath != "" {
+		if b, err := os.ReadFile(presetsPath); err == nil && len(b) > 0 {
+			raw = b
+		}
+	}
+
+	var skuPresets []GPUHardwareSpec
+	if err := json.Unmarshal(raw, &skuPresets); err != nil {
+		return []GPUHardwareSpec{localHW}
+	}
+
+	out := make([]GPUHardwareSpec, 0, len(skuPresets)+1)
+	out = append(out, localHW)
+	for _, s := range skuPresets {
+		if s.RidgePointFLOPsPerByte <= 0 {
+			s.RidgePointFLOPsPerByte = computeRidgePoint(s.PeakFP32TFLOPS, s.PeakMemBandwidthGBps)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// ReferenceHardwarePresets returns the dynamically detected local GPU followed by reference SKUs.
 func ReferenceHardwarePresets() []GPUHardwareSpec {
-	local, _ := DetectHardware(context.Background(), "/opt/cuda/bin/nvcc", "nvidia-smi")
-	if local.HourlyRateHintUSD == 0 {
-		local.HourlyRateHintUSD = 0.35
-	}
-
-	l4 := GPUHardwareSpec{
-		Name:                 "NVIDIA L4 24GB",
-		ComputeCapability:    "8.9",
-		ArchFlag:             "sm_89",
-		SMCount:              58,
-		MaxSMClockMHz:        2040.0,
-		MaxMemClockMHz:       6250.0,
-		MemoryBusWidthBits:   192,
-		TotalVRAMMiB:         24576.0,
-		L2CacheBytes:         48 * 1024 * 1024,
-		PeakFP32TFLOPS:       30.29,
-		PeakMemBandwidthGBps: 300.0,
-		IdlePowerWatts:       18.0,
-		TDPWatts:             72.0,
-		HourlyRateHintUSD:    0.85,
-	}
-	l4.RidgePointFLOPsPerByte = computeRidgePoint(l4.PeakFP32TFLOPS, l4.PeakMemBandwidthGBps)
-
-	l40s := GPUHardwareSpec{
-		Name:                 "NVIDIA L40S 48GB",
-		ComputeCapability:    "8.9",
-		ArchFlag:             "sm_89",
-		SMCount:              142,
-		MaxSMClockMHz:        2520.0,
-		MaxMemClockMHz:       9000.0,
-		MemoryBusWidthBits:   384,
-		TotalVRAMMiB:         49152.0,
-		L2CacheBytes:         96 * 1024 * 1024,
-		PeakFP32TFLOPS:       91.61,
-		PeakMemBandwidthGBps: 864.0,
-		IdlePowerWatts:       45.0,
-		TDPWatts:             350.0,
-		HourlyRateHintUSD:    1.95,
-	}
-	l40s.RidgePointFLOPsPerByte = computeRidgePoint(l40s.PeakFP32TFLOPS, l40s.PeakMemBandwidthGBps)
-
-	a100 := GPUHardwareSpec{
-		Name:                 "NVIDIA A100 80GB SXM",
-		ComputeCapability:    "8.0",
-		ArchFlag:             "sm_80",
-		SMCount:              108,
-		MaxSMClockMHz:        1410.0,
-		MaxMemClockMHz:       1593.0,
-		MemoryBusWidthBits:   5120,
-		TotalVRAMMiB:         81920.0,
-		L2CacheBytes:         40 * 1024 * 1024,
-		PeakFP32TFLOPS:       19.49,
-		PeakMemBandwidthGBps: 2039.0,
-		IdlePowerWatts:       55.0,
-		TDPWatts:             400.0,
-		HourlyRateHintUSD:    3.40,
-	}
-	a100.RidgePointFLOPsPerByte = computeRidgePoint(a100.PeakFP32TFLOPS, a100.PeakMemBandwidthGBps)
-
-	return []GPUHardwareSpec{local, l4, l40s, a100}
+	local, _ := DetectHardwareForDevice(
+		context.Background(),
+		config.DefaultGPUIndex(),
+		config.ResolveNVCCPath(),
+		config.ResolveNvidiaSMIPath(),
+	)
+	return LoadReferenceHardwarePresets("", local)
 }
 
 type smiQueryResult struct {
@@ -253,11 +241,13 @@ type smiQueryResult struct {
 	TDPWatts       float64
 }
 
-func queryNvidiaSMI(ctx context.Context, nvidiaSMIPath string) (*smiQueryResult, error) {
+func queryNvidiaSMIForDevice(ctx context.Context, gpuIndex int, nvidiaSMIPath string) (*smiQueryResult, error) {
 	if strings.TrimSpace(nvidiaSMIPath) == "" {
 		return nil, fmt.Errorf("empty nvidia-smi path")
 	}
+	idxArg := strconv.Itoa(gpuIndex)
 	cmd := exec.CommandContext(ctx, nvidiaSMIPath,
+		"-i", idxArg,
 		"--query-gpu=name,compute_cap,memory.total,clocks.max.sm,clocks.max.memory,power.draw,enforced.power.limit,power.default_limit",
 		"--format=csv,noheader,nounits",
 	)
@@ -265,6 +255,7 @@ func queryNvidiaSMI(ctx context.Context, nvidiaSMIPath string) (*smiQueryResult,
 	if err != nil {
 		// Retry with the basic 6-column query in case enforced.power.limit is unsupported on older drivers
 		cmdBasic := exec.CommandContext(ctx, nvidiaSMIPath,
+			"-i", idxArg,
 			"--query-gpu=name,compute_cap,memory.total,clocks.max.sm,clocks.max.memory,power.draw",
 			"--format=csv,noheader,nounits",
 		)
@@ -313,7 +304,7 @@ func queryNvidiaSMI(ctx context.Context, nvidiaSMIPath string) (*smiQueryResult,
 	return res, nil
 }
 
-func runCUDAProbe(ctx context.Context, nvccPath string) (*cudaProbeResult, error) {
+func runCUDAProbeForDevice(ctx context.Context, gpuIndex int, nvccPath string) (*cudaProbeResult, error) {
 	if strings.TrimSpace(nvccPath) == "" {
 		return nil, fmt.Errorf("empty nvcc path")
 	}
@@ -324,16 +315,16 @@ func runCUDAProbe(ctx context.Context, nvccPath string) (*cudaProbeResult, error
 	devQueryMu.Lock()
 	defer devQueryMu.Unlock()
 
-	if cachedProbeVal != nil {
-		return cachedProbeVal, nil
+	if cached, ok := cachedProbeMap[gpuIndex]; ok && cached != nil {
+		return cached, nil
 	}
 
-	cacheDir := ".gpumode_cache"
+	cacheDir := filepath.Join(os.TempDir(), "gpumode_cache")
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, err
 	}
-	srcPath := filepath.Join(cacheDir, "gpumode_devquery.cu")
-	binPath := filepath.Join(cacheDir, "gpumode_devquery")
+	srcPath := filepath.Join(cacheDir, "gpumode_devquery_v2.cu")
+	binPath := filepath.Join(cacheDir, "gpumode_devquery_v2")
 
 	if _, err := os.Stat(binPath); err != nil {
 		if err := os.WriteFile(srcPath, []byte(cudaDevQuerySource), 0o644); err != nil {
@@ -345,7 +336,7 @@ func runCUDAProbe(ctx context.Context, nvccPath string) (*cudaProbeResult, error
 		}
 	}
 
-	runCmd := exec.CommandContext(ctx, "./"+binPath)
+	runCmd := exec.CommandContext(ctx, binPath, strconv.Itoa(gpuIndex))
 	out, err := runCmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("devquery execution failed: %w", err)
@@ -381,22 +372,32 @@ func runCUDAProbe(ctx context.Context, nvccPath string) (*cudaProbeResult, error
 			res.L2Bytes, _ = strconv.Atoi(val)
 		case "vram":
 			res.VRAMBytes, _ = strconv.ParseInt(val, 10, 64)
+		case "deviceCount":
+			res.DeviceCount, _ = strconv.Atoi(val)
 		}
 	}
 
 	if res.SMCount == 0 {
 		return nil, fmt.Errorf("invalid devquery output")
 	}
-	cachedProbeVal = res
+	cachedProbeMap[gpuIndex] = res
 	return res, nil
 }
 
 func fp32CoresPerSM(computeCap string) int {
 	switch computeCap {
+	case "12.0", "10.0", "10.1": // Blackwell
+		return 128
+	case "9.0": // Hopper H100/H200
+		return 128
 	case "8.9", "8.6", "8.7": // Ada Lovelace & Ampere GA10x
 		return 128
-	case "8.0", "9.0", "7.5", "7.0": // A100, H100, Turing, Volta
+	case "8.0", "7.5", "7.0", "6.0": // A100, Turing, Volta, P100
 		return 64
+	case "6.1", "6.2", "5.0", "5.2", "5.3": // Pascal GP10x, Maxwell
+		return 128
+	case "3.0", "3.5", "3.7": // Kepler
+		return 192
 	default:
 		return 128
 	}

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"gpumode/internal/config"
 	"gpumode/internal/telemetry"
 )
 
@@ -57,23 +58,23 @@ type HarnessOutput struct {
 
 // BenchmarkResult combines compiler stats, sanitizer/numerical verification, timing, and live energy integration.
 type BenchmarkResult struct {
-	Spec              KernelSpec                  `json:"spec"`
-	CompiledOK        bool                        `json:"compiledOk"`
-	CompileTimeMS     float64                     `json:"compileTimeMs"`
-	CompilerLog       string                      `json:"compilerLog,omitempty"`
-	PTXAS             PTXASStats                  `json:"ptxas"`
-	SanitizerPassed   bool                        `json:"sanitizerPassed"`
-	SanitizerLog      string                      `json:"sanitizerLog,omitempty"`
-	ParityPassed      bool                        `json:"parityPassed"`
-	EdgeCasePassed    bool                        `json:"edgeCasePassed"`
-	MaxAbsError       float64                     `json:"maxAbsError"`
-	MedianLatencyMS   float64                     `json:"medianLatencyMs"`
-	P95LatencyMS      float64                     `json:"p95LatencyMs"`
-	ThroughputRPS     float64                     `json:"throughputRps"`
-	EffectiveBWGBps   float64                     `json:"effectiveBwGbps"`
-	PeakVRAMMiB       float64                     `json:"peakVramMib"`
-	Energy            telemetry.EnergyMeasurement `json:"energy"`
-	ErrorMessage      string                      `json:"errorMessage,omitempty"`
+	Spec            KernelSpec                  `json:"spec"`
+	CompiledOK      bool                        `json:"compiledOk"`
+	CompileTimeMS   float64                     `json:"compileTimeMs"`
+	CompilerLog     string                      `json:"compilerLog,omitempty"`
+	PTXAS           PTXASStats                  `json:"ptxas"`
+	SanitizerPassed bool                        `json:"sanitizerPassed"`
+	SanitizerLog    string                      `json:"sanitizerLog,omitempty"`
+	ParityPassed    bool                        `json:"parityPassed"`
+	EdgeCasePassed  bool                        `json:"edgeCasePassed"`
+	MaxAbsError     float64                     `json:"maxAbsError"`
+	MedianLatencyMS float64                     `json:"medianLatencyMs"`
+	P95LatencyMS    float64                     `json:"p95LatencyMs"`
+	ThroughputRPS   float64                     `json:"throughputRps"`
+	EffectiveBWGBps float64                     `json:"effectiveBwGbps"`
+	PeakVRAMMiB     float64                     `json:"peakVramMib"`
+	Energy          telemetry.EnergyMeasurement `json:"energy"`
+	ErrorMessage    string                      `json:"errorMessage,omitempty"`
 }
 
 // Runner manages parallel nvcc compilation workers and a serialized GPU verification & benchmark mutex.
@@ -81,7 +82,9 @@ type Runner struct {
 	NVCCPath       string
 	SanitizerPath  string
 	ArchFlag       string
+	GPUIndex       int
 	CompileWorkers int
+	RepeatWindows  int
 	KernelTimeout  time.Duration
 	RunSanitizer   bool
 	Monitor        *telemetry.Monitor
@@ -91,13 +94,13 @@ type Runner struct {
 // NewRunner creates a CUDA compilation & verification runner targeting the detected GPU architecture.
 func NewRunner(nvccPath, sanitizerPath, archFlag string, workers int, timeout time.Duration, mon *telemetry.Monitor) *Runner {
 	if nvccPath == "" {
-		nvccPath = "/opt/cuda/bin/nvcc"
+		nvccPath = config.ResolveNVCCPath()
 	}
 	if sanitizerPath == "" {
-		sanitizerPath = "/opt/cuda/bin/compute-sanitizer"
+		sanitizerPath = config.ResolveSanitizerPath()
 	}
 	if archFlag == "" {
-		archFlag = "sm_89"
+		archFlag = "native"
 	}
 	if workers <= 0 {
 		workers = 3
@@ -109,7 +112,9 @@ func NewRunner(nvccPath, sanitizerPath, archFlag string, workers int, timeout ti
 		NVCCPath:       nvccPath,
 		SanitizerPath:  sanitizerPath,
 		ArchFlag:       archFlag,
+		GPUIndex:       config.DefaultGPUIndex(),
 		CompileWorkers: workers,
+		RepeatWindows:  3,
 		KernelTimeout:  timeout,
 		RunSanitizer:   true,
 		Monitor:        mon,
@@ -294,6 +299,7 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 		if _, err := os.Stat(r.SanitizerPath); err == nil {
 			sCtx, sCancel := context.WithTimeout(ctx, r.KernelTimeout)
 			sCmd := exec.CommandContext(sCtx, r.SanitizerPath, "--tool", "memcheck", "--error-exitcode", "99", art.binPath, "--verify-only")
+			sCmd.Env = r.cudaExecEnv()
 			var sOut bytes.Buffer
 			sCmd.Stdout = &sOut
 			sCmd.Stderr = &sOut
@@ -319,105 +325,190 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 		res.SanitizerPassed = true
 	}
 
-	// Step 2: Run full benchmark with live energy sampling window
+	// Step 2: Establish idle GPU power baseline before benchmark windows
+	var idlePowerW float64
 	if r.Monitor != nil {
-		_, _ = r.Monitor.PollOnce(ctx)
-	}
-	winStart := time.Now()
-
-	bCtx, bCancel := context.WithTimeout(ctx, r.KernelTimeout)
-	bCmd := exec.CommandContext(bCtx, art.binPath)
-	var bOut, bErr bytes.Buffer
-	bCmd.Stdout = &bOut
-	bCmd.Stderr = &bErr
-	runErr := bCmd.Run()
-	bCancel()
-
-	if r.Monitor != nil {
-		_, _ = r.Monitor.PollOnce(ctx)
-	}
-	winEnd := time.Now()
-
-	if runErr != nil {
-		res.ErrorMessage = fmt.Sprintf("kernel execution failed: %v (%s)", runErr, strings.TrimSpace(bErr.String()))
-		return res
+		idlePowerW = r.Monitor.MeasureIdleBaseline(ctx, 2)
 	}
 
-	// Parse JSON output line from the C++ harness
-	var hOut HarnessOutput
-	lines := strings.Split(strings.TrimSpace(bOut.String()), "\n")
-	parsed := false
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
-			if err := json.Unmarshal([]byte(line), &hOut); err == nil {
-				parsed = true
-				break
+	repeatCount := r.RepeatWindows
+	if repeatCount <= 0 {
+		repeatCount = 3
+	}
+
+	var windowMeasurements []telemetry.EnergyMeasurement
+	var medLatencies []float64
+	var p95Latencies []float64
+	var bwList []float64
+	var lastOut HarnessOutput
+	var totalKernelMS float64
+
+	// Step 3: Run repeated benchmark windows with burst telemetry polling so energy uncertainty & confidence are quantified
+	for w := 0; w < repeatCount; w++ {
+		burstCtx, burstCancel := context.WithCancel(ctx)
+		if r.Monitor != nil {
+			_, _ = r.Monitor.PollOnce(ctx)
+			go func() {
+				tk := time.NewTicker(50 * time.Millisecond)
+				defer tk.Stop()
+				for {
+					select {
+					case <-burstCtx.Done():
+						return
+					case <-tk.C:
+						_, _ = r.Monitor.PollOnce(burstCtx)
+					}
+				}
+			}()
+		}
+
+		winStart := time.Now()
+		bCtx, bCancel := context.WithTimeout(ctx, r.KernelTimeout)
+		bCmd := exec.CommandContext(bCtx, art.binPath)
+		bCmd.Env = r.cudaExecEnv()
+		var bOut, bErr bytes.Buffer
+		bCmd.Stdout = &bOut
+		bCmd.Stderr = &bErr
+		runErr := bCmd.Run()
+		bCancel()
+		burstCancel()
+
+		if r.Monitor != nil {
+			_, _ = r.Monitor.PollOnce(ctx)
+		}
+		winEnd := time.Now()
+
+		if runErr != nil {
+			res.ErrorMessage = fmt.Sprintf("kernel execution failed (window %d): %v (%s)", w+1, runErr, strings.TrimSpace(bErr.String()))
+			return res
+		}
+
+		var hOut HarnessOutput
+		lines := strings.Split(strings.TrimSpace(bOut.String()), "\n")
+		parsed := false
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
+				if err := json.Unmarshal([]byte(line), &hOut); err == nil {
+					parsed = true
+					break
+				}
 			}
 		}
-	}
-	if !parsed {
-		res.ErrorMessage = fmt.Sprintf("failed to parse harness JSON output: %s", bOut.String())
-		return res
+		if !parsed {
+			res.ErrorMessage = fmt.Sprintf("failed to parse harness JSON output: %s", bOut.String())
+			return res
+		}
+
+		lastOut = hOut
+		medLatencies = append(medLatencies, hOut.MedianLatencyMS)
+		p95Latencies = append(p95Latencies, hOut.P95LatencyMS)
+		bwList = append(bwList, hOut.EffectiveBWGBps)
+
+		completedReqs := hOut.CompletedRequests
+		if completedReqs <= 0 {
+			completedReqs = art.spec.Iterations
+			if completedReqs <= 0 {
+				completedReqs = 200
+			}
+		}
+		winKernelMS := hOut.MedianLatencyMS * float64(completedReqs)
+		totalKernelMS += winKernelMS
+
+		if r.Monitor != nil {
+			winEnergy := r.Monitor.MeasureWindow(winStart, winEnd, completedReqs, hOut.MedianLatencyMS)
+			avgW := winEnergy.AvgPowerWatts
+			if avgW <= 0 {
+				avgW = idlePowerW
+				if avgW <= 0 {
+					avgW = 15.0
+				}
+			}
+			latSec := hOut.MedianLatencyMS / 1000.0
+			kernDurSec := latSec * float64(completedReqs)
+			jPerReq := avgW * latSec
+			winEnergy.DurationSec = kernDurSec
+			winEnergy.TotalEnergyJoules = jPerReq * float64(completedReqs)
+			winEnergy.JoulesPerRequest = jPerReq
+			winEnergy.JoulesPer1KRequests = jPerReq * 1000.0
+			winEnergy.EnergyDelayProduct = jPerReq * latSec
+			if avgW > 0 && hOut.MedianLatencyMS > 0 {
+				winEnergy.PerformancePerWatt = (1000.0 / hOut.MedianLatencyMS) / avgW
+			}
+			windowMeasurements = append(windowMeasurements, winEnergy)
+		}
 	}
 
-	res.ParityPassed = hOut.ParityPassed
-	res.EdgeCasePassed = hOut.EdgeCasePassed
-	res.MaxAbsError = hOut.MaxAbsError
-	res.MedianLatencyMS = hOut.MedianLatencyMS
-	res.P95LatencyMS = hOut.P95LatencyMS
-	res.EffectiveBWGBps = hOut.EffectiveBWGBps
-	res.PeakVRAMMiB = hOut.PeakVRAMMiB
+	// Median across repeated windows
+	res.ParityPassed = lastOut.ParityPassed
+	res.EdgeCasePassed = lastOut.EdgeCasePassed
+	res.MaxAbsError = lastOut.MaxAbsError
+	res.MedianLatencyMS = medianFloat(medLatencies)
+	res.P95LatencyMS = medianFloat(p95Latencies)
+	res.EffectiveBWGBps = medianFloat(bwList)
+	res.PeakVRAMMiB = lastOut.PeakVRAMMiB
 	if res.MedianLatencyMS > 0 {
 		res.ThroughputRPS = 1000.0 / res.MedianLatencyMS
 	}
 
-	completedReqs := hOut.CompletedRequests
-	if completedReqs <= 0 {
-		completedReqs = art.spec.Iterations
+	if r.Monitor != nil && len(windowMeasurements) > 0 {
+		res.Energy = telemetry.AggregateWindowMeasurements(windowMeasurements, idlePowerW, totalKernelMS, r.Monitor.Interval())
+	} else {
+		completedReqs := lastOut.CompletedRequests
 		if completedReqs <= 0 {
 			completedReqs = 200
 		}
-	}
-
-	// Step 3: Integrate power P(t) over the benchmark execution window, then attribute energy
-	// to the exact CUDA-event timed kernel execution duration (excluding host CUDA context init & CPU parity check).
-	if r.Monitor != nil {
-		winEnergy := r.Monitor.MeasureWindow(winStart, winEnd, completedReqs, res.MedianLatencyMS)
-		avgW := winEnergy.AvgPowerWatts
-		if avgW <= 0 {
-			avgW = 15.0
-		}
-		latSec := res.MedianLatencyMS / 1000.0
-		kernDurSec := latSec * float64(completedReqs)
-		jPerReq := avgW * latSec
-		winEnergy.DurationSec = kernDurSec
-		winEnergy.TotalEnergyJoules = jPerReq * float64(completedReqs)
-		winEnergy.JoulesPerRequest = jPerReq
-		winEnergy.JoulesPer1KRequests = jPerReq * 1000.0
-		winEnergy.EnergyDelayProduct = jPerReq * latSec
-		if avgW > 0 {
-			winEnergy.PerformancePerWatt = res.ThroughputRPS / avgW
-		}
-		res.Energy = winEnergy
-	} else {
-		// Fallback estimate if monitor is nil in isolated unit test
-		avgW := 48.0
 		durSec := (res.MedianLatencyMS / 1000.0) * float64(completedReqs)
-		totalJ := avgW * durSec
-		jPerReq := avgW * (res.MedianLatencyMS / 1000.0)
 		res.Energy = telemetry.EnergyMeasurement{
-			DurationSec:         durSec,
-			TotalEnergyJoules:   totalJ,
-			AvgPowerWatts:       avgW,
-			PeakPowerWatts:      avgW * 1.1,
-			JoulesPerRequest:    jPerReq,
-			JoulesPer1KRequests: jPerReq * 1000.0,
-			EnergyDelayProduct:  jPerReq * (res.MedianLatencyMS / 1000.0),
-			PerformancePerWatt:  res.ThroughputRPS / avgW,
-			SampleCount:         1,
+			DurationSec:             durSec,
+			TotalEnergyJoules:       0,
+			AvgPowerWatts:           0,
+			IdlePowerWatts:          0,
+			ActivePowerWatts:        0,
+			ActiveEnergyJoules:      0,
+			ActiveJoulesPer1K:       0,
+			PeakPowerWatts:          0,
+			JoulesPerRequest:        0,
+			JoulesPer1KRequests:     0,
+			EnergyDelayProduct:      0,
+			PerformancePerWatt:      0,
+			SampleCount:             0,
+			RepeatWindows:           repeatCount,
+			TotalKernelTimeMS:       totalKernelMS,
+			EnergyUncertaintyPct:    100.0,
+			EnergyUncertaintyJoules: 0,
+			MeasurementConfidence:   "LOW",
+			Provenance:              "ESTIMATED",
 		}
 	}
 
 	return res
+}
+
+func (r *Runner) cudaExecEnv() []string {
+	env := os.Environ()
+	if os.Getenv("CUDA_VISIBLE_DEVICES") == "" && r.GPUIndex >= 0 {
+		env = append(env, fmt.Sprintf("CUDA_VISIBLE_DEVICES=%d", r.GPUIndex))
+	}
+	return env
+}
+
+func medianFloat(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	cp := make([]float64, len(vals))
+	copy(cp, vals)
+	for i := 0; i < len(cp); i++ {
+		for j := i + 1; j < len(cp); j++ {
+			if cp[j] < cp[i] {
+				cp[i], cp[j] = cp[j], cp[i]
+			}
+		}
+	}
+	mid := len(cp) / 2
+	if len(cp)%2 == 1 {
+		return cp[mid]
+	}
+	return 0.5 * (cp[mid-1] + cp[mid])
 }

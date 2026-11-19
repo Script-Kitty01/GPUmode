@@ -47,6 +47,15 @@ func TestSimulateDigitalTwinAndBinPacking(t *testing.T) {
 	if scenarios[1].GPUCount >= scenarios[0].GPUCount {
 		t.Fatalf("expected optimized scenario to need fewer GPUs than baseline (%d vs %d)", scenarios[1].GPUCount, scenarios[0].GPUCount)
 	}
+	if scenarios[0].Provenance != "MEASURED" {
+		t.Errorf("expected baseline provenance MEASURED, got %s", scenarios[0].Provenance)
+	}
+	if len(scenarios) > 2 && scenarios[2].Provenance != "SIMULATED" {
+		t.Errorf("expected cross-SKU provenance SIMULATED, got %s", scenarios[2].Provenance)
+	}
+	if scenarios[0].CalibrationBasis == "" || scenarios[0].PriceAssumptionNote == "" {
+		t.Errorf("expected non-empty CalibrationBasis and PriceAssumptionNote")
+	}
 
 	plan := ScheduleWorkloads(nil, hw.TotalVRAMMiB, econ)
 	if plan.ConsolidatedGPUs >= plan.SeparateGPUsBefore {

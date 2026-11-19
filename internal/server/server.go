@@ -14,6 +14,7 @@ import (
 	"gpumode/internal/profiler"
 	"gpumode/internal/store"
 	"gpumode/internal/telemetry"
+	"gpumode/internal/workload"
 )
 
 // Server is the real-time Go daemon serving REST endpoints, live SSE telemetry streams, and the Web Dashboard.
@@ -52,6 +53,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/stream/telemetry", s.handleTelemetrySSE)
 	mux.HandleFunc("/api/optimize", s.handleOptimize)
 	mux.HandleFunc("/api/recompute", s.handleRecompute)
+	mux.HandleFunc("/api/workload", s.handleWorkload)
 	return mux
 }
 
@@ -229,6 +231,64 @@ func (s *Server) handleRecompute(w http.ResponseWriter, r *http.Request) {
 	updated := profiler.RecomputeEconomics(latest, econ)
 	_ = s.store.Save(updated)
 	writeJSON(w, http.StatusOK, updated)
+}
+
+func (s *Server) handleWorkload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req workload.BenchmarkConfig
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	def := workload.DefaultBenchmarkConfig()
+	if req.ServerURL == "" {
+		req.ServerURL = def.ServerURL
+	}
+	if req.ModelName == "" {
+		req.ModelName = def.ModelName
+	}
+	if req.ModelPath == "" {
+		if s.cfg.DeepSeekModelPath != "" {
+			req.ModelPath = s.cfg.DeepSeekModelPath
+		} else {
+			req.ModelPath = def.ModelPath
+		}
+	}
+	if req.NumRequests <= 0 {
+		req.NumRequests = def.NumRequests
+	}
+	if req.MaxTokens <= 0 {
+		req.MaxTokens = def.MaxTokens
+	}
+
+	s.mu.Lock()
+	if s.runningOp {
+		s.mu.Unlock()
+		http.Error(w, "a GPU benchmark job is already running", http.StatusConflict)
+		return
+	}
+	s.runningOp = true
+	econ := s.cfg.Economics
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.runningOp = false
+		s.mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
+	defer cancel()
+
+	rep, err := workload.RunInferenceBenchmark(ctx, req, s.monitor, econ)
+	if err != nil {
+		http.Error(w, "workload benchmark failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
