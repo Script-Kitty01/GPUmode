@@ -269,7 +269,7 @@ __global__ void rmsnorm_fused_kernel(
 
     float sum_sq = 0.0f;
 #if VEC_WIDTH == 4
-    int vec_cols = cols / 4;
+    int vec_cols = ((cols & 3) == 0) ? (cols / 4) : 0;
     const float4* rx4 = reinterpret_cast<const float4*>(rx);
     const float4* rr4 = reinterpret_cast<const float4*>(rr);
     for (int i = tid; i < vec_cols; i += BLOCK_SIZE) {
