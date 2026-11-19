@@ -44,7 +44,7 @@ type PyTorchTrace struct {
 	Hotspots       []HotspotOp `json:"hotspots"`
 }
 
-// SevenQuestionAnswers explicitly answers the 7 linked CUDA-to-Economics questions.
+// SevenQuestionAnswers explicitly answers the linked CUDA hardware and energy verification questions.
 type SevenQuestionAnswers struct {
 	Q1WhyUnderutilized      string `json:"q1WhyUnderutilized"`
 	Q2WhichOpsResponsible   string `json:"q2WhichOpsResponsible"`
@@ -52,7 +52,6 @@ type SevenQuestionAnswers struct {
 	Q4IsItNumericallySafe   string `json:"q4IsItNumericallySafe"`
 	Q5HowMuchEnergySaved    string `json:"q5HowMuchEnergySaved"`
 	Q6CanCheaperGPUServe    string `json:"q6CanCheaperGpuServe"`
-	Q7MonthlyMoneySaved     string `json:"q7MonthlyMoneySaved"`
 }
 
 // CausalChainReport is the unified closed-loop output of gpuMode:
@@ -269,7 +268,7 @@ func RecomputeEconomics(rep CausalChainReport, econ config.EconomicsConfig) Caus
 
 	rep.EconomicsComparison = physics.CompareWorkloadEconomics(baseMetrics, optMetrics, econ)
 
-	// Re-score Pareto candidates under new economic weights and SLA
+	// Re-score Pareto candidates under new SLA and weights
 	for i := range rep.Autotune.ParetoCandidates {
 		c := &rep.Autotune.ParetoCandidates[i]
 		m := physics.WorkloadMetrics{
@@ -281,7 +280,6 @@ func RecomputeEconomics(rep CausalChainReport, econ config.EconomicsConfig) Caus
 			PeakVRAMMiB:        c.PeakVRAMMiB,
 		}
 		kpi := physics.ComputeBusinessKPIs(m, econ)
-		c.CostPer1MInferencesUSD = kpi.CostPer1MInferencesUSD
 		c.MeetsLatencySLA = kpi.MeetsLatencySLA
 	}
 	rep.Autotune.ParetoRecommendations = pareto.Solve(rep.Autotune.ParetoCandidates, econ)
@@ -390,7 +388,7 @@ func buildSevenAnswers(
 	edpAfter := math.Max(1e-9, bestRes.Energy.EnergyDelayProduct)
 	edpRatio := edpBefore / edpAfter
 	q5 := fmt.Sprintf(
-		"[%s, %s confidence, ±%.1f%% uncertainty across %d windows] Reduces GPU board energy by %.1f%% (%.2f J → %.2f J per 1K inferences at %.1f W total / %.1f W active above %.1f W idle), improves EDP by %.2f×, and saves %.1f kWh/month (%.1f kg CO2e/month including PUE).",
+		"[%s, %s confidence, ±%.1f%% uncertainty across %d windows] Reduces GPU board energy by %.1f%% (%.2f J → %.2f J per 1K inferences at %.1f W total / %.1f W active above %.1f W idle) and improves EDP by %.2f×.",
 		bestRes.Energy.Provenance,
 		bestRes.Energy.MeasurementConfidence,
 		bestRes.Energy.EnergyUncertaintyPct,
@@ -402,14 +400,12 @@ func buildSevenAnswers(
 		bestRes.Energy.ActivePowerWatts,
 		bestRes.Energy.IdlePowerWatts,
 		edpRatio,
-		econComp.MonthlyKWhSaved,
-		econComp.MonthlyCarbonSavedKgCO2e,
 	)
 
 	recTwin := "current GPU fleet with fewer instances"
 	for _, sc := range twinScenarios {
 		if sc.Decision == "RECOMMENDED" {
-			recTwin = fmt.Sprintf("[%s, %.0f%% conf] %s (%s; %s)", sc.Provenance, sc.ConfidenceScorePct, sc.ScenarioName, sc.UnlockedByOptimization, sc.PriceAssumptionNote)
+			recTwin = fmt.Sprintf("[%s, %.0f%% conf] %s (%s)", sc.Provenance, sc.ConfidenceScorePct, sc.ScenarioName, sc.UnlockedByOptimization)
 			break
 		}
 	}
@@ -422,16 +418,6 @@ func buildSevenAnswers(
 		recTwin, paretoRecs.Balanced.Name,
 	)
 
-	q7 := fmt.Sprintf(
-		"Cuts unit cost by %.1f%% ($%.4f → $%.4f per 1M inferences), eliminating %d GPU instance(s) and saving $%.2f/month ($%.2f/year) in combined GPU infrastructure and PUE-adjusted electricity costs.",
-		econComp.CostPer1MReductionPct,
-		econComp.Baseline.CostPer1MInferencesUSD,
-		econComp.Optimized.CostPer1MInferencesUSD,
-		econComp.GPUsEliminated,
-		econComp.MonthlySavingsUSD,
-		econComp.AnnualSavingsUSD,
-	)
-
 	return SevenQuestionAnswers{
 		Q1WhyUnderutilized:      q1,
 		Q2WhichOpsResponsible:   q2,
@@ -439,7 +425,6 @@ func buildSevenAnswers(
 		Q4IsItNumericallySafe:   q4,
 		Q5HowMuchEnergySaved:    q5,
 		Q6CanCheaperGPUServe:    q6,
-		Q7MonthlyMoneySaved:     q7,
 	}
 }
 

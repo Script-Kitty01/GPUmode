@@ -10,36 +10,23 @@ import (
 	"time"
 )
 
-// EconomicsConfig holds user-configurable tariff, infrastructure, and SLA parameters
-// used to translate CUDA-level latency, energy, and VRAM into business metrics.
+// EconomicsConfig holds workload SLA and multi-objective optimization weights.
 type EconomicsConfig struct {
-	GPUHourlyRateUSD    float64 `json:"gpuHourlyRateUsd"`    // e.g. $1.50/hr for GPU instance or amortized hardware rate
-	ElectricityRateKWh  float64 `json:"electricityRateKwh"`  // e.g. $0.14/kWh
-	DatacenterPUE       float64 `json:"datacenterPue"`       // Power Usage Effectiveness (e.g. 1.30)
-	ServerOverheadWatts float64 `json:"serverOverheadWatts"` // Host CPU/RAM/cooling share per GPU (e.g. 35W)
-	CarbonIntensityGCO2 float64 `json:"carbonIntensityGco2"` // Grid gCO2e per kWh (e.g. 385 g/kWh)
-	TargetQPS           float64 `json:"targetQps"`           // Required workload requests/sec
-	LatencySLAMS        float64 `json:"latencySlaMs"`        // Maximum acceptable p95 latency in ms
-	MonthlyOperatingHrs float64 `json:"monthlyOperatingHrs"` // Default 730 hours/month
-	AlphaCostWeight     float64 `json:"alphaCostWeight"`     // Multi-objective weight for Cost/Time
-	BetaEnergyWeight    float64 `json:"betaEnergyWeight"`    // Multi-objective weight for Energy
-	GammaMemoryWeight   float64 `json:"gammaMemoryWeight"`   // Multi-objective weight for VRAM/Latency
+	TargetQPS         float64 `json:"targetQps"`         // Required workload requests/sec
+	LatencySLAMS      float64 `json:"latencySlaMs"`      // Maximum acceptable p95 latency in ms
+	AlphaCostWeight   float64 `json:"alphaCostWeight"`   // Multi-objective weight for Latency/Time
+	BetaEnergyWeight  float64 `json:"betaEnergyWeight"`  // Multi-objective weight for Energy
+	GammaMemoryWeight float64 `json:"gammaMemoryWeight"` // Multi-objective weight for VRAM
 }
 
-// DefaultEconomicsConfig returns sensible defaults that can be adjusted live in the Web Dashboard.
+// DefaultEconomicsConfig returns sensible defaults for workload SLA and multi-objective weights.
 func DefaultEconomicsConfig() EconomicsConfig {
 	return EconomicsConfig{
-		GPUHourlyRateUSD:    1.50,
-		ElectricityRateKWh:  0.14,
-		DatacenterPUE:       1.30,
-		ServerOverheadWatts: 35.0,
-		CarbonIntensityGCO2: 385.0,
-		TargetQPS:           120.0,
-		LatencySLAMS:        25.0,
-		MonthlyOperatingHrs: 730.0,
-		AlphaCostWeight:     0.45,
-		BetaEnergyWeight:    0.35,
-		GammaMemoryWeight:   0.20,
+		TargetQPS:         120.0,
+		LatencySLAMS:      25.0,
+		AlphaCostWeight:   0.45,
+		BetaEnergyWeight:  0.35,
+		GammaMemoryWeight: 0.20,
 	}
 }
 

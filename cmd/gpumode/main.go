@@ -44,9 +44,6 @@ func main() {
 	batch := fs.Int("batch", 256, "Batch x sequence token count")
 	hidden := fs.Int("hidden", 4096, "Hidden dimension")
 	iters := fs.Int("iters", 50, "Timed benchmark iterations")
-	gpuRate := fs.Float64("gpu-rate", cfg.Economics.GPUHourlyRateUSD, "Custom GPU hourly rate ($/GPU-hr)")
-	kwhRate := fs.Float64("kwh-rate", cfg.Economics.ElectricityRateKWh, "Electricity tariff ($/kWh)")
-	pue := fs.Float64("pue", cfg.Economics.DatacenterPUE, "Datacenter PUE multiplier")
 	qps := fs.Float64("qps", cfg.Economics.TargetQPS, "Target workload traffic (requests/sec)")
 	sla := fs.Float64("sla", cfg.Economics.LatencySLAMS, "Latency p95 SLA in milliseconds")
 	pythonPath := fs.String("python", cfg.PythonPath, "Python interpreter for PyTorch profiler bridge")
@@ -68,9 +65,6 @@ func main() {
 	cfg.PresetsPath = *presetsPath
 	cfg.DeepSeekModelPath = *deepseekModel
 	cfg.PythonPath = *pythonPath
-	cfg.Economics.GPUHourlyRateUSD = *gpuRate
-	cfg.Economics.ElectricityRateKWh = *kwhRate
-	cfg.Economics.DatacenterPUE = *pue
 	cfg.Economics.TargetQPS = *qps
 	cfg.Economics.LatencySLAMS = *sla
 
@@ -197,33 +191,19 @@ func printWorkloadReportCLI(rep workload.WorkloadBenchmarkReport) {
 	fmt.Printf("  • Power & Energy      : %.1f W total (%.1f W active above %.1f W idle) | %.2f J/1K tokens [%s, %s conf, ±%.1f%%]\n",
 		rep.Energy.AvgPowerWatts, rep.Energy.ActivePowerWatts, rep.Energy.IdlePowerWatts,
 		rep.JoulesPer1KTokens, rep.Energy.Provenance, rep.Energy.MeasurementConfidence, rep.Energy.EnergyUncertaintyPct)
-	fmt.Printf("  • Production Cost     : $%.4f / 1M output tokens | $%.4f / 1M requests\n",
-		rep.CostPer1MTokensUSD, rep.Economics.CostPer1MInferencesUSD)
 	fmt.Printf("================================================================================\n")
 }
 
 func printCausalReportCLI(rep profiler.CausalChainReport) {
-	ec := rep.EconomicsComparison
 	sa := rep.SevenAnswers
 	fmt.Printf("================================================================================\n")
-	fmt.Printf(" gpuMode — 7-Step CUDA-to-Economics Verification Report (%s / %s)\n", rep.Hardware.Name, rep.Hardware.ArchFlag)
+	fmt.Printf(" gpuMode — CUDA Hardware & Energy Verification Report (%s / %s)\n", rep.Hardware.Name, rep.Hardware.ArchFlag)
 	fmt.Printf("================================================================================\n")
-	fmt.Printf("Headline Business Metrics:\n")
-	fmt.Printf("  • $ / 1M Inferences      : $%.4f -> $%.4f (-%.1f%%)\n",
-		ec.Baseline.CostPer1MInferencesUSD, ec.Optimized.CostPer1MInferencesUSD, ec.CostPer1MReductionPct)
-	fmt.Printf("  • Joules / 1K Inferences : %.2f J -> %.2f J (-%.1f%% GPU energy)\n",
-		ec.Baseline.JoulesPer1KInferences, ec.Optimized.JoulesPer1KInferences, ec.EnergySavedPct)
-	fmt.Printf("  • Requests / GPU-Hour    : %.0f -> %.0f (%.2fx speedup)\n",
-		ec.Baseline.RequestsPerGPUHour, ec.Optimized.RequestsPerGPUHour, ec.SpeedupFactor)
-	fmt.Printf("  • Monthly Savings        : $%.2f/mo ($%.2f/yr) | %.1f kWh/mo | %.1f kg CO2e/mo\n\n",
-		ec.MonthlySavingsUSD, ec.AnnualSavingsUSD, ec.MonthlyKWhSaved, ec.MonthlyCarbonSavedKgCO2e)
-
 	fmt.Printf("1. Why is the GPU underutilized?\n   %s\n\n", sa.Q1WhyUnderutilized)
 	fmt.Printf("2. Which operations are responsible?\n   %s\n\n", sa.Q2WhichOpsResponsible)
 	fmt.Printf("3. What optimization helps?\n   %s\n\n", sa.Q3WhatOptimizationHelps)
 	fmt.Printf("4. Is that optimization numerically safe?\n   %s\n\n", sa.Q4IsItNumericallySafe)
 	fmt.Printf("5. How much energy does it save?\n   %s\n\n", sa.Q5HowMuchEnergySaved)
-	fmt.Printf("6. Can fewer/cheaper GPUs serve the workload?\n   %s\n\n", sa.Q6CanCheaperGPUServe)
-	fmt.Printf("7. How much money does the business save monthly?\n   %s\n", sa.Q7MonthlyMoneySaved)
+	fmt.Printf("6. Can fewer/cheaper GPUs serve the workload?\n   %s\n", sa.Q6CanCheaperGPUServe)
 	fmt.Printf("================================================================================\n")
 }

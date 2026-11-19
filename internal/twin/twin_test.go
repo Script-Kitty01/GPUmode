@@ -53,8 +53,8 @@ func TestSimulateDigitalTwinAndBinPacking(t *testing.T) {
 	if len(scenarios) > 2 && scenarios[2].Provenance != "SIMULATED" {
 		t.Errorf("expected cross-SKU provenance SIMULATED, got %s", scenarios[2].Provenance)
 	}
-	if scenarios[0].CalibrationBasis == "" || scenarios[0].PriceAssumptionNote == "" {
-		t.Errorf("expected non-empty CalibrationBasis and PriceAssumptionNote")
+	if scenarios[0].CalibrationBasis == "" {
+		t.Errorf("expected non-empty CalibrationBasis")
 	}
 
 	plan := ScheduleWorkloads(nil, hw.TotalVRAMMiB, econ)

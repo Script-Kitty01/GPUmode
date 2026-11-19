@@ -75,7 +75,7 @@ const dashboardHTML = `<!DOCTYPE html>
   /* Control Bar */
   .controls-grid {
     display: grid;
-    grid-template-columns: 1.25fr 1.75fr;
+    grid-template-columns: 1fr;
     gap: 14px;
     margin-bottom: 18px;
   }
@@ -130,23 +130,6 @@ const dashboardHTML = `<!DOCTYPE html>
     border: 1px solid var(--border);
   }
   .status-msg { font-size: 0.8rem; color: var(--amber); }
-
-  /* Headline KPIs */
-  .kpi-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 14px;
-    margin-bottom: 18px;
-  }
-  .kpi-card {
-    background: linear-gradient(145deg, #131a27, #172135);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 14px 16px;
-  }
-  .kpi-title { font-size: 0.76rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
-  .kpi-main { font-size: 1.55rem; font-weight: 800; margin: 4px 0; color: var(--green); font-variant-numeric: tabular-nums; }
-  .kpi-sub { font-size: 0.78rem; color: var(--muted); }
 
   /* 7-Question Causal Chain */
   .causal-grid {
@@ -224,7 +207,7 @@ const dashboardHTML = `<!DOCTYPE html>
     color: #cbd5e1;
   }
   @media (max-width: 1024px) {
-    .telemetry-strip, .controls-grid, .kpi-grid, .charts-grid, .two-col {
+    .telemetry-strip, .controls-grid, .charts-grid, .two-col {
       grid-template-columns: 1fr;
     }
   }
@@ -234,8 +217,8 @@ const dashboardHTML = `<!DOCTYPE html>
 
 <header>
   <div class="brand">
-    <h1>gpu<span>Mode</span> — GPU Resource Intelligence & CUDA-to-Economics Engine</h1>
-    <p>Closed-Loop Pipeline: Observe &rarr; Diagnose (Roofline) &rarr; Optimize (Bayesian/CUDA) &rarr; Verify (Sanitizer) &rarr; Measure Energy &rarr; Right-Size &rarr; Calculate Savings</p>
+    <h1>gpu<span>Mode</span> — GPU Resource Intelligence &amp; CUDA Optimization Engine</h1>
+    <p>Closed-Loop Pipeline: Observe &rarr; Diagnose (Roofline) &rarr; Optimize (Bayesian/CUDA) &rarr; Verify (Sanitizer) &rarr; Measure Energy &rarr; Right-Size</p>
   </div>
   <div class="hw-badge" id="hwBadge">
     Detecting GPU Hardware Physics...
@@ -271,10 +254,10 @@ const dashboardHTML = `<!DOCTYPE html>
   <canvas id="sparkCanvas" width="210" height="42"></canvas>
 </section>
 
-<!-- Controls: Live GPU Optimization Trigger + Custom Tariff & SLA Controls -->
+<!-- Controls: Live GPU Optimization Trigger -->
 <section class="controls-grid">
   <div class="card">
-    <h2>1. Live CUDA Hardware Optimization & Verification</h2>
+    <h2>1. Live CUDA Hardware Optimization &amp; Verification</h2>
     <div class="form-row">
       <div>
         <label for="opSelect">Target Hotspot Operation</label>
@@ -293,8 +276,6 @@ const dashboardHTML = `<!DOCTYPE html>
           <option value="GRID_SEARCH">Exhaustive Grid Search</option>
         </select>
       </div>
-    </div>
-    <div class="form-row">
       <div>
         <label for="batchInput">Batch &times; Tokens</label>
         <input type="number" id="batchInput" value="256" min="16" max="2048" step="16">
@@ -313,64 +294,6 @@ const dashboardHTML = `<!DOCTYPE html>
       <span class="status-msg" id="jobStatus"></span>
     </div>
   </div>
-
-  <div class="card">
-    <h2>2. Custom Hardware Tariff, Energy, Carbon &amp; SLA Parameters</h2>
-    <div class="form-row">
-      <div>
-        <label for="rateGpu">GPU Rate ($/GPU-hr)</label>
-        <input type="number" id="rateGpu" value="1.50" step="0.10" min="0.10">
-      </div>
-      <div>
-        <label for="rateKwh">Electricity ($/kWh)</label>
-        <input type="number" id="rateKwh" value="0.14" step="0.01" min="0.01">
-      </div>
-      <div>
-        <label for="ratePue">Datacenter PUE</label>
-        <input type="number" id="ratePue" value="1.30" step="0.05" min="1.0">
-      </div>
-      <div>
-        <label for="rateCarbon">Carbon (gCO2e/kWh)</label>
-        <input type="number" id="rateCarbon" value="385" step="10" min="10">
-      </div>
-      <div>
-        <label for="targetQps">Target Traffic (QPS)</label>
-        <input type="number" id="targetQps" value="350" step="25" min="10">
-      </div>
-      <div>
-        <label for="slaMs">Latency SLA (ms)</label>
-        <input type="number" id="slaMs" value="25.0" step="1.0" min="0.5">
-      </div>
-    </div>
-    <div class="btn-row">
-      <button class="btn-secondary" onclick="triggerRecompute()">Recalculate Economics &amp; Pareto Frontier</button>
-      <span style="font-size:0.77rem;color:var(--muted);">Instantly updates $/1M inferences, Joules/1K, Pareto winners &amp; Digital Twin</span>
-    </div>
-  </div>
-</section>
-
-<!-- Headline Business Metrics -->
-<section class="kpi-grid">
-  <div class="kpi-card">
-    <div class="kpi-title">Financial Efficiency ($ / 1M Inferences)</div>
-    <div class="kpi-main" id="kpiCost">--</div>
-    <div class="kpi-sub" id="kpiCostSub">Baseline: --</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-title">Energy Efficiency (Joules / 1K Inferences)</div>
-    <div class="kpi-main" id="kpiJoules">--</div>
-    <div class="kpi-sub" id="kpiJoulesSub">Baseline: --</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-title">Hardware Efficiency (Requests / GPU-Hour)</div>
-    <div class="kpi-main" id="kpiReqHr">--</div>
-    <div class="kpi-sub" id="kpiReqHrSub">Speedup: --</div>
-  </div>
-  <div class="kpi-card">
-    <div class="kpi-title">Verified Monthly Infrastructure Savings</div>
-    <div class="kpi-main" id="kpiMonthlySave">--</div>
-    <div class="kpi-sub" id="kpiMonthlySub">--</div>
-  </div>
 </section>
 
 <!-- Digital Twin SKU Right-Sizing & DVFS Power-Clock Policies -->
@@ -385,8 +308,7 @@ const dashboardHTML = `<!DOCTYPE html>
           <th>Latency</th>
           <th>Fleet Cap (RPS)</th>
           <th>VRAM Fit</th>
-          <th>Monthly Cost</th>
-          <th>Calibration / Price Basis</th>
+          <th>Calibration Basis</th>
           <th>Decision</th>
         </tr>
       </thead>
@@ -416,7 +338,7 @@ const dashboardHTML = `<!DOCTYPE html>
 
 <!-- Real Local OpenAI-Compatible / Ollama Inference Workload Adapter -->
 <section class="card" style="margin-bottom:18px;">
-  <h2>3. Production LLM Workload Adapter (Local llama-server / Ollama Streaming Benchmark) <span class="badge badge-blue" id="workloadProvBadge">MEASURED END-TO-END</span></h2>
+  <h2>2. Production LLM Workload Adapter (Local llama-server / Ollama Streaming Benchmark) <span class="badge badge-blue" id="workloadProvBadge">MEASURED END-TO-END</span></h2>
   <div class="form-row">
     <div>
       <label for="llmUrl">Inference Server URL (llama-server / Ollama)</label>
@@ -467,14 +389,6 @@ async function loadInitialState() {
     const data = await res.json();
     currentState = data;
     renderHardware(data.hardware);
-    if (data.economics) {
-      document.getElementById("rateGpu").value = data.economics.gpuHourlyRateUsd;
-      document.getElementById("rateKwh").value = data.economics.electricityRateKwh;
-      document.getElementById("ratePue").value = data.economics.datacenterPue;
-      document.getElementById("rateCarbon").value = data.economics.carbonIntensityGco2;
-      document.getElementById("targetQps").value = data.economics.targetQps;
-      document.getElementById("slaMs").value = data.economics.latencySlaMs;
-    }
     if (data.telemetryHistory && data.telemetryHistory.length) {
       data.telemetryHistory.forEach(s => updateTelemetryUI(s, false));
       drawSparkline();
@@ -552,22 +466,6 @@ function connectSSE() {
   };
 }
 
-function readEconomicsForm() {
-  return {
-    gpuHourlyRateUsd: parseFloat(document.getElementById("rateGpu").value) || 1.50,
-    electricityRateKwh: parseFloat(document.getElementById("rateKwh").value) || 0.14,
-    datacenterPue: parseFloat(document.getElementById("ratePue").value) || 1.30,
-    serverOverheadWatts: 35.0,
-    carbonIntensityGco2: parseFloat(document.getElementById("rateCarbon").value) || 385.0,
-    targetQps: parseFloat(document.getElementById("targetQps").value) || 350.0,
-    latencySlaMs: parseFloat(document.getElementById("slaMs").value) || 25.0,
-    monthlyOperatingHrs: 730.0,
-    alphaCostWeight: 0.45,
-    betaEnergyWeight: 0.35,
-    gammaMemoryWeight: 0.20
-  };
-}
-
 async function triggerOptimize() {
   const btn = document.getElementById("runOptBtn");
   const status = document.getElementById("jobStatus");
@@ -580,8 +478,7 @@ async function triggerOptimize() {
       strategy: document.getElementById("strategySelect").value,
       batchSize: parseInt(document.getElementById("batchInput").value) || 256,
       hiddenDim: parseInt(document.getElementById("hiddenInput").value) || 4096,
-      iterations: parseInt(document.getElementById("iterInput").value) || 50,
-      economics: readEconomicsForm()
+      iterations: parseInt(document.getElementById("iterInput").value) || 50
     };
     const res = await fetch("/api/optimize", {
       method: "POST",
@@ -601,55 +498,8 @@ async function triggerOptimize() {
   }
 }
 
-async function triggerRecompute() {
-  const status = document.getElementById("jobStatus");
-  try {
-    const res = await fetch("/api/recompute", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(readEconomicsForm())
-    });
-    if (res.ok) {
-      const rep = await res.json();
-      if (rep && rep.id) {
-        renderReport(rep);
-        status.textContent = "Economics & Pareto frontier updated!";
-      }
-    }
-  } catch (e) {
-    status.textContent = "Recompute error: " + e.message;
-  }
-}
-
 function renderReport(rep) {
-  if (!rep || !rep.economicsComparison) return;
-  const ec = rep.economicsComparison;
-
-  // Headline KPIs
-  document.getElementById("kpiCost").textContent = "$" + fmtNum(ec.optimized.costPer1mInferencesUsd, 4);
-  document.getElementById("kpiCostSub").textContent =
-    "Baseline: $" + fmtNum(ec.baseline.costPer1mInferencesUsd, 4) +
-    " (-" + fmtNum(ec.costPer1mReductionPct, 1) + "%)";
-
-  const eng = (rep.autotune && rep.autotune.bestResult && rep.autotune.bestResult.energy) || {};
-  const prov = eng.provenance || "MEASURED";
-  const conf = eng.measurementConfidence || "MEDIUM";
-  const unc = eng.energyUncertaintyPct ? ("±" + fmtNum(eng.energyUncertaintyPct, 1) + "%") : "";
-  document.getElementById("kpiJoules").textContent = fmtNum(ec.optimized.joulesPer1kInferences, 1) + " J";
-  document.getElementById("kpiJoulesSub").textContent =
-    "[" + prov + " • " + conf + " " + unc + "] Active " + fmtNum(eng.activePowerWatts, 1) + "W (Idle " + fmtNum(eng.idlePowerWatts, 1) + "W) • Baseline: " +
-    fmtNum(ec.baseline.joulesPer1kInferences, 1) + " J (-" + fmtNum(ec.energySavedPct, 1) + "%)";
-
-  document.getElementById("kpiReqHr").textContent = Number(Math.round(ec.optimized.requestsPerGpuHour)).toLocaleString();
-  document.getElementById("kpiReqHrSub").textContent =
-    "Baseline: " + Number(Math.round(ec.baseline.requestsPerGpuHour)).toLocaleString() +
-    " (" + fmtNum(ec.speedupFactor, 2) + "x faster)";
-
-  document.getElementById("kpiMonthlySave").textContent = "$" + fmtNum(ec.monthlySavingsUsd, 2) + "/mo";
-  document.getElementById("kpiMonthlySub").textContent =
-    "$" + fmtNum(ec.annualSavingsUsd, 0) + "/yr • " +
-    fmtNum(ec.monthlyKwhSaved, 1) + " kWh & " +
-    fmtNum(ec.monthlyCarbonSavedKgCo2e, 1) + " kg CO2e saved";
+  if (!rep) return;
 
   // Digital Twin Table
   const twinBody = document.getElementById("twinBody");
@@ -665,7 +515,6 @@ function renderReport(rep) {
       "<td>" + fmtNum(sc.estimatedLatencyMs, 2) + " ms</td>" +
       "<td>" + fmtNum(sc.estimatedThroughputRps, 0) + " req/s</td>" +
       "<td>" + fmtNum(sc.requiredVramMib, 0) + " / " + fmtNum(sc.availableVramMib, 0) + " MiB</td>" +
-      "<td>$" + fmtNum(sc.monthlyTotalCostUsd, 0) + "/mo</td>" +
       "<td style='font-size:0.74rem;color:var(--muted);'>" + (sc.calibrationBasis || sc.unlockedByOptimization) + "</td>" +
       "<td><span class='badge " + bcls + "'>" + sc.decision + "</span></td>" +
       "</tr>";
@@ -693,14 +542,13 @@ function renderReport(rep) {
   if (sp && af) {
     document.getElementById("scheduleBox").innerHTML =
       "<strong>Multi-Workload Bin-Packing Scheduler (J = &alpha;C + &beta;E + &gamma;L = " + fmtNum(sp.objectiveScoreJ, 2) + "):</strong> " +
-      "Consolidates " + sp.separateGpusBefore + " separate inference workloads onto <strong>" + sp.consolidatedGpus + " GPU(s)</strong>, saving <strong>$" +
-      fmtNum(sp.monthlyPackingSave, 0) + "/mo</strong>.<br>" +
+      "Consolidates " + sp.separateGpusBefore + " separate inference workloads onto <strong>" + sp.consolidatedGpus + " GPU(s)</strong>.<br>" +
       "<strong>Predictive Autoscaler (15-min Holt Forecast):</strong> Current " + fmtNum(af.currentTrafficRps, 0) +
       " req/s &rarr; Predicted " + fmtNum(af.predictedTraffic15Min, 0) + " req/s &bull; <em>" + af.action + "</em>";
   }
 
   // Code boxes
-  if (rep.autotune.bestResult && rep.autotune.bestResult.spec) {
+  if (rep.autotune && rep.autotune.bestResult && rep.autotune.bestResult.spec) {
     document.getElementById("optCodeBox").textContent = rep.autotune.bestResult.spec.displayKernel;
   }
   document.getElementById("torchExtBox").textContent = rep.pytorchExtensionCode || "";
@@ -732,8 +580,7 @@ async function triggerWorkload() {
       "<strong>TPOT:</strong> " + fmtNum(w.medianTpotMs, 2) + " ms/tok &bull; " +
       "<strong>Throughput:</strong> " + fmtNum(w.throughputTokensPerS, 2) + " tok/s &bull; " +
       "<strong>Peak VRAM:</strong> " + fmtNum(w.measuredPeakVramMib, 0) + " MiB &bull; " +
-      "<strong>Energy:</strong> " + fmtNum(w.joulesPer1kTokens, 1) + " J/1K tokens (" + fmtNum(w.energy.activePowerWatts, 1) + "W active) &bull; " +
-      "<strong>Cost:</strong> $" + fmtNum(w.costPer1mTokensUsd, 4) + " / 1M tokens";
+      "<strong>Energy:</strong> " + fmtNum(w.joulesPer1kTokens, 1) + " J/1K tokens (" + fmtNum(w.energy.activePowerWatts, 1) + "W active)";
   } catch (e) {
     status.textContent = "Error: " + e.message;
   } finally {

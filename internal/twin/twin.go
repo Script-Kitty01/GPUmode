@@ -14,23 +14,18 @@ type DigitalTwinScenario struct {
 	ScenarioName           string  `json:"scenarioName"`
 	HardwareName           string  `json:"hardwareName"`
 	GPUCount               int     `json:"gpuCount"`
-	HourlyRatePerGPU       float64 `json:"hourlyRatePerGpu"`
 	EstimatedLatencyMS     float64 `json:"estimatedLatencyMs"`
 	EstimatedThroughputRPS float64 `json:"estimatedThroughputRps"`
 	RequiredVRAMMiB        float64 `json:"requiredVramMib"`
 	AvailableVRAMMiB       float64 `json:"availableVramMib"`
 	VRAMFits               bool    `json:"vramFits"`
 	MeetsQPSAndSLA         bool    `json:"meetsQpsAndSla"`
-	CostPer1MInferencesUSD float64 `json:"costPer1mInferencesUsd"`
 	JoulesPer1KInferences  float64 `json:"joulesPer1kInferences"`
-	MonthlyTotalCostUSD    float64 `json:"monthlyTotalCostUsd"`
-	MonthlySavingsVsBase   float64 `json:"monthlySavingsVsBase"`
 	UnlockedByOptimization string  `json:"unlockedByOptimization"` // e.g. "CUDA Fusion + float4" or "VRAM Activation Reduction"
 	Decision               string  `json:"decision"`               // "RECOMMENDED", "VIABLE", "VRAM_EXCEEDED", "SLA_OR_QPS_INSUFFICIENT"
 	ConfidenceScorePct     float64 `json:"confidenceScorePct"`
 	Provenance             string  `json:"provenance"` // "MEASURED" (local GPU) or "SIMULATED" (cross-SKU Roofline projection)
 	CalibrationBasis       string  `json:"calibrationBasis"`
-	PriceAssumptionNote    string  `json:"priceAssumptionNote"`
 }
 
 // WorkloadItem represents an inference service or batch job to be co-located by the bin-packing scheduler.
@@ -56,14 +51,13 @@ type GPUBin struct {
 	EstimatedPowerWatts   float64  `json:"estimatedPowerWatts"`
 }
 
-// SchedulePlan summarizes the bin-packing and carbon/off-peak scheduling recommendation.
+// SchedulePlan summarizes the bin-packing and off-peak scheduling recommendation.
 type SchedulePlan struct {
 	SeparateGPUsBefore   int      `json:"separateGpusBefore"`
 	ConsolidatedGPUs     int      `json:"consolidatedGpus"`
 	GPUsSavedByPacking   int      `json:"gpusSavedByPacking"`
 	Bins                 []GPUBin `json:"bins"`
 	ObjectiveScoreJ      float64  `json:"objectiveScoreJ"` // J = αC + βE + γL
-	MonthlyPackingSave   float64  `json:"monthlyPackingSave"`
 	OffPeakDeferralNotes []string `json:"offPeakDeferralNotes"`
 }
 
@@ -75,7 +69,6 @@ type AutoscaleForecast struct {
 	CurrentGPUs           int     `json:"currentGpus"`
 	RecommendedGPUs       int     `json:"recommendedGpus"`
 	Action                string  `json:"action"`
-	HourlyCostDeltaUSD    float64 `json:"hourlyCostDeltaUsd"`
 }
 
 // SimulateDigitalTwin evaluates the optimized workload across the local hardware physics and default reference tiers.
@@ -101,11 +94,7 @@ func SimulateDigitalTwinWithPresets(
 ) []DigitalTwinScenario {
 	if len(presets) > 0 {
 		presets[0] = localHW
-		if presets[0].HourlyRateHintUSD <= 0 {
-			presets[0].HourlyRateHintUSD = econ.GPUHourlyRateUSD
-		}
 	} else {
-		localHW.HourlyRateHintUSD = econ.GPUHourlyRateUSD
 		presets = []physics.GPUHardwareSpec{localHW}
 	}
 
@@ -117,30 +106,25 @@ func SimulateDigitalTwinWithPresets(
 		ScenarioName:           "Baseline (Unoptimized)",
 		HardwareName:           localHW.Name,
 		GPUCount:               baseKPI.GPUsRequiredForTargetQPS,
-		HourlyRatePerGPU:       econ.GPUHourlyRateUSD,
 		EstimatedLatencyMS:     baseMetrics.LatencyMS,
 		EstimatedThroughputRPS: baseMetrics.ThroughputRPS * float64(baseKPI.GPUsRequiredForTargetQPS),
 		RequiredVRAMMiB:        baseMetrics.PeakVRAMMiB,
 		AvailableVRAMMiB:       localHW.TotalVRAMMiB,
 		VRAMFits:               baseMetrics.PeakVRAMMiB <= localHW.TotalVRAMMiB,
 		MeetsQPSAndSLA:         baseKPI.MeetsLatencySLA,
-		CostPer1MInferencesUSD: baseKPI.CostPer1MInferencesUSD,
 		JoulesPer1KInferences:  baseKPI.JoulesPer1KInferences,
-		MonthlyTotalCostUSD:    baseKPI.MonthlyTotalCostUSD,
-		MonthlySavingsVsBase:   0,
 		UnlockedByOptimization: "None (Baseline)",
 		Decision:               "BASELINE",
 		ConfidenceScorePct:     98.0,
 		Provenance:             "MEASURED",
 		CalibrationBasis:       fmt.Sprintf("Direct CUDA event timing & nvidia-smi probe on %s (%s)", localHW.Name, localHW.ArchFlag),
-		PriceAssumptionNote:    fmt.Sprintf("User-configured tariff ($%.2f/GPU-hr, $%.3f/kWh, PUE %.2f)", econ.GPUHourlyRateUSD, econ.ElectricityRateKWh, econ.DatacenterPUE),
 	})
 
 	mbFrac := math.Max(0.15, math.Min(0.95, memoryBoundFraction))
 	cbFrac := 1.0 - mbFrac
 
 	bestIdx := -1
-	bestCost := math.MaxFloat64
+	bestJoules := math.MaxFloat64
 
 	for idx, spec := range presets {
 		// Scale performance from localHW to candidate spec using Roofline bandwidth & FP32 scaling
@@ -177,14 +161,6 @@ func SimulateDigitalTwinWithPresets(
 			estWatts = spec.TDPWatts * 0.65
 		}
 
-		rate := econ.GPUHourlyRateUSD
-		if idx > 0 && spec.HourlyRateHintUSD > 0 {
-			// Scale relative to user's configured hourly rate or use preset hint
-			rate = spec.HourlyRateHintUSD
-		}
-
-		simEcon := econ
-		simEcon.GPUHourlyRateUSD = rate
 		simMetrics := physics.WorkloadMetrics{
 			LatencyMS:          estLat,
 			P95LatencyMS:       estP95,
@@ -193,7 +169,7 @@ func SimulateDigitalTwinWithPresets(
 			EnergyJoulesPerReq: estWatts / math.Max(1e-6, estRPSPerGPU),
 			PeakVRAMMiB:        optMetrics.PeakVRAMMiB,
 		}
-		kpi := physics.ComputeBusinessKPIs(simMetrics, simEcon)
+		kpi := physics.ComputeBusinessKPIs(simMetrics, econ)
 
 		vramFits := optMetrics.PeakVRAMMiB <= spec.TotalVRAMMiB
 		baseVRAMFit := baseMetrics.PeakVRAMMiB <= spec.TotalVRAMMiB
@@ -215,41 +191,34 @@ func SimulateDigitalTwinWithPresets(
 		confidence := 96.0
 		provenance := "MEASURED"
 		calibBasis := fmt.Sprintf("Direct hardware measurement on %s (%.0f GB/s BW, %.1f TFLOPS FP32)", spec.Name, spec.PeakMemBandwidthGBps, spec.PeakFP32TFLOPS)
-		priceNote := fmt.Sprintf("User-configured tariff ($%.2f/GPU-hr)", rate)
 		if idx > 0 {
 			provenance = "SIMULATED"
 			confidence = 78.0 // Unvalidated cross-SKU Roofline projection
 			calibBasis = fmt.Sprintf("Cross-SKU Roofline scaling (%.0f%% memory-BW ratio %.2fx + %.0f%% FP32 ratio %.2fx); requires target-GPU benchmark to validate",
 				mbFrac*100.0, bwRatio, cbFrac*100.0, fpRatio)
-			priceNote = fmt.Sprintf("Reference cloud on-demand SKU rate ($%.2f/GPU-hr) — compare apples-to-apples only against cloud deployment rates", rate)
 		}
 
 		sc := DigitalTwinScenario{
 			ScenarioName:           fmt.Sprintf("Optimized on %d× %s", kpi.GPUsRequiredForTargetQPS, spec.Name),
 			HardwareName:           spec.Name,
 			GPUCount:               kpi.GPUsRequiredForTargetQPS,
-			HourlyRatePerGPU:       rate,
 			EstimatedLatencyMS:     estLat,
 			EstimatedThroughputRPS: estRPSPerGPU * float64(kpi.GPUsRequiredForTargetQPS),
 			RequiredVRAMMiB:        optMetrics.PeakVRAMMiB,
 			AvailableVRAMMiB:       spec.TotalVRAMMiB,
 			VRAMFits:               vramFits,
 			MeetsQPSAndSLA:         vramFits && kpi.MeetsLatencySLA,
-			CostPer1MInferencesUSD: kpi.CostPer1MInferencesUSD,
 			JoulesPer1KInferences:  kpi.JoulesPer1KInferences,
-			MonthlyTotalCostUSD:    kpi.MonthlyTotalCostUSD,
-			MonthlySavingsVsBase:   baseKPI.MonthlyTotalCostUSD - kpi.MonthlyTotalCostUSD,
 			UnlockedByOptimization: unlockedBy,
 			Decision:               decision,
 			ConfidenceScorePct:     confidence,
 			Provenance:             provenance,
 			CalibrationBasis:       calibBasis,
-			PriceAssumptionNote:    priceNote,
 		}
 		scenarios = append(scenarios, sc)
 
-		if sc.MeetsQPSAndSLA && sc.MonthlyTotalCostUSD < bestCost {
-			bestCost = sc.MonthlyTotalCostUSD
+		if sc.MeetsQPSAndSLA && sc.JoulesPer1KInferences < bestJoules {
+			bestJoules = sc.JoulesPer1KInferences
 			bestIdx = len(scenarios) - 1
 		}
 	}
@@ -257,7 +226,6 @@ func SimulateDigitalTwinWithPresets(
 	if bestIdx >= 0 {
 		scenarios[bestIdx].Decision = "RECOMMENDED"
 	}
-
 	return scenarios
 }
 
@@ -296,7 +264,7 @@ func ScheduleWorkloads(workloads []WorkloadItem, vramCapMiB float64, econ config
 	for _, w := range sorted {
 		if w.DeferrableToOffPk {
 			offPeakNotes = append(offPeakNotes, fmt.Sprintf(
-				"Defer '%s' (%s priority) to off-peak low-carbon window (-22%% electricity tariff & -30%% gCO2e/kWh)",
+				"Defer '%s' (%s priority) to off-peak execution window",
 				w.Name, w.Priority,
 			))
 		}
@@ -336,12 +304,6 @@ func ScheduleWorkloads(workloads []WorkloadItem, vramCapMiB float64, econ config
 		savedGPUs = 0
 	}
 
-	monthlyHours := econ.MonthlyOperatingHrs
-	if monthlyHours <= 0 {
-		monthlyHours = 730.0
-	}
-	monthlySave := float64(savedGPUs) * econ.GPUHourlyRateUSD * monthlyHours
-
 	// Compute J = αC + βE + γL normalized objective
 	totalPower := 0.0
 	maxUtil := 0.0
@@ -362,7 +324,6 @@ func ScheduleWorkloads(workloads []WorkloadItem, vramCapMiB float64, econ config
 		GPUsSavedByPacking:   savedGPUs,
 		Bins:                 bins,
 		ObjectiveScoreJ:      jScore,
-		MonthlyPackingSave:   monthlySave,
 		OffPeakDeferralNotes: offPeakNotes,
 	}
 }
@@ -450,6 +411,5 @@ func ForecastAutoscaling(qpsHistory []float64, perGPUCapacityRPS float64, econ c
 		CurrentGPUs:           curGPUs,
 		RecommendedGPUs:       recGPUs,
 		Action:                action,
-		HourlyCostDeltaUSD:    float64(recGPUs-curGPUs) * econ.GPUHourlyRateUSD,
 	}
 }

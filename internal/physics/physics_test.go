@@ -77,7 +77,7 @@ func TestReferenceHardwarePresets(t *testing.T) {
 
 	// Verify external JSON presets loading overrides embedded list
 	customPath := filepath.Join(t.TempDir(), "custom_presets.json")
-	customJSON := `[{"name":"Custom NVIDIA H200","computeCapability":"9.0","archFlag":"sm_90","smCount":132,"totalVramMib":144384,"peakFp32Tflops":67.0,"peakMemBandwidthGbps":4800.0,"tdpWatts":700.0,"hourlyRateHintUsd":5.50}]`
+	customJSON := `[{"name":"Custom NVIDIA H200","computeCapability":"9.0","archFlag":"sm_90","smCount":132,"totalVramMib":144384,"peakFp32Tflops":67.0,"peakMemBandwidthGbps":4800.0,"tdpWatts":700.0}]`
 	if err := os.WriteFile(customPath, []byte(customJSON), 0o600); err != nil {
 		t.Fatalf("WriteFile failed: %v", err)
 	}
@@ -89,17 +89,11 @@ func TestReferenceHardwarePresets(t *testing.T) {
 
 func TestComputeBusinessKPIsAndCompareEconomics(t *testing.T) {
 	econ := config.EconomicsConfig{
-		GPUHourlyRateUSD:    1.50,
-		ElectricityRateKWh:  0.14,
-		DatacenterPUE:       1.30,
-		ServerOverheadWatts: 35.0,
-		CarbonIntensityGCO2: 385.0,
-		TargetQPS:           150.0,
-		LatencySLAMS:        20.0,
-		MonthlyOperatingHrs: 730.0,
-		AlphaCostWeight:     0.45,
-		BetaEnergyWeight:    0.35,
-		GammaMemoryWeight:   0.20,
+		TargetQPS:         150.0,
+		LatencySLAMS:      20.0,
+		AlphaCostWeight:   0.45,
+		BetaEnergyWeight:  0.35,
+		GammaMemoryWeight: 0.20,
 	}
 
 	// Baseline: slower kernel (25ms latency, 40 RPS/GPU, 62W power, violates 20ms SLA, requires 4 GPUs for 150 QPS)
@@ -131,10 +125,6 @@ func TestComputeBusinessKPIsAndCompareEconomics(t *testing.T) {
 		t.Errorf("expected optimized to meet 20ms latency SLA (p95=12.5ms)")
 	}
 
-	if cmp.Optimized.CostPer1MInferencesUSD >= cmp.Baseline.CostPer1MInferencesUSD {
-		t.Errorf("expected optimized $/1M inferences (%.4f) < baseline (%.4f)",
-			cmp.Optimized.CostPer1MInferencesUSD, cmp.Baseline.CostPer1MInferencesUSD)
-	}
 	if cmp.Optimized.JoulesPer1KInferences >= cmp.Baseline.JoulesPer1KInferences {
 		t.Errorf("expected optimized Joules/1K (%.2f) < baseline (%.2f)",
 			cmp.Optimized.JoulesPer1KInferences, cmp.Baseline.JoulesPer1KInferences)
@@ -156,18 +146,6 @@ func TestComputeBusinessKPIsAndCompareEconomics(t *testing.T) {
 
 	if cmp.SpeedupFactor != 2.5 {
 		t.Errorf("expected SpeedupFactor = 2.50, got %.2f", cmp.SpeedupFactor)
-	}
-	if cmp.MonthlySavingsUSD <= 2000.0 {
-		t.Errorf("expected MonthlySavingsUSD > $2000, got %.2f", cmp.MonthlySavingsUSD)
-	}
-	if cmp.AnnualSavingsUSD <= 24000.0 {
-		t.Errorf("expected AnnualSavingsUSD > $24000, got %.2f", cmp.AnnualSavingsUSD)
-	}
-	if cmp.MonthlyKWhSaved <= 100.0 {
-		t.Errorf("expected MonthlyKWhSaved > 100 kWh, got %.2f", cmp.MonthlyKWhSaved)
-	}
-	if cmp.MonthlyCarbonSavedKgCO2e <= 40.0 {
-		t.Errorf("expected MonthlyCarbonSavedKgCO2e > 40 kg, got %.2f", cmp.MonthlyCarbonSavedKgCO2e)
 	}
 	if cmp.VRAMReductionMiB != 1100.0 {
 		t.Errorf("expected VRAMReductionMiB = 1100.0, got %.2f", cmp.VRAMReductionMiB)

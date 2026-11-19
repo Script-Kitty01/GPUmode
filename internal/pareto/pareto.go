@@ -13,50 +13,46 @@ type OperatingMode string
 const (
 	ModePerformance  OperatingMode = "PERFORMANCE"
 	ModeEnergySaving OperatingMode = "ENERGY_SAVING"
-	ModeCostSaving   OperatingMode = "COST_SAVING"
 	ModeBalanced     OperatingMode = "BALANCED"
 )
 
 // Candidate represents a verified kernel or execution configuration evaluated on multiple objectives.
 type Candidate struct {
-	ID                     string  `json:"id"`
-	Name                   string  `json:"name"`
-	Variant                string  `json:"variant"`
-	BlockSize              int     `json:"blockSize"`
-	VecWidth               int     `json:"vecWidth"`
-	Fused                  bool    `json:"fused"`
-	LatencyMS              float64 `json:"latencyMs"`
-	P95LatencyMS           float64 `json:"p95LatencyMs"`
-	ThroughputRPS          float64 `json:"throughputRps"`
-	PowerWatts             float64 `json:"powerWatts"`
-	JoulesPer1KRequests    float64 `json:"joulesPer1kRequests"`
-	CostPer1MInferencesUSD float64 `json:"costPer1mInferencesUsd"`
-	PeakVRAMMiB            float64 `json:"peakVramMib"`
-	MeetsLatencySLA        bool    `json:"meetsLatencySla"`
-	VerifiedCorrect        bool    `json:"verifiedCorrect"`
-	SanitizerClean         bool    `json:"sanitizerClean"`
-	IsParetoOptimal        bool    `json:"isParetoOptimal"`
-	ScalarizedScore        float64 `json:"scalarizedScore"` // Lower is better: J(θ) = αT + βE + γM
+	ID                  string  `json:"id"`
+	Name                string  `json:"name"`
+	Variant             string  `json:"variant"`
+	BlockSize           int     `json:"blockSize"`
+	VecWidth            int     `json:"vecWidth"`
+	Fused               bool    `json:"fused"`
+	LatencyMS           float64 `json:"latencyMs"`
+	P95LatencyMS        float64 `json:"p95LatencyMs"`
+	ThroughputRPS       float64 `json:"throughputRps"`
+	PowerWatts          float64 `json:"powerWatts"`
+	JoulesPer1KRequests float64 `json:"joulesPer1kRequests"`
+	PeakVRAMMiB         float64 `json:"peakVramMib"`
+	MeetsLatencySLA     bool    `json:"meetsLatencySla"`
+	VerifiedCorrect     bool    `json:"verifiedCorrect"`
+	SanitizerClean      bool    `json:"sanitizerClean"`
+	IsParetoOptimal     bool    `json:"isParetoOptimal"`
+	ScalarizedScore     float64 `json:"scalarizedScore"` // Lower is better: J(θ) = αT + βE + γM
 }
 
-// ModeRecommendations maps each business operating mode to the best verified Pareto-optimal candidate.
+// ModeRecommendations maps each operating mode to the best verified Pareto-optimal candidate.
 type ModeRecommendations struct {
 	Performance  Candidate   `json:"performance"`
 	EnergySaving Candidate   `json:"energySaving"`
-	CostSaving   Candidate   `json:"costSaving"`
 	Balanced     Candidate   `json:"balanced"`
 	Frontier     []Candidate `json:"frontier"`
 	AllEvaluated []Candidate `json:"allEvaluated"`
 }
 
 // Dominates returns true if candidate a Pareto-dominates candidate b across
-// (LatencyMS, JoulesPer1KRequests, CostPer1MInferencesUSD, PeakVRAMMiB),
+// (LatencyMS, JoulesPer1KRequests, PeakVRAMMiB),
 // meaning a is <= b on all objectives and strictly < b on at least one objective.
 func Dominates(a, b Candidate) bool {
 	const eps = 1e-9
 	noWorse := a.LatencyMS <= b.LatencyMS+eps &&
 		a.JoulesPer1KRequests <= b.JoulesPer1KRequests+eps &&
-		a.CostPer1MInferencesUSD <= b.CostPer1MInferencesUSD+eps &&
 		a.PeakVRAMMiB <= b.PeakVRAMMiB+eps
 
 	if !noWorse {
@@ -65,7 +61,6 @@ func Dominates(a, b Candidate) bool {
 
 	strictlyBetter := a.LatencyMS < b.LatencyMS-eps ||
 		a.JoulesPer1KRequests < b.JoulesPer1KRequests-eps ||
-		a.CostPer1MInferencesUSD < b.CostPer1MInferencesUSD-eps ||
 		a.PeakVRAMMiB < b.PeakVRAMMiB-eps
 
 	return strictlyBetter
@@ -181,7 +176,6 @@ func Solve(candidates []Candidate, econ config.EconomicsConfig) ModeRecommendati
 
 	perfWinner := pickFrom[0]
 	energyWinner := pickFrom[0]
-	costWinner := pickFrom[0]
 	balancedWinner := pickFrom[0]
 
 	for _, c := range pickFrom[1:] {
@@ -191,9 +185,6 @@ func Solve(candidates []Candidate, econ config.EconomicsConfig) ModeRecommendati
 		if c.JoulesPer1KRequests < energyWinner.JoulesPer1KRequests {
 			energyWinner = c
 		}
-		if c.CostPer1MInferencesUSD < costWinner.CostPer1MInferencesUSD {
-			costWinner = c
-		}
 		if c.ScalarizedScore < balancedWinner.ScalarizedScore {
 			balancedWinner = c
 		}
@@ -202,7 +193,6 @@ func Solve(candidates []Candidate, econ config.EconomicsConfig) ModeRecommendati
 	return ModeRecommendations{
 		Performance:  perfWinner,
 		EnergySaving: energyWinner,
-		CostSaving:   costWinner,
 		Balanced:     balancedWinner,
 		Frontier:     frontier,
 		AllEvaluated: allEvaluated,

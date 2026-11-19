@@ -69,7 +69,6 @@ type WorkloadBenchmarkReport struct {
 	MeasuredPeakVRAMMiB  float64                     `json:"measuredPeakVramMib"`
 	Energy               telemetry.EnergyMeasurement `json:"energy"`
 	JoulesPer1KTokens    float64                     `json:"joulesPer1kTokens"`
-	CostPer1MTokensUSD   float64                     `json:"costPer1mTokensUsd"`
 	Economics            physics.BusinessKPIs        `json:"economics"`
 	Requests             []RequestMeasurement        `json:"requests"`
 }
@@ -296,17 +295,6 @@ func RunInferenceBenchmark(
 	}
 	kpi := physics.ComputeBusinessKPIs(wm, econ)
 
-	costPer1MTokens := 0.0
-	if tokPerSec > 0 {
-		gpuHoursPer1MTok := (1e6 / tokPerSec) / 3600.0
-		pue := econ.DatacenterPUE
-		if pue <= 0 {
-			pue = 1.0
-		}
-		elecKWhPer1MTok := (joulesPer1KTokens * 1000.0 * pue) / 3.6e6
-		costPer1MTokens = gpuHoursPer1MTok*econ.GPUHourlyRateUSD + elecKWhPer1MTok*econ.ElectricityRateKWh
-	}
-
 	return WorkloadBenchmarkReport{
 		Timestamp:            time.Now(),
 		Adapter:              "OpenAI-Compatible Local Inference Adapter (llama-server / Ollama)",
@@ -326,7 +314,6 @@ func RunInferenceBenchmark(
 		MeasuredPeakVRAMMiB:  em.PeakVRAMMiB,
 		Energy:               em,
 		JoulesPer1KTokens:    joulesPer1KTokens,
-		CostPer1MTokensUSD:   math.Round(costPer1MTokens*10000.0) / 10000.0,
 		Economics:            kpi,
 		Requests:             results,
 	}, nil

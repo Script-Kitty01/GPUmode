@@ -12,8 +12,7 @@
     "peakFp32Tflops": 30.29,
     "peakMemBandwidthGbps": 300.0,
     "idlePowerWatts": 18.0,
-    "tdpWatts": 72.0,
-    "hourlyRateHintUsd": 0.85
+    "tdpWatts": 72.0
   },
   {
     "name": "NVIDIA L40S 48GB",
@@ -28,8 +27,7 @@
     "peakFp32Tflops": 91.61,
     "peakMemBandwidthGbps": 864.0,
     "idlePowerWatts": 45.0,
-    "tdpWatts": 350.0,
-    "hourlyRateHintUsd": 1.95
+    "tdpWatts": 350.0
   },
   {
     "name": "NVIDIA A100 80GB SXM",
@@ -44,8 +42,7 @@
     "peakFp32Tflops": 19.49,
     "peakMemBandwidthGbps": 2039.0,
     "idlePowerWatts": 55.0,
-    "tdpWatts": 400.0,
-    "hourlyRateHintUsd": 3.40
+    "tdpWatts": 400.0
   },
   {
     "name": "NVIDIA H100 80GB SXM",
@@ -60,7 +57,6 @@
     "peakFp32Tflops": 66.91,
     "peakMemBandwidthGbps": 3352.0,
     "idlePowerWatts": 70.0,
-    "tdpWatts": 700.0,
-    "hourlyRateHintUsd": 4.95
+    "tdpWatts": 700.0
   }
 ]

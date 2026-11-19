@@ -36,15 +36,11 @@ func TestFullCausalChainPipelineOnCUDA(t *testing.T) {
 	if !strings.Contains(rep.SevenAnswers.Q4IsItNumericallySafe, "VERIFIED SAFE") {
 		t.Fatalf("expected Q4 numerical safety verification, got: %s", rep.SevenAnswers.Q4IsItNumericallySafe)
 	}
-	if rep.EconomicsComparison.Optimized.CostPer1MInferencesUSD >= rep.EconomicsComparison.Baseline.CostPer1MInferencesUSD {
-		t.Fatalf("expected lower $/1M inferences after optimization")
-	}
 
-	// Test dynamic rate recomputation
-	econ.GPUHourlyRateUSD = 3.50
+	// Test dynamic SLA/QPS recomputation
 	econ.TargetQPS = 500
 	updated := RecomputeEconomics(rep, econ)
-	if updated.EconomicsComparison.MonthlySavingsUSD <= 0 {
-		t.Fatalf("expected positive monthly dollar savings at 500 QPS, got %.2f", updated.EconomicsComparison.MonthlySavingsUSD)
+	if updated.EconomicsComparison.SpeedupFactor <= 1.2 {
+		t.Fatalf("expected speedup > 1.2x after recompute, got %.2f", updated.EconomicsComparison.SpeedupFactor)
 	}
 }

@@ -110,7 +110,4 @@ func TestRunInferenceBenchmarkWithMockStreamingServer(t *testing.T) {
 	if rep.MeasuredPeakVRAMMiB != 5420.0 {
 		t.Errorf("expected MeasuredPeakVRAMMiB=5420, got %.1f", rep.MeasuredPeakVRAMMiB)
 	}
-	if rep.CostPer1MTokensUSD <= 0 {
-		t.Errorf("expected positive CostPer1MTokensUSD, got %.4f", rep.CostPer1MTokensUSD)
-	}
 }

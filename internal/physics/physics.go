@@ -37,7 +37,6 @@ type GPUHardwareSpec struct {
 	RidgePointFLOPsPerByte float64 `json:"ridgePointFlopsPerByte"`
 	IdlePowerWatts         float64 `json:"idlePowerWatts"`
 	TDPWatts               float64 `json:"tdpWatts"`
-	HourlyRateHintUSD      float64 `json:"hourlyRateHintUsd,omitempty"`
 }
 
 const cudaDevQuerySource = `#include <cuda_runtime.h>
@@ -190,10 +189,6 @@ func DetectHardwareForDevice(ctx context.Context, gpuIndex int, nvccPath, nvidia
 // LoadReferenceHardwarePresets returns localHW followed by reference SKUs loaded from
 // presetsPath (or GPUMODE_PRESETS_PATH, or the embedded presets.json if unset).
 func LoadReferenceHardwarePresets(presetsPath string, localHW GPUHardwareSpec) []GPUHardwareSpec {
-	if localHW.HourlyRateHintUSD <= 0 {
-		localHW.HourlyRateHintUSD = 0
-	}
-
 	raw := embeddedPresetsJSON
 	if strings.TrimSpace(presetsPath) == "" {
 		presetsPath = strings.TrimSpace(os.Getenv("GPUMODE_PRESETS_PATH"))

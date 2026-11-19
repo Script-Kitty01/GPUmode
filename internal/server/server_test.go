@@ -67,9 +67,8 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 		t.Fatalf("expected >1.0x speedup from POST /api/optimize, got %.2f", rep.EconomicsComparison.SpeedupFactor)
 	}
 
-	// 3. POST /api/recompute with updated tariff
+	// 3. POST /api/recompute with updated QPS/SLA
 	newEcon := cfg.Economics
-	newEcon.GPUHourlyRateUSD = 4.00
 	newEcon.TargetQPS = 800
 	b, _ := json.Marshal(newEcon)
 	res3, err := http.Post(ts.URL+"/api/recompute", "application/json", bytes.NewReader(b))
