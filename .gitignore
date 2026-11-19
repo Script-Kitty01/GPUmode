@@ -1,0 +1,12 @@
+# Compiled binaries
+/gpumode
+*.exe
+*.out
+*.test
+
+# Runtime data store & temporary CUDA build artifacts
+/.gpumode_data/
+**/.gpumode_cache/
+/harness/kernel_bench*
+*.o
+*.so
