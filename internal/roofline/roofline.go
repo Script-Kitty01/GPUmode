@@ -20,16 +20,20 @@ const (
 
 // OpProfile describes a neural network or CUDA operation's workload characteristics.
 type OpProfile struct {
-	Name              string  `json:"name"`
-	Category          string  `json:"category"` // e.g. "rmsnorm", "rmsnorm_residual", "layernorm", "softmax", "swiglu", "gemm"
-	Elements          int64   `json:"elements"`
-	HiddenDim         int     `json:"hiddenDim"`
-	BatchSize         int     `json:"batchSize"`
-	FLOPs             float64 `json:"flops"`
-	BytesTransferred  float64 `json:"bytesTransferred"`
-	MeasuredLatencyMS float64 `json:"measuredLatencyMs"`
-	LaunchCount       int     `json:"launchCount"`
-	ActivationVRAMMiB float64 `json:"activationVramMib"`
+	Name                   string  `json:"name"`
+	Category               string  `json:"category"` // e.g. "rmsnorm", "rmsnorm_residual", "layernorm", "softmax", "swiglu", "gemm"
+	Elements               int64   `json:"elements"`
+	HiddenDim              int     `json:"hiddenDim"`
+	BatchSize              int     `json:"batchSize"`
+	FLOPs                  float64 `json:"flops"`
+	BytesTransferred       float64 `json:"bytesTransferred"`
+	MeasuredLatencyMS      float64 `json:"measuredLatencyMs"`
+	LaunchCount            int     `json:"launchCount"`
+	ActivationVRAMMiB      float64 `json:"activationVramMib"`
+	HostLaunchGapUS        float64 `json:"hostLaunchGapUs,omitempty"`
+	HostSyncStallPct       float64 `json:"hostSyncStallPct,omitempty"`
+	HostStarvationPct      float64 `json:"hostStarvationPct,omitempty"`
+	HostBoundaryProvenance string  `json:"hostBoundaryProvenance,omitempty"`
 }
 
 // Diagnosis explains why the GPU is underutilized on a given operation and prescribes targeted CUDA optimizations.
@@ -45,6 +49,11 @@ type Diagnosis struct {
 	ComputeUtilizationPct   float64         `json:"computeUtilizationPct"`   // AchievedTFLOPS / PeakFP32TFLOPS * 100
 	BandwidthUtilizationPct float64         `json:"bandwidthUtilizationPct"` // AchievedBW / PeakBW * 100
 	RooflineEfficiencyPct   float64         `json:"rooflineEfficiencyPct"`   // AchievedTFLOPS / RooflineCeilingTFLOPS * 100
+	LaunchCount             int             `json:"launchCount,omitempty"`
+	HostLaunchGapUS         float64         `json:"hostLaunchGapUs,omitempty"`
+	HostSyncStallPct        float64         `json:"hostSyncStallPct,omitempty"`
+	HostStarvationPct       float64         `json:"hostStarvationPct,omitempty"`
+	HostBoundaryProvenance  string          `json:"hostBoundaryProvenance,omitempty"`
 	UnderutilizationReason  string          `json:"underutilizationReason"`
 	RecommendedStrategies   []string        `json:"recommendedStrategies"`
 	ExpectedVRAMSaveMiB     float64         `json:"expectedVramSaveMib"`
@@ -183,25 +192,50 @@ func Diagnose(op OpProfile, hw physics.GPUHardwareSpec) Diagnosis {
 		rooflineEff = math.Min(100.0, (achievedTFLOPS/ceilingTFLOPS)*100.0)
 	}
 
+	hostProv := strings.TrimSpace(op.HostBoundaryProvenance)
+	if hostProv == "" {
+		hostProv = "ANALYTICAL"
+	}
+
 	// Determine primary bottleneck classification
 	var class BottleneckClass
 	var reason string
 	var strategies []string
 	var vramSave float64
 
-	// Launch-bound check: small tensor or multiple unfused kernel launches with low bandwidth & compute saturation
-	if op.LaunchCount >= 3 && op.Elements < 262144 && bwUtil < 25.0 && computeUtil < 15.0 {
+	// Launch-bound check: small tensor, multiple unfused kernel launches, or host-side launch gap / scheduler starvation
+	smallMultiLaunch := op.LaunchCount >= 3 && op.Elements < 262144
+	hostStarvedLaunch := op.HostLaunchGapUS >= 40.0 || op.HostStarvationPct >= 25.0
+	if bwUtil < 25.0 && computeUtil < 15.0 && (smallMultiLaunch || hostStarvedLaunch) {
 		class = BottleneckLaunchBound
-		reason = fmt.Sprintf(
-			"GPU SMs are starved by %d separate kernel launches on a small working set (%.1f%% compute util, %.1f%% memory bandwidth util). Kernel launch overhead and global memory round-trips dominate execution time.",
-			op.LaunchCount, computeUtil, bwUtil,
-		)
+		if hostProv == "MEASURED_EBPF" {
+			reason = fmt.Sprintf(
+				"GPU SMs are starved at the host-device launch boundary (%.1f%% compute util, %.1f%% memory bandwidth util): eBPF measured %.1f µs inter-launch host gap and %.1f%% off-CPU scheduler starvation across %d kernel launches.",
+				computeUtil, bwUtil, op.HostLaunchGapUS, op.HostStarvationPct, op.LaunchCount,
+			)
+		} else if smallMultiLaunch {
+			reason = fmt.Sprintf(
+				"GPU SMs are starved by %d separate kernel launches on a small working set (%.1f%% compute util, %.1f%% memory bandwidth util). Kernel launch overhead and global memory round-trips dominate execution time.",
+				op.LaunchCount, computeUtil, bwUtil,
+			)
+		} else {
+			reason = fmt.Sprintf(
+				"GPU SMs are starved by host-side kernel launch overhead (%.1f µs inter-launch host gap, %.1f%% scheduler starvation, %.1f%% compute util, %.1f%% memory bandwidth util).",
+				op.HostLaunchGapUS, op.HostStarvationPct, computeUtil, bwUtil,
+			)
+		}
 	} else if ai < ridge*0.85 {
 		class = BottleneckMemoryBound
 		reason = fmt.Sprintf(
 			"Operation has low Arithmetic Intensity (%.2f FLOPs/Byte vs GPU ridge point %.1f FLOPs/Byte). Floating-point cores sit at %.1f%% utilization waiting on DRAM memory transfers (%.1f GB/s achieved of %.1f GB/s peak).",
 			ai, ridge, computeUtil, achievedBWGBps, hw.PeakMemBandwidthGBps,
 		)
+		if hostProv == "MEASURED_EBPF" {
+			reason += fmt.Sprintf(
+				" eBPF host trace measured %.1f µs inter-launch gap and %.1f%% CUDA sync stall.",
+				op.HostLaunchGapUS, op.HostSyncStallPct,
+			)
+		}
 	} else if ai > ridge*1.15 {
 		class = BottleneckComputeBound
 		reason = fmt.Sprintf(
@@ -275,6 +309,11 @@ func Diagnose(op OpProfile, hw physics.GPUHardwareSpec) Diagnosis {
 		ComputeUtilizationPct:   computeUtil,
 		BandwidthUtilizationPct: bwUtil,
 		RooflineEfficiencyPct:   rooflineEff,
+		LaunchCount:             op.LaunchCount,
+		HostLaunchGapUS:         op.HostLaunchGapUS,
+		HostSyncStallPct:        op.HostSyncStallPct,
+		HostStarvationPct:       op.HostStarvationPct,
+		HostBoundaryProvenance:  hostProv,
 		UnderutilizationReason:  reason,
 		RecommendedStrategies:   strategies,
 		ExpectedVRAMSaveMiB:     vramSave,

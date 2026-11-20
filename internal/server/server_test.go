@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"gpumode/internal/config"
+	"gpumode/internal/ebpftrace"
 	"gpumode/internal/harness"
 	"gpumode/internal/physics"
 	"gpumode/internal/profiler"
@@ -24,11 +26,13 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 	cfg.DataDir = t.TempDir()
 
 	hw, _ := physics.DetectHardware(ctx, cfg.NVCCPath, cfg.NvidiaSMIPath)
-	mon := telemetry.NewMonitor(cfg.NvidiaSMIPath, 200*time.Millisecond, 30)
+	mon := telemetry.NewMonitorWithBackend(cfg.NvidiaSMIPath, cfg.GPUIndex, 200*time.Millisecond, 30, telemetry.ParseBackendMode(cfg.TelemetryBackend))
+	defer mon.Close()
 	runner := harness.NewRunner(cfg.NVCCPath, cfg.SanitizerPath, hw.ArchFlag, 2, 20*time.Second, mon)
 	runner.RunSanitizer = false
 
 	pipe := profiler.NewPipeline(hw, mon, runner, cfg.PythonPath, "../../scripts/profile_pytorch.py")
+	pipe.EBPFMode = ebpftrace.ParseMode(cfg.EBPFMode)
 	st, err := store.NewStore(cfg.DataDir)
 	if err != nil {
 		t.Fatalf("NewStore failed: %v", err)
@@ -43,9 +47,45 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET / failed: %v", err)
 	}
+	htmlBytes, err := io.ReadAll(res.Body)
 	res.Body.Close()
+	if err != nil {
+		t.Fatalf("failed reading dashboard HTML: %v", err)
+	}
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 on GET /, got %d", res.StatusCode)
+	}
+	html := string(htmlBytes)
+	for _, marker := range []string{"telemetrySourceBadge", "ebpfProvBadge", "CUDA Boundary (eBPF + Scheduler)"} {
+		if !strings.Contains(html, marker) {
+			t.Fatalf("expected dashboard HTML to contain %q", marker)
+		}
+	}
+
+	// 1b. GET /api/state verifies telemetryBackend and cached ebpfStatus
+	stateRes, err := http.Get(ts.URL + "/api/state")
+	if err != nil {
+		t.Fatalf("GET /api/state failed: %v", err)
+	}
+	defer stateRes.Body.Close()
+	if stateRes.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on GET /api/state, got %d", stateRes.StatusCode)
+	}
+	var statePayload struct {
+		TelemetryBackend string            `json:"telemetryBackend"`
+		EBPFStatus       ebpftrace.Summary `json:"ebpfStatus"`
+	}
+	if err := json.NewDecoder(stateRes.Body).Decode(&statePayload); err != nil {
+		t.Fatalf("failed decoding /api/state: %v", err)
+	}
+	if statePayload.TelemetryBackend != "NVML" && statePayload.TelemetryBackend != "NVIDIA_SMI" {
+		t.Fatalf("expected telemetryBackend NVML or NVIDIA_SMI, got %q", statePayload.TelemetryBackend)
+	}
+	if statePayload.EBPFStatus.Provenance == "" {
+		t.Fatalf("expected non-empty ebpfStatus.provenance in /api/state")
+	}
+	if statePayload.EBPFStatus.Mode == "" {
+		t.Fatalf("expected non-empty ebpfStatus.mode in /api/state")
 	}
 
 	// 2. POST /api/optimize

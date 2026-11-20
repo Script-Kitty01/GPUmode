@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gpumode/internal/config"
+	"gpumode/internal/ebpftrace"
 	"gpumode/internal/optimizer"
 	"gpumode/internal/telemetry"
 )
@@ -24,7 +25,6 @@ func TestResolveGGUFModelPath(t *testing.T) {
 	if err := os.WriteFile(modelPath, []byte("test model"), 0o600); err != nil {
 		t.Fatalf("failed to write test GGUF: %v", err)
 	}
-
 	t.Setenv("GPUMODE_MODEL_DIR", modelDir)
 	if got := config.ResolveDeepSeekModelPath(); got != modelPath {
 		t.Fatalf("config model discovery = %q, want %q", got, modelPath)
@@ -110,4 +110,36 @@ func TestRunInferenceBenchmarkWithMockStreamingServer(t *testing.T) {
 	if rep.MeasuredPeakVRAMMiB != 5420.0 {
 		t.Errorf("expected MeasuredPeakVRAMMiB=5420, got %.1f", rep.MeasuredPeakVRAMMiB)
 	}
+	if rep.TelemetryBackend != "CUSTOM" {
+		t.Errorf("expected TelemetryBackend=CUSTOM, got %q", rep.TelemetryBackend)
+	}
+	if rep.HostCUDATrace.Mode != ebpftrace.ModeAuto || !rep.HostCUDATrace.Enabled {
+		t.Errorf("expected default ModeAuto enabled HostCUDATrace, got %+v", rep.HostCUDATrace)
+	}
+	validAutoProv := rep.HostCUDATrace.Provenance == ebpftrace.ProvenanceMeasuredEBPF ||
+		rep.HostCUDATrace.Provenance == ebpftrace.ProvenanceUnavailableUnprivileged ||
+		rep.HostCUDATrace.Provenance == ebpftrace.ProvenanceUnavailableUnsupported
+	if !validAutoProv {
+		t.Errorf("unexpected HostCUDATrace provenance in ModeAuto: %q", rep.HostCUDATrace.Provenance)
+	}
+
+	// Verify DefaultBenchmarkConfig sets EBPFMode=ModeAuto and explicit ModeOff produces DISABLED provenance.
+	if def := DefaultBenchmarkConfig(); def.EBPFMode != ebpftrace.ModeAuto {
+		t.Errorf("DefaultBenchmarkConfig().EBPFMode = %q, want %q", def.EBPFMode, ebpftrace.ModeAuto)
+	}
+
+	cfgOff := cfg
+	cfgOff.NumRequests = 1
+	cfgOff.EBPFMode = ebpftrace.ModeOff
+	repOff, err := RunInferenceBenchmark(ctx, cfgOff, mon, config.DefaultEconomicsConfig())
+	if err != nil {
+		t.Fatalf("RunInferenceBenchmark(ModeOff) failed: %v", err)
+	}
+	if repOff.HostCUDATrace.Provenance != ebpftrace.ProvenanceDisabled || repOff.HostCUDATrace.Enabled || repOff.HostCUDATrace.Active {
+		t.Errorf("expected DISABLED HostCUDATrace for ModeOff, got %+v", repOff.HostCUDATrace)
+	}
+	if repOff.TelemetryBackend != "CUSTOM" {
+		t.Errorf("expected TelemetryBackend=CUSTOM for ModeOff, got %q", repOff.TelemetryBackend)
+	}
 }
+

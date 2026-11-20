@@ -3,10 +3,13 @@ package telemetry
 import (
 	"context"
 	"math"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"gpumode/internal/nvml"
 )
 
 func TestParseNvidiaSMICSVLine(t *testing.T) {
@@ -294,5 +297,151 @@ func TestAggregateWindowMeasurementsIdleSubtractionAndUncertainty(t *testing.T) 
 	}
 	if agg.EnergyUncertaintyPct <= 0 || agg.EnergyUncertaintyJoules <= 0 {
 		t.Errorf("expected positive energy uncertainty, got pct=%.2f J=%.2f", agg.EnergyUncertaintyPct, agg.EnergyUncertaintyJoules)
+	}
+}
+
+func TestParseBackendMode(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want BackendMode
+	}{
+		{raw: "auto", want: BackendAuto},
+		{raw: "AUTO", want: BackendAuto},
+		{raw: "nvml", want: BackendNVML},
+		{raw: " NVML ", want: BackendNVML},
+		{raw: "smi", want: BackendSMI},
+		{raw: "SMI", want: BackendSMI},
+		{raw: "", want: BackendAuto},
+		{raw: "   ", want: BackendAuto},
+		{raw: "unknown-backend", want: BackendAuto},
+	}
+
+	for _, tc := range cases {
+		if got := ParseBackendMode(tc.raw); got != tc.want {
+			t.Errorf("ParseBackendMode(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
+func TestMonitorNVMLAndFallback(t *testing.T) {
+	// Verify CSV parser sets Source = "NVIDIA_SMI"
+	csvSample, err := ParseNvidiaSMICSVLine(
+		"NVIDIA GeForce RTX 4050 Laptop GPU, 42.68, 2355, 8001, 58, 76, 44, 1842, 6141\n",
+		time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("ParseNvidiaSMICSVLine error: %v", err)
+	}
+	if csvSample.Source != "NVIDIA_SMI" {
+		t.Errorf("CSV Sample.Source = %q, want NVIDIA_SMI", csvSample.Source)
+	}
+
+	// BackendSMI forces NVIDIA_SMI even when NVML is present on the host
+	smiMon := NewMonitorWithBackend("nvidia-smi", 0, 50*time.Millisecond, 32, BackendSMI)
+	defer smiMon.Close()
+	if smiMon.Backend() != "NVIDIA_SMI" {
+		t.Fatalf("BackendSMI Backend() = %q, want NVIDIA_SMI", smiMon.Backend())
+	}
+	if smiMon.BurstInterval() != 50*time.Millisecond {
+		t.Fatalf("BackendSMI BurstInterval() = %v, want 50ms", smiMon.BurstInterval())
+	}
+	if pids := smiMon.ActiveComputePIDs(); pids != nil {
+		t.Fatalf("BackendSMI ActiveComputePIDs() = %v, want nil", pids)
+	}
+
+	// Custom non-standard binary path in BackendAuto sticks to NVIDIA_SMI so test overrides aren't bypassed
+	customPathMon := NewMonitorWithBackend("testdata/fake-smi-binary", 0, 50*time.Millisecond, 32, BackendAuto)
+	defer customPathMon.Close()
+	if customPathMon.Backend() != "NVIDIA_SMI" {
+		t.Fatalf("non-standard smi path Backend() = %q, want NVIDIA_SMI", customPathMon.Backend())
+	}
+
+	// Probe whether NVML with >=1 GPU is available on this host
+	nvmlAvailable := false
+	if probe, openErr := nvml.Open(); openErr == nil {
+		if cnt, cntErr := probe.DeviceCount(); cntErr == nil && cnt > 0 {
+			nvmlAvailable = true
+		}
+		_ = probe.Close()
+	}
+
+	autoMon := NewMonitorWithBackend("nvidia-smi", 0, 50*time.Millisecond, 32, BackendAuto)
+	defer autoMon.Close()
+
+	if nvmlAvailable {
+		if autoMon.Backend() != "NVML" {
+			t.Fatalf("expected Backend() == NVML on NVML-capable host, got %q", autoMon.Backend())
+		}
+		if autoMon.BurstInterval() != 10*time.Millisecond {
+			t.Fatalf("expected BurstInterval() == 10ms under NVML, got %v", autoMon.BurstInterval())
+		}
+
+		s, pollErr := autoMon.PollOnce(context.Background())
+		if pollErr != nil {
+			t.Fatalf("NVML PollOnce failed: %v", pollErr)
+		}
+		if s.Source != "NVML" {
+			t.Errorf("Sample.Source = %q, want NVML", s.Source)
+		}
+		if s.VRAMTotalMiB <= 0 {
+			t.Errorf("Sample.VRAMTotalMiB = %v, want > 0", s.VRAMTotalMiB)
+		}
+		if strings.TrimSpace(s.GPUName) == "" {
+			t.Errorf("expected non-empty Sample.GPUName")
+		}
+
+		pids := autoMon.ActiveComputePIDs()
+		selfPID := os.Getpid()
+		for i, pid := range pids {
+			if pid <= 0 {
+				t.Errorf("expected positive PID, got %d", pid)
+			}
+			if pid == selfPID {
+				t.Errorf("expected ActiveComputePIDs to exclude self PID %d", selfPID)
+			}
+			if i > 0 && pids[i-1] > pid {
+				t.Errorf("expected sorted PIDs, got %v", pids)
+			}
+		}
+
+		// Verify SetSampler transitions to CUSTOM and nil restores NVML
+		autoMon.SetSampler(func(ctx context.Context) (Sample, error) {
+			return Sample{GPUName: "CustomGPU", PowerWatts: 33.0}, nil
+		})
+		if autoMon.Backend() != "CUSTOM" || autoMon.BurstInterval() != 50*time.Millisecond {
+			t.Fatalf("after SetSampler(fn), Backend=%q BurstInterval=%v", autoMon.Backend(), autoMon.BurstInterval())
+		}
+		cs, err := autoMon.PollOnce(context.Background())
+		if err != nil || cs.Source != "CUSTOM" {
+			t.Fatalf("custom PollOnce err=%v Source=%q, want CUSTOM", err, cs.Source)
+		}
+		autoMon.SetSampler(nil)
+		if autoMon.Backend() != "NVML" || autoMon.BurstInterval() != 10*time.Millisecond {
+			t.Fatalf("after SetSampler(nil), Backend=%q BurstInterval=%v, want NVML / 10ms", autoMon.Backend(), autoMon.BurstInterval())
+		}
+
+		// Close is idempotent and transitions monitor cleanly to NVIDIA_SMI fallback
+		if err := autoMon.Close(); err != nil {
+			t.Fatalf("first Close() returned error: %v", err)
+		}
+		if err := autoMon.Close(); err != nil {
+			t.Fatalf("second Close() returned error: %v", err)
+		}
+		if autoMon.Backend() != "NVIDIA_SMI" {
+			t.Fatalf("after Close(), Backend() = %q, want NVIDIA_SMI", autoMon.Backend())
+		}
+	} else {
+		if autoMon.Backend() != "NVIDIA_SMI" {
+			t.Fatalf("expected fallback Backend() == NVIDIA_SMI, got %q", autoMon.Backend())
+		}
+		if autoMon.BurstInterval() != 50*time.Millisecond {
+			t.Fatalf("expected fallback BurstInterval() == 50ms, got %v", autoMon.BurstInterval())
+		}
+		if pids := autoMon.ActiveComputePIDs(); pids != nil {
+			t.Fatalf("expected nil ActiveComputePIDs without NVML, got %v", pids)
+		}
+		if err := autoMon.Close(); err != nil {
+			t.Fatalf("Close() returned error: %v", err)
+		}
 	}
 }

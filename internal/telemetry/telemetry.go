@@ -5,20 +5,49 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"gpumode/internal/nvml"
 )
+
+// BackendMode controls how Monitor collects GPU telemetry samples.
+type BackendMode string
+
+const (
+	BackendAuto BackendMode = "auto"
+	BackendNVML BackendMode = "nvml"
+	BackendSMI  BackendMode = "smi"
+)
+
+// ParseBackendMode normalizes a telemetry backend mode string, defaulting to BackendAuto.
+func ParseBackendMode(raw string) BackendMode {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case string(BackendNVML):
+		return BackendNVML
+	case string(BackendSMI):
+		return BackendSMI
+	case string(BackendAuto), "":
+		return BackendAuto
+	default:
+		return BackendAuto
+	}
+}
 
 const (
 	DefaultBufferCapacity = 300
 	DefaultPollInterval   = 150 * time.Millisecond
+	nvmlBurstInterval     = 10 * time.Millisecond
+	defaultBurstInterval  = 50 * time.Millisecond
 	nvidiaSMIQueryArgs    = "name,power.draw,clocks.current.sm,clocks.current.memory,temperature.gpu,utilization.gpu,utilization.memory,memory.used,memory.total"
 )
 
-// Sample represents a point-in-time GPU telemetry snapshot from nvidia-smi.
+// Sample represents a point-in-time GPU telemetry snapshot from NVML or nvidia-smi.
 type Sample struct {
 	Timestamp    time.Time `json:"timestamp"`
 	GPUName      string    `json:"gpuName"`
@@ -30,6 +59,7 @@ type Sample struct {
 	MemUtilPct   float64   `json:"memUtilPct"`
 	VRAMUsedMiB  float64   `json:"vramUsedMib"`
 	VRAMTotalMiB float64   `json:"vramTotalMib"`
+	Source       string    `json:"source,omitempty"`
 }
 
 // EnergyMeasurement captures integrated energy, idle-baseline subtraction, uncertainty, and provenance over execution windows.
@@ -96,7 +126,10 @@ type Monitor struct {
 	nextSubID   int
 	subscribers map[int]chan Sample
 
-	sampler SamplerFunc
+	nvmlClient  *nvml.Client
+	backend     string
+	backendMode BackendMode
+	sampler     SamplerFunc
 }
 
 // NewMonitor creates a new GPU telemetry monitor for GPU 0 with a ring buffer of capacity items.
@@ -106,8 +139,17 @@ func NewMonitor(nvidiaSMIPath string, interval time.Duration, capacity int) *Mon
 
 // NewMonitorForGPU creates a new GPU telemetry monitor targeting a specific NVIDIA GPU index.
 func NewMonitorForGPU(nvidiaSMIPath string, gpuIndex int, interval time.Duration, capacity int) *Monitor {
-	if strings.TrimSpace(nvidiaSMIPath) == "" {
+	return NewMonitorWithBackend(nvidiaSMIPath, gpuIndex, interval, capacity, BackendAuto)
+}
+
+// NewMonitorWithBackend creates a GPU telemetry monitor configured with an explicit BackendMode.
+func NewMonitorWithBackend(nvidiaSMIPath string, gpuIndex int, interval time.Duration, capacity int, mode BackendMode) *Monitor {
+	rawSMI := strings.TrimSpace(nvidiaSMIPath)
+	isStandardSMI := isStandardNvidiaSMIPath(rawSMI)
+	if rawSMI == "" {
 		nvidiaSMIPath = "nvidia-smi"
+	} else {
+		nvidiaSMIPath = rawSMI
 	}
 	if gpuIndex < 0 {
 		gpuIndex = 0
@@ -118,6 +160,8 @@ func NewMonitorForGPU(nvidiaSMIPath string, gpuIndex int, interval time.Duration
 	if capacity <= 0 {
 		capacity = DefaultBufferCapacity
 	}
+	normalizedMode := ParseBackendMode(string(mode))
+
 	m := &Monitor{
 		nvidiaSMIPath: nvidiaSMIPath,
 		gpuIndex:      gpuIndex,
@@ -125,9 +169,28 @@ func NewMonitorForGPU(nvidiaSMIPath string, gpuIndex int, interval time.Duration
 		capacity:      capacity,
 		ring:          make([]Sample, capacity),
 		subscribers:   make(map[int]chan Sample),
+		backend:       "NVIDIA_SMI",
+		backendMode:   normalizedMode,
 	}
 	m.sampler = m.queryNvidiaSMI
+
+	if normalizedMode == BackendNVML || (normalizedMode == BackendAuto && isStandardSMI) {
+		if client, err := nvml.Open(); err == nil {
+			if count, cntErr := client.DeviceCount(); cntErr == nil && gpuIndex < count {
+				m.nvmlClient = client
+				m.backend = "NVML"
+				m.sampler = m.queryNVML
+			} else {
+				_ = client.Close()
+			}
+		}
+	}
+
 	return m
+}
+
+func isStandardNvidiaSMIPath(raw string) bool {
+	return raw == "" || raw == "nvidia-smi" || strings.HasSuffix(raw, "/nvidia-smi")
 }
 
 // SetHardwareDefaults configures the detected GPU's max SM clock and TDP/idle power
@@ -145,9 +208,92 @@ func (m *Monitor) SetSampler(fn SamplerFunc) {
 	defer m.mu.Unlock()
 	if fn != nil {
 		m.sampler = fn
+		m.backend = "CUSTOM"
+		return
+	}
+	if m.nvmlClient != nil {
+		m.sampler = m.queryNVML
+		m.backend = "NVML"
 	} else {
 		m.sampler = m.queryNvidiaSMI
+		m.backend = "NVIDIA_SMI"
 	}
+}
+
+// Close releases any underlying NVML client handle and falls back to nvidia-smi polling.
+// Close is idempotent and safe for concurrent calls.
+func (m *Monitor) Close() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	client := m.nvmlClient
+	m.nvmlClient = nil
+	if m.backend != "CUSTOM" {
+		m.backend = "NVIDIA_SMI"
+		m.sampler = m.queryNvidiaSMI
+	}
+	m.mu.Unlock()
+
+	if client != nil {
+		return client.Close()
+	}
+	return nil
+}
+
+// Backend returns the currently active telemetry backend ("NVML", "NVIDIA_SMI", or "CUSTOM").
+func (m *Monitor) Backend() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.backend
+}
+
+// BurstInterval returns the high-frequency polling period used during benchmark execution windows.
+func (m *Monitor) BurstInterval() time.Duration {
+	if m != nil && m.Backend() == "NVML" {
+		return nvmlBurstInterval
+	}
+	return defaultBurstInterval
+}
+
+// ActiveComputePIDs returns sorted positive PIDs holding active GPU compute contexts (excluding this process),
+// or nil when NVML is unavailable.
+func (m *Monitor) ActiveComputePIDs() []int {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	client := m.nvmlClient
+	gpuIdx := m.gpuIndex
+	m.mu.RUnlock()
+
+	if client == nil {
+		return nil
+	}
+	procs, err := client.ListComputeProcesses(gpuIdx)
+	if err != nil {
+		return nil
+	}
+
+	selfPID := os.Getpid()
+	seen := make(map[int]struct{}, len(procs))
+	pids := make([]int, 0, len(procs))
+	for _, p := range procs {
+		pid := int(p.PID)
+		if pid <= 0 || pid == selfPID {
+			continue
+		}
+		if _, dup := seen[pid]; dup {
+			continue
+		}
+		seen[pid] = struct{}{}
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids
 }
 
 // RecordSample appends a sample to the ring buffer and broadcasts it to all active SSE subscribers.
@@ -187,11 +333,15 @@ func (m *Monitor) RecordSample(s Sample) {
 func (m *Monitor) PollOnce(ctx context.Context) (Sample, error) {
 	m.mu.RLock()
 	sampler := m.sampler
+	backend := m.backend
 	m.mu.RUnlock()
 
 	s, err := sampler(ctx)
 	if err != nil {
 		return Sample{}, err
+	}
+	if s.Source == "" && backend == "CUSTOM" {
+		s.Source = "CUSTOM"
 	}
 	m.RecordSample(s)
 	return s, nil
@@ -274,22 +424,70 @@ func (m *Monitor) History(limit int) []Sample {
 	return out
 }
 
+// queryNVML collects a telemetry sample directly via libnvidia-ml without spawning a subprocess.
+func (m *Monitor) queryNVML(ctx context.Context) (Sample, error) {
+	if err := ctx.Err(); err != nil {
+		return Sample{}, err
+	}
+
+	m.mu.RLock()
+	client := m.nvmlClient
+	gpuIdx := m.gpuIndex
+	mode := m.backendMode
+	smiPath := m.nvidiaSMIPath
+	m.mu.RUnlock()
+
+	if client == nil {
+		if mode == BackendAuto && smiPath != "" {
+			return m.queryNvidiaSMI(ctx)
+		}
+		return Sample{}, nvml.ErrUnavailable
+	}
+
+	ds, err := client.SampleDevice(gpuIdx)
+	if err != nil {
+		if mode == BackendAuto && smiPath != "" {
+			return m.queryNvidiaSMI(ctx)
+		}
+		return Sample{}, err
+	}
+
+	return Sample{
+		Timestamp:    time.Now(),
+		GPUName:      ds.GPUName,
+		PowerWatts:   ds.PowerWatts,
+		SMClockMHz:   ds.SMClockMHz,
+		MemClockMHz:  ds.MemClockMHz,
+		TemperatureC: ds.TemperatureC,
+		GPUUtilPct:   ds.GPUUtilPct,
+		MemUtilPct:   ds.MemUtilPct,
+		VRAMUsedMiB:  ds.VRAMUsedMiB,
+		VRAMTotalMiB: ds.VRAMTotalMiB,
+		Source:       "NVML",
+	}, nil
+}
+
 // queryNvidiaSMI runs nvidia-smi and parses the target GPU's CSV telemetry line.
 func (m *Monitor) queryNvidiaSMI(ctx context.Context) (Sample, error) {
+	m.mu.RLock()
+	smiPath := m.nvidiaSMIPath
+	gpuIdx := m.gpuIndex
+	m.mu.RUnlock()
+
 	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(
 		queryCtx,
-		m.nvidiaSMIPath,
-		"-i", strconv.Itoa(m.gpuIndex),
+		smiPath,
+		"-i", strconv.Itoa(gpuIdx),
 		"--query-gpu="+nvidiaSMIQueryArgs,
 		"--format=csv,noheader,nounits",
 	)
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
-		return Sample{}, fmt.Errorf("nvidia-smi poll failed for GPU %d: %w", m.gpuIndex, err)
+		return Sample{}, fmt.Errorf("nvidia-smi poll failed for GPU %d: %w", gpuIdx, err)
 	}
 	return ParseNvidiaSMICSVLine(out.String(), time.Now())
 }
@@ -326,6 +524,7 @@ func ParseNvidiaSMICSVLine(raw string, ts time.Time) (Sample, error) {
 		MemUtilPct:   parseFlexibleFloat(parts[numOffset+5]),
 		VRAMUsedMiB:  parseFlexibleFloat(parts[numOffset+6]),
 		VRAMTotalMiB: parseFlexibleFloat(parts[numOffset+7]),
+		Source:       "NVIDIA_SMI",
 	}, nil
 }
 
@@ -721,6 +920,10 @@ func lerpSample(a, b Sample, t time.Time) Sample {
 	} else if alpha > 1 {
 		alpha = 1
 	}
+	src := b.Source
+	if src == "" {
+		src = a.Source
+	}
 	return Sample{
 		Timestamp:    t,
 		GPUName:      b.GPUName,
@@ -732,6 +935,7 @@ func lerpSample(a, b Sample, t time.Time) Sample {
 		MemUtilPct:   a.MemUtilPct + alpha*(b.MemUtilPct-a.MemUtilPct),
 		VRAMUsedMiB:  a.VRAMUsedMiB + alpha*(b.VRAMUsedMiB-a.VRAMUsedMiB),
 		VRAMTotalMiB: b.VRAMTotalMiB,
+		Source:       src,
 	}
 }
 

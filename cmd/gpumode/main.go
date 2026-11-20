@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"gpumode/internal/config"
+	"gpumode/internal/ebpftrace"
 	"gpumode/internal/harness"
 	"gpumode/internal/optimizer"
 	"gpumode/internal/physics"
@@ -38,6 +40,9 @@ func main() {
 	nvccPath := fs.String("nvcc", cfg.NVCCPath, "Path to NVIDIA nvcc compiler")
 	sanitizerPath := fs.String("sanitizer", cfg.SanitizerPath, "Path to NVIDIA compute-sanitizer")
 	nvidiaSMIPath := fs.String("nvidia-smi", cfg.NvidiaSMIPath, "Path to nvidia-smi")
+	telemetryBackend := fs.String("telemetry", cfg.TelemetryBackend, "Telemetry backend (auto, nvml, or smi)")
+	ebpfModeFlag := fs.String("ebpf", cfg.EBPFMode, "eBPF host-to-CUDA tracer mode (auto, on, or off)")
+	tracePIDFlag := fs.Int("trace-pid", cfg.TracePID, "Optional target PID for eBPF CUDA/scheduler tracing (0 = auto-discover)")
 	presetsPath := fs.String("presets", cfg.PresetsPath, "Path to JSON file of Digital Twin reference GPU presets")
 	op := fs.String("op", "rmsnorm_residual", "Target operation (rmsnorm_residual, rmsnorm, layernorm, softmax, swiglu)")
 	strategy := fs.String("strategy", string(optimizer.StrategyBayesian), "Autotuning strategy (BAYESIAN_UCB or GRID_SEARCH)")
@@ -62,6 +67,13 @@ func main() {
 	cfg.NVCCPath = *nvccPath
 	cfg.SanitizerPath = *sanitizerPath
 	cfg.NvidiaSMIPath = *nvidiaSMIPath
+	cfg.TelemetryBackend = string(telemetry.ParseBackendMode(*telemetryBackend))
+	cfg.EBPFMode = string(ebpftrace.ParseMode(*ebpfModeFlag))
+	if *tracePIDFlag > 0 {
+		cfg.TracePID = *tracePIDFlag
+	} else {
+		cfg.TracePID = 0
+	}
 	cfg.PresetsPath = *presetsPath
 	cfg.DeepSeekModelPath = *deepseekModel
 	cfg.PythonPath = *pythonPath
@@ -82,7 +94,35 @@ func main() {
 		os.Exit(1)
 	}
 
-	mon := telemetry.NewMonitorForGPU(cfg.NvidiaSMIPath, cfg.GPUIndex, cfg.TelemetryInterval, 300)
+	ebpfMode := ebpftrace.ParseMode(cfg.EBPFMode)
+	var targetPIDs []int
+	if cfg.TracePID > 0 {
+		targetPIDs = []int{cfg.TracePID}
+	}
+
+	if ebpfMode == ebpftrace.ModeOn {
+		switch cmd {
+		case "optimize", "analyze", "deepseek", "workload", "dashboard", "serve", "ebpf", "probe":
+			probeSess, probeErr := ebpftrace.StartSession(ebpftrace.ModeOn, targetPIDs)
+			if probeErr != nil {
+				fmt.Fprintf(os.Stderr, "[gpumode] -ebpf=on could not attach eBPF probes: %v\n", probeErr)
+				if !strings.Contains(probeErr.Error(), "setcap") {
+					fmt.Fprintf(os.Stderr, "[gpumode] Hint: run './run.sh setcap' or execute with sudo.\n")
+				}
+				os.Exit(1)
+			}
+			_ = probeSess.Stop()
+		}
+	}
+
+	mon := telemetry.NewMonitorWithBackend(
+		cfg.NvidiaSMIPath,
+		cfg.GPUIndex,
+		cfg.TelemetryInterval,
+		300,
+		telemetry.ParseBackendMode(cfg.TelemetryBackend),
+	)
+	defer mon.Close()
 	mon.SetHardwareDefaults(hw.MaxSMClockMHz, hw.TDPWatts)
 	mon.Start(ctx)
 
@@ -90,12 +130,17 @@ func main() {
 	runner.GPUIndex = cfg.GPUIndex
 	pipe := profiler.NewPipeline(hw, mon, runner, cfg.PythonPath, "scripts/profile_pytorch.py")
 	pipe.PresetsPath = cfg.PresetsPath
+	pipe.EBPFMode = ebpfMode
+	if len(targetPIDs) > 0 {
+		pipe.TracePIDs = targetPIDs
+	}
 	if *proposerFlag == "deepseek" || cmd == "deepseek" {
 		dsProposer := optimizer.NewLocalDeepSeekProposerForHardware("llama-cli", *deepseekModel, hw)
 		pipe.Autotuner = optimizer.NewAutotuner(dsProposer, runner)
 	}
 	st, err := store.NewStore(cfg.DataDir)
 	if err != nil {
+		_ = mon.Close()
 		fmt.Fprintf(os.Stderr, "[gpumode] failed to initialize data store: %v\n", err)
 		os.Exit(1)
 	}
@@ -118,8 +163,40 @@ func main() {
 
 	case "monitor":
 		s, _ := mon.PollOnce(ctx)
-		fmt.Printf("GPU: %s (%s) | Power: %.2f W | Clocks: %.0f / %.0f MHz | Temp: %.1f C | Util: %.0f%% SM / %.0f%% Mem | VRAM: %.0f / %.0f MiB\n",
-			hw.Name, hw.ArchFlag, s.PowerWatts, s.SMClockMHz, s.MemClockMHz, s.TemperatureC, s.GPUUtilPct, s.MemUtilPct, s.VRAMUsedMiB, s.VRAMTotalMiB)
+		fmt.Printf("GPU: %s (%s) | Telemetry: %s | Power: %.2f W | Clocks: %.0f / %.0f MHz | Temp: %.1f C | Util: %.0f%% SM / %.0f%% Mem | VRAM: %.0f / %.0f MiB\n",
+			hw.Name, hw.ArchFlag, mon.Backend(), s.PowerWatts, s.SMClockMHz, s.MemClockMHz, s.TemperatureC, s.GPUUtilPct, s.MemUtilPct, s.VRAMUsedMiB, s.VRAMTotalMiB)
+
+	case "ebpf", "probe":
+		sample, _ := mon.PollOnce(ctx)
+		computePIDs := mon.ActiveComputePIDs()
+		ebpfSummary := ebpftrace.ProbeAvailability(ebpfMode)
+		libCuda, libCudart := ebpfSummary.AttachedLibCUDA, ebpfSummary.AttachedLibCUDART
+		if libCuda == "" || libCudart == "" {
+			discCuda, discCudart := ebpftrace.DiscoverCUDALibraries(targetPIDs...)
+			if libCuda == "" {
+				libCuda = discCuda
+			}
+			if libCudart == "" {
+				libCudart = discCudart
+			}
+		}
+		if *jsonOut {
+			diag := map[string]any{
+				"gpu":               hw,
+				"telemetryBackend":  mon.Backend(),
+				"burstIntervalMs":   mon.BurstInterval().Milliseconds(),
+				"latestSample":      sample,
+				"activeComputePids": computePIDs,
+				"libCudaPath":       libCuda,
+				"libCudartPath":     libCudart,
+				"ebpf":              ebpfSummary,
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(diag)
+			return
+		}
+		printEBPFDiagnosticCLI(hw, mon, sample, computePIDs, libCuda, libCudart, ebpfSummary)
 
 	case "workload":
 		wCfg := workload.DefaultBenchmarkConfig()
@@ -129,11 +206,14 @@ func main() {
 		wCfg.AutoServer = *autoServer
 		wCfg.NumRequests = *llmReqs
 		wCfg.MaxTokens = *llmMaxTok
+		wCfg.EBPFMode = ebpfMode
+		wCfg.TracePID = cfg.TracePID
 
 		wCtx, wCancel := context.WithTimeout(ctx, 180*time.Second)
 		defer wCancel()
 		wRep, wErr := workload.RunInferenceBenchmark(wCtx, wCfg, mon, cfg.Economics)
 		if wErr != nil {
+			_ = mon.Close()
 			fmt.Fprintf(os.Stderr, "[gpumode] workload benchmark failed: %v\n", wErr)
 			os.Exit(1)
 		}
@@ -165,15 +245,60 @@ func main() {
 		}()
 		fmt.Printf("[gpumode] Real-Time Go Daemon & Web Dashboard listening at http://%s\n", cfg.ListenAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			_ = mon.Close()
 			fmt.Fprintf(os.Stderr, "[gpumode] server error: %v\n", err)
 			os.Exit(1)
 		}
 
 	default:
-		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|monitor] [flags]\n")
+		_ = mon.Close()
+		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|monitor|ebpf] [flags]\n")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
+}
+
+func printEBPFDiagnosticCLI(
+	hw physics.GPUHardwareSpec,
+	mon *telemetry.Monitor,
+	sample telemetry.Sample,
+	computePIDs []int,
+	libCuda, libCudart string,
+	sum ebpftrace.Summary,
+) {
+	fmt.Printf("================================================================================\n")
+	fmt.Printf(" gpuMode — Direct NVML & Host ↔ CUDA eBPF Observability Probe\n")
+	fmt.Printf("================================================================================\n")
+	fmt.Printf("  • GPU Device          : %s (%s, GPU #%d)\n", hw.Name, hw.ArchFlag, hw.GPUIndex)
+	fmt.Printf("  • Telemetry Backend   : %s (burst interval: %dms | live: %.2f W, %.0f/%.0f MiB VRAM)\n",
+		mon.Backend(), mon.BurstInterval().Milliseconds(), sample.PowerWatts, sample.VRAMUsedMiB, sample.VRAMTotalMiB)
+	if len(computePIDs) > 0 {
+		fmt.Printf("  • Active Compute PIDs : %v\n", computePIDs)
+	} else {
+		fmt.Printf("  • Active Compute PIDs : none\n")
+	}
+	fmt.Printf("  • CUDA Driver Library : %s\n", nonEmptyOr(libCuda, "not found"))
+	fmt.Printf("  • CUDA Runtime Library: %s\n", nonEmptyOr(libCudart, "not found"))
+	fmt.Printf("  • eBPF Tracer Status  : [%s] mode=%s active=%t\n", sum.Provenance, sum.Mode, sum.Active)
+	if sum.StatusDetail != "" {
+		fmt.Printf("  • Status Detail       : %s\n", sum.StatusDetail)
+	}
+	if len(sum.HookedSymbols) > 0 {
+		fmt.Printf("  • Hooked Symbols (%2d) : %s\n", len(sum.HookedSymbols), strings.Join(sum.HookedSymbols, ", "))
+	} else {
+		fmt.Printf("  • Hooked Symbols      : none (probes not attached)\n")
+	}
+	if sum.Provenance == ebpftrace.ProvenanceUnavailableUnprivileged {
+		fmt.Printf("  • Rootless Setup Hint : run './run.sh setcap' to grant cap_bpf,cap_perfmon,cap_sys_resource+ep\n")
+	}
+	fmt.Printf("================================================================================\n")
+}
+
+func nonEmptyOr(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
 }
 
 func printWorkloadReportCLI(rep workload.WorkloadBenchmarkReport) {
@@ -182,6 +307,26 @@ func printWorkloadReportCLI(rep workload.WorkloadBenchmarkReport) {
 	fmt.Printf("================================================================================\n")
 	fmt.Printf("  • Adapter             : %s\n", rep.Adapter)
 	fmt.Printf("  • Model / Endpoint    : %s @ %s\n", rep.ModelName, rep.ServerURL)
+	fmt.Printf("  • Telemetry Backend   : %s\n", nonEmptyOr(rep.TelemetryBackend, "NVIDIA_SMI"))
+	if rep.HostCUDATrace.Active {
+		fmt.Printf("  • Host ↔ CUDA eBPF    : [%s] %d launches (%.1f/tok) | %.1f µs avg gap | %.2f/%.2f MiB H2D/D2H | %.2f ms sync stall | %.2f ms off-CPU\n",
+			rep.HostCUDATrace.Provenance,
+			rep.HostCUDATrace.KernelLaunches,
+			rep.LaunchesPerOutputToken,
+			rep.HostCUDATrace.AvgLaunchGapUS,
+			rep.HostCUDATrace.MemcpyH2DMiB,
+			rep.HostCUDATrace.MemcpyD2HMiB,
+			rep.HostCUDATrace.SyncStallMS,
+			rep.HostCUDATrace.OffCPUMS,
+		)
+	} else {
+		prov := nonEmptyOr(rep.HostCUDATrace.Provenance, ebpftrace.ProvenanceDisabled)
+		if rep.HostCUDATrace.StatusDetail != "" {
+			fmt.Printf("  • Host ↔ CUDA eBPF    : [%s] %s\n", prov, rep.HostCUDATrace.StatusDetail)
+		} else {
+			fmt.Printf("  • Host ↔ CUDA eBPF    : [%s]\n", prov)
+		}
+	}
 	fmt.Printf("  • Requests / Tokens   : %d requests | %d output tokens in %.2fs\n",
 		rep.CompletedRequests, rep.TotalOutputTokens, rep.TotalDurationSec)
 	fmt.Printf("  • TTFT (p50 / p95)    : %.1f ms / %.1f ms\n", rep.MedianTTFTMS, rep.P95TTFTMS)
@@ -199,6 +344,20 @@ func printCausalReportCLI(rep profiler.CausalChainReport) {
 	fmt.Printf("================================================================================\n")
 	fmt.Printf(" gpuMode — CUDA Hardware & Energy Verification Report (%s / %s)\n", rep.Hardware.Name, rep.Hardware.ArchFlag)
 	fmt.Printf("================================================================================\n")
+	telBackend := nonEmptyOr(rep.TelemetryBackend, "NVIDIA_SMI")
+	ebpfProv := nonEmptyOr(rep.HostCUDATrace.Provenance, ebpftrace.ProvenanceDisabled)
+	if rep.HostCUDATrace.Active {
+		fmt.Printf("Observability: Telemetry: %s | Host-CUDA eBPF: %s (%d launches, %.1f µs avg gap, %.2f ms sync stall, %.2f ms off-CPU)\n\n",
+			telBackend,
+			ebpfProv,
+			rep.HostCUDATrace.KernelLaunches,
+			rep.HostCUDATrace.AvgLaunchGapUS,
+			rep.HostCUDATrace.SyncStallMS,
+			rep.HostCUDATrace.OffCPUMS,
+		)
+	} else {
+		fmt.Printf("Observability: Telemetry: %s | Host-CUDA eBPF: %s\n\n", telBackend, ebpfProv)
+	}
 	fmt.Printf("1. Why is the GPU underutilized?\n   %s\n\n", sa.Q1WhyUnderutilized)
 	fmt.Printf("2. Which operations are responsible?\n   %s\n\n", sa.Q2WhichOpsResponsible)
 	fmt.Printf("3. What optimization helps?\n   %s\n\n", sa.Q3WhatOptimizationHelps)

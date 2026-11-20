@@ -16,9 +16,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gpumode/internal/config"
+	"gpumode/internal/ebpftrace"
 	"gpumode/internal/optimizer"
 	"gpumode/internal/physics"
 	"gpumode/internal/telemetry"
@@ -26,15 +28,17 @@ import (
 
 // BenchmarkConfig configures a real HTTP inference benchmark against a local llama-server or Ollama endpoint.
 type BenchmarkConfig struct {
-	ServerURL   string   `json:"serverUrl"`   // e.g. http://127.0.0.1:8081
-	ModelName   string   `json:"modelName"`   // e.g. deepseek-v4-9b or ollama model tag
-	ModelPath   string   `json:"modelPath"`   // GGUF path when AutoStartServer is true
-	AutoServer  bool     `json:"autoServer"`  // Launch temporary llama-server if none is running
-	GPULayers   int      `json:"gpuLayers"`   // -ngl for llama-server
-	CtxSize     int      `json:"ctxSize"`     // -c for llama-server
-	NumRequests int      `json:"numRequests"` // Number of real streaming inference requests
-	MaxTokens   int      `json:"maxTokens"`   // max_tokens per request
-	Prompts     []string `json:"prompts,omitempty"`
+	ServerURL   string         `json:"serverUrl"`   // e.g. http://127.0.0.1:8081
+	ModelName   string         `json:"modelName"`   // e.g. deepseek-v4-9b or ollama model tag
+	ModelPath   string         `json:"modelPath"`   // GGUF path when AutoStartServer is true
+	AutoServer  bool           `json:"autoServer"`  // Launch temporary llama-server if none is running
+	GPULayers   int            `json:"gpuLayers"`   // -ngl for llama-server
+	CtxSize     int            `json:"ctxSize"`     // -c for llama-server
+	NumRequests int            `json:"numRequests"` // Number of real streaming inference requests
+	MaxTokens   int            `json:"maxTokens"`   // max_tokens per request
+	Prompts     []string       `json:"prompts,omitempty"`
+	EBPFMode    ebpftrace.Mode `json:"ebpfMode,omitempty"`
+	TracePID    int            `json:"tracePid,omitempty"`
 }
 
 // RequestMeasurement holds real streaming timings for a single LLM inference call.
@@ -51,26 +55,29 @@ type RequestMeasurement struct {
 
 // WorkloadBenchmarkReport captures end-to-end measured inference, energy, VRAM, and production economics.
 type WorkloadBenchmarkReport struct {
-	Timestamp            time.Time                   `json:"timestamp"`
-	Adapter              string                      `json:"adapter"`
-	ServerURL            string                      `json:"serverUrl"`
-	ModelName            string                      `json:"modelName"`
-	Provenance           string                      `json:"provenance"` // "MEASURED"
-	CompletedRequests    int                         `json:"completedRequests"`
-	TotalOutputTokens    int                         `json:"totalOutputTokens"`
-	TotalDurationSec     float64                     `json:"totalDurationSec"`
-	MedianTTFTMS         float64                     `json:"medianTtftMs"`
-	P95TTFTMS            float64                     `json:"p95TtftMs"`
-	MedianTPOTMS         float64                     `json:"medianTpotMs"`
-	MedianLatencyMS      float64                     `json:"medianLatencyMs"`
-	P95LatencyMS         float64                     `json:"p95LatencyMs"`
-	ThroughputTokensPerS float64                     `json:"throughputTokensPerS"`
-	ThroughputRPS        float64                     `json:"throughputRps"`
-	MeasuredPeakVRAMMiB  float64                     `json:"measuredPeakVramMib"`
-	Energy               telemetry.EnergyMeasurement `json:"energy"`
-	JoulesPer1KTokens    float64                     `json:"joulesPer1kTokens"`
-	Economics            physics.BusinessKPIs        `json:"economics"`
-	Requests             []RequestMeasurement        `json:"requests"`
+	Timestamp              time.Time                   `json:"timestamp"`
+	Adapter                string                      `json:"adapter"`
+	ServerURL              string                      `json:"serverUrl"`
+	ModelName              string                      `json:"modelName"`
+	Provenance             string                      `json:"provenance"` // "MEASURED"
+	TelemetryBackend       string                      `json:"telemetryBackend,omitempty"`
+	HostCUDATrace          ebpftrace.Summary           `json:"hostCudaTrace"`
+	LaunchesPerOutputToken float64                     `json:"launchesPerOutputToken,omitempty"`
+	CompletedRequests      int                         `json:"completedRequests"`
+	TotalOutputTokens      int                         `json:"totalOutputTokens"`
+	TotalDurationSec       float64                     `json:"totalDurationSec"`
+	MedianTTFTMS           float64                     `json:"medianTtftMs"`
+	P95TTFTMS              float64                     `json:"p95TtftMs"`
+	MedianTPOTMS           float64                     `json:"medianTpotMs"`
+	MedianLatencyMS        float64                     `json:"medianLatencyMs"`
+	P95LatencyMS           float64                     `json:"p95LatencyMs"`
+	ThroughputTokensPerS   float64                     `json:"throughputTokensPerS"`
+	ThroughputRPS          float64                     `json:"throughputRps"`
+	MeasuredPeakVRAMMiB    float64                     `json:"measuredPeakVramMib"`
+	Energy                 telemetry.EnergyMeasurement `json:"energy"`
+	JoulesPer1KTokens      float64                     `json:"joulesPer1kTokens"`
+	Economics              physics.BusinessKPIs        `json:"economics"`
+	Requests               []RequestMeasurement        `json:"requests"`
 }
 
 func DefaultBenchmarkConfig() BenchmarkConfig {
@@ -89,6 +96,7 @@ func DefaultBenchmarkConfig() BenchmarkConfig {
 		CtxSize:     1024,
 		NumRequests: 4,
 		MaxTokens:   48,
+		EBPFMode:    ebpftrace.ModeAuto,
 		Prompts: []string{
 			"Explain why fused RMSNorm + Residual Add reduces DRAM bandwidth traffic in CUDA in two concise sentences.",
 			"Write a short 3-line explanation of warp shuffle reductions in CUDA.",
@@ -199,12 +207,34 @@ func RunInferenceBenchmark(
 	// Warmup request (excluded from timed stats)
 	_, _ = executeStreamingChat(ctx, cfg.ServerURL, cfg.ModelName, "Say OK.", 8)
 
+	ebpfMode := ebpftrace.ParseMode(string(cfg.EBPFMode))
+	targetPIDs := resolveBenchmarkTargetPIDs(cfg, serverCmd, mon)
+	sess, ebpfErr := ebpftrace.StartSession(ebpfMode, targetPIDs)
+	if ebpfErr != nil {
+		return WorkloadBenchmarkReport{}, ebpfErr
+	}
+	defer func() {
+		if sess != nil {
+			_ = sess.Stop()
+		}
+	}()
+
+	burstInterval := 75 * time.Millisecond
+	if mon != nil {
+		if bi := mon.BurstInterval(); bi > 0 {
+			burstInterval = bi
+		}
+	}
+
 	// Start active burst telemetry polling during real inference load
+	var burstWG sync.WaitGroup
 	burstCtx, burstCancel := context.WithCancel(ctx)
 	if mon != nil {
 		_, _ = mon.PollOnce(ctx)
-		go func() {
-			tk := time.NewTicker(75 * time.Millisecond)
+		burstWG.Add(1)
+		go func(interval time.Duration) {
+			defer burstWG.Done()
+			tk := time.NewTicker(interval)
 			defer tk.Stop()
 			for {
 				select {
@@ -214,7 +244,7 @@ func RunInferenceBenchmark(
 					_, _ = mon.PollOnce(burstCtx)
 				}
 			}
-		}()
+		}(burstInterval)
 	}
 
 	winStart := time.Now()
@@ -238,10 +268,22 @@ func RunInferenceBenchmark(
 			totals = append(totals, rm.TotalLatencyMS)
 			totalTokens += rm.OutputTokens
 		}
+		if i == 0 && mon != nil {
+			for _, pid := range mon.ActiveComputePIDs() {
+				sess.AddTargetPID(pid)
+			}
+		}
 		results = append(results, rm)
 	}
 	winEnd := time.Now()
+	if mon != nil {
+		for _, pid := range mon.ActiveComputePIDs() {
+			sess.AddTargetPID(pid)
+		}
+	}
+	ebpfSum := sess.Stop()
 	burstCancel()
+	burstWG.Wait()
 
 	if mon != nil {
 		_, _ = mon.PollOnce(ctx)
@@ -262,15 +304,8 @@ func RunInferenceBenchmark(
 
 	var em telemetry.EnergyMeasurement
 	if mon != nil {
-		em = mon.MeasureWindow(winStart, winEnd, len(totals), medLat)
-		em.IdlePowerWatts = idlePowerW
-		em.ActivePowerWatts = math.Max(0, em.AvgPowerWatts-idlePowerW)
-		if em.AvgPowerWatts > 0 {
-			ratio := em.ActivePowerWatts / em.AvgPowerWatts
-			em.ActiveEnergyJoules = em.TotalEnergyJoules * ratio
-			em.ActiveJoulesPer1K = em.JoulesPer1KRequests * ratio
-		}
-		em.TotalKernelTimeMS = totalDurSec * 1000.0
+		winEM := mon.MeasureWindow(winStart, winEnd, len(totals), medLat)
+		em = telemetry.AggregateWindowMeasurements([]telemetry.EnergyMeasurement{winEM}, idlePowerW, totalDurSec*1000.0, burstInterval)
 	} else {
 		em = telemetry.EnergyMeasurement{
 			DurationSec:           totalDurSec,
@@ -285,6 +320,16 @@ func RunInferenceBenchmark(
 		joulesPer1KTokens = (em.TotalEnergyJoules / float64(totalTokens)) * 1000.0
 	}
 
+	telemetryBackend := ""
+	if mon != nil {
+		telemetryBackend = mon.Backend()
+	}
+
+	launchesPerOutputToken := 0.0
+	if ebpfSum.Active && totalTokens > 0 {
+		launchesPerOutputToken = float64(ebpfSum.KernelLaunches) / float64(totalTokens)
+	}
+
 	wm := physics.WorkloadMetrics{
 		LatencyMS:          medLat,
 		P95LatencyMS:       p95Lat,
@@ -296,27 +341,74 @@ func RunInferenceBenchmark(
 	kpi := physics.ComputeBusinessKPIs(wm, econ)
 
 	return WorkloadBenchmarkReport{
-		Timestamp:            time.Now(),
-		Adapter:              "OpenAI-Compatible Local Inference Adapter (llama-server / Ollama)",
-		ServerURL:            cfg.ServerURL,
-		ModelName:            cfg.ModelName,
-		Provenance:           "MEASURED",
-		CompletedRequests:    len(totals),
-		TotalOutputTokens:    totalTokens,
-		TotalDurationSec:     totalDurSec,
-		MedianTTFTMS:         medTTFT,
-		P95TTFTMS:            p95TTFT,
-		MedianTPOTMS:         medTPOT,
-		MedianLatencyMS:      medLat,
-		P95LatencyMS:         p95Lat,
-		ThroughputTokensPerS: tokPerSec,
-		ThroughputRPS:        rps,
-		MeasuredPeakVRAMMiB:  em.PeakVRAMMiB,
-		Energy:               em,
-		JoulesPer1KTokens:    joulesPer1KTokens,
-		Economics:            kpi,
-		Requests:             results,
+		Timestamp:              time.Now(),
+		Adapter:                "OpenAI-Compatible Local Inference Adapter (llama-server / Ollama)",
+		ServerURL:              cfg.ServerURL,
+		ModelName:              cfg.ModelName,
+		Provenance:             "MEASURED",
+		TelemetryBackend:       telemetryBackend,
+		HostCUDATrace:          ebpfSum,
+		LaunchesPerOutputToken: launchesPerOutputToken,
+		CompletedRequests:      len(totals),
+		TotalOutputTokens:      totalTokens,
+		TotalDurationSec:       totalDurSec,
+		MedianTTFTMS:           medTTFT,
+		P95TTFTMS:              p95TTFT,
+		MedianTPOTMS:           medTPOT,
+		MedianLatencyMS:        medLat,
+		P95LatencyMS:           p95Lat,
+		ThroughputTokensPerS:   tokPerSec,
+		ThroughputRPS:          rps,
+		MeasuredPeakVRAMMiB:    em.PeakVRAMMiB,
+		Energy:                 em,
+		JoulesPer1KTokens:      joulesPer1KTokens,
+		Economics:              kpi,
+		Requests:               results,
 	}, nil
+}
+
+func resolveBenchmarkTargetPIDs(cfg BenchmarkConfig, serverCmd *exec.Cmd, mon *telemetry.Monitor) []int {
+	seen := make(map[int]struct{})
+	add := func(pid int) {
+		if pid > 0 {
+			seen[pid] = struct{}{}
+		}
+	}
+
+	add(cfg.TracePID)
+	if serverCmd != nil && serverCmd.Process != nil {
+		add(serverCmd.Process.Pid)
+	}
+
+	portStr := extractPort(cfg.ServerURL, "")
+	if portStr == "" {
+		if strings.HasPrefix(strings.ToLower(cfg.ServerURL), "https://") {
+			portStr = "443"
+		} else if strings.HasPrefix(strings.ToLower(cfg.ServerURL), "http://") {
+			portStr = "80"
+		}
+	}
+	if portNum, err := strconv.Atoi(portStr); err == nil && portNum > 0 {
+		for _, pid := range ebpftrace.FindPIDsByTCPPort(portNum) {
+			add(pid)
+		}
+	}
+
+	if mon != nil {
+		for _, pid := range mon.ActiveComputePIDs() {
+			add(pid)
+		}
+	}
+
+	if len(seen) == 0 {
+		return nil
+	}
+	pids := make([]int, 0, len(seen))
+	for pid := range seen {
+		pids = append(pids, pid)
+	}
+	sort.Ints(pids)
+	return pids
 }
 
 func executeStreamingChat(ctx context.Context, baseURL, modelName, prompt string, maxTokens int) (RequestMeasurement, error) {

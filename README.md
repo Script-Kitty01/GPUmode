@@ -69,8 +69,8 @@ For every workload, **gpuMode** traces the full causal chain from low-level CUDA
        ┌──────────────────────────────────┼──────────────────────────────────┐
        ▼                                  ▼                                  ▼
 1. CONCURRENT TELEMETRY & ENERGY   2. WORKLOAD & ROOFLINE      3. HARDWARE PHYSICS & COST ENGINE
-   - Goroutine Ring-Buffer + SSE      - CUDA Hardware Probe       - Auto-detected GPU FP32/BW/VRAM
-   - Live Power P(t), Clocks, Temp    - PyTorch / Workload Trace  - User-Configurable $/GPU-hr & $/kWh
+   - Direct NVML (10ms) + SMI         - CUDA Hardware Probe       - Auto-detected GPU FP32/BW/VRAM
+   - Optional eBPF CUDA + Scheduler   - PyTorch / Workload Trace  - User-Configurable $/GPU-hr & $/kWh
    - E = ∫ P(t) dt (Joules), EDP      - Arithmetic Intensity (AI) - Server PUE & Grid Carbon (CO2e)
        └──────────────────────────────────┼──────────────────────────────────┘
                                           ▼
@@ -116,14 +116,28 @@ gpuMode/
 │   └── main.go                        # CLI & Real-Time HTTP/SSE Daemon entrypoint
 ├── internal/
 │   ├── config/
-│   │   └── config.go                  # Daemon, tariff, PUE, carbon, and SLA configuration
+│   │   ├── config.go                  # Daemon, telemetry/eBPF, tariff, PUE, carbon, and SLA config
+│   │   └── config_test.go
+│   ├── nvml/
+│   │   ├── nvml.go                    # Pure-Go NVML types & entrypoints (zero-cgo dlopen)
+│   │   ├── nvml_linux.go              # Direct libnvidia-ml.so.1 bindings (10ms power/clock/PIDs)
+│   │   ├── nvml_other.go              # Non-Linux graceful fallback stub
+│   │   └── nvml_test.go
+│   ├── ebpftrace/
+│   │   ├── bpf/cuda_trace.bpf.c       # Kernel BPF C program (libcuda uprobes + sched_switch)
+│   │   ├── gen.go                     # bpf2go code generation directive
+│   │   ├── discover.go                # libcuda.so.1 / libcudart.so & /proc TCP PID discovery
+│   │   ├── tracer_linux.go            # cilium/ebpf uprobe/uretprobe & tracepoint session manager
+│   │   ├── tracer_stub.go             # Non-Linux/non-amd64 graceful fallback stub
+│   │   ├── types.go                   # Aggregated Host <-> CUDA eBPF summary & lineage filter
+│   │   └── tracer_test.go
 │   ├── physics/
 │   │   ├── physics.go                 # Live CUDA cudaGetDeviceProperties + nvidia-smi hardware probe
 │   │   ├── economics.go               # $/1M inferences, Joules/1K, Requests/GPU-hr, and monthly ROI
 │   │   ├── presets.json               # Reference NVIDIA SKU presets for the Digital Twin
 │   │   └── physics_test.go
 │   ├── telemetry/
-│   │   ├── telemetry.go               # Concurrent ring-buffer, SSE pub/sub, E = ∫P(t)dt, & DVFS simulator
+│   │   ├── telemetry.go               # Direct NVML (10ms burst) + nvidia-smi fallback, SSE, & E = ∫P(t)dt
 │   │   └── telemetry_test.go
 │   ├── roofline/
 │   │   ├── roofline.go                # Arithmetic Intensity, ridge points, & bottleneck classifier
@@ -149,12 +163,13 @@ gpuMode/
 │   ├── store/
 │   │   ├── store.go                   # Thread-safe local JSON persistence for optimization history
 │   │   └── store_test.go
-│   └── server/
-│       ├── server.go                  # REST API (/api/state, /api/optimize, /api/recompute) & SSE stream
-│       ├── dashboard.go               # Embedded zero-dependency interactive Web Dashboard
-│       └── server_test.go
+│   ├── server/
+│   │   ├── server.go                  # REST API (/api/state, /api/optimize, /api/recompute, /api/workload) & SSE
+│   │   ├── dashboard.go               # Embedded zero-dependency interactive Web Dashboard
+│   │   └── server_test.go
 │   └── workload/
-│       └── workload.go                # Optional llama-server / Ollama streaming benchmark
+│       ├── workload.go                # Optional llama-server / Ollama streaming benchmark + eBPF trace
+│       └── workload_test.go
 ├── scripts/
 │   └── profile_pytorch.py             # PyTorch operator profiler bridge with standalone fallback
 ├── run.sh                             # One-command build & launch script
@@ -193,12 +208,40 @@ You can also run specific modes directly via `./run.sh` or `./gpumode`:
 # Benchmark real end-to-end streaming inference on your local DeepSeek-V4-9B / Ollama server (TTFT, TPOT, VRAM, J/1K tokens)
 ./run.sh workload -llm-reqs 3 -llm-tokens 48
 
-# Print a live GPU hardware & power telemetry snapshot
+# Print a live GPU hardware & power telemetry snapshot (shows active NVML / NVIDIA_SMI backend)
 ./run.sh monitor
+
+# Inspect NVML telemetry backend, discovered libcuda.so.1/libcudart.so, active GPU PIDs, and eBPF capability status
+./run.sh ebpf
+
+# Grant rootless eBPF capabilities (cap_bpf,cap_perfmon,cap_sys_resource+ep) to ./gpumode without running the daemon as root
+./run.sh setcap
 
 # Run the complete unit & live GPU hardware verification test suite
 ./run.sh test
 ```
+
+### Direct NVML Telemetry & Optional eBPF Host ↔ CUDA Tracer
+
+gpuMode includes two kernel/driver-level observability subsystems that eliminate subprocess jitter and expose host-side CUDA launch bottlenecks:
+
+1. **Direct NVML Telemetry (`libnvidia-ml.so.1`, `internal/nvml`):**
+   - Dynamically loads `libnvidia-ml.so.1` directly in pure Go (`dlopen`, no CGo toolchain required) to sample board power, SM/memory clocks, utilization, VRAM, and active compute process PIDs with **zero subprocess spawn jitter** and **`10 ms` high-frequency burst sampling** during kernel & LLM benchmark windows.
+   - Automatically falls back to `nvidia-smi` (`50 ms` burst) if NVML is unavailable or when `-telemetry=smi` (`GPUMODE_TELEMETRY=smi`) is specified.
+
+2. **Optional eBPF Host ↔ CUDA Boundary Tracer (`internal/ebpftrace`):**
+   - Attaches Linux uprobes/uretprobes directly to `libcuda.so.1` (`cuLaunchKernel*`, `cuMemcpyHtoD*`, `cuMemcpyDtoH*`, `cuMemAlloc*`, `cuStreamSynchronize*`, `cuCtxSynchronize*`, with `libcudart.so` fallback) plus the kernel `sched/sched_switch` raw tracepoint.
+   - Captures **kernel launch counts** (`launches/tok`), **inter-launch CPU dispatch gaps (`µs`)**, **PCIe H2D/D2H transfer volumes (`MiB`)**, **CUDA synchronization stalls (`ms`)**, and **host scheduler off-CPU starvation (`ms`)** per target process tree.
+   - Controlled via `-ebpf=auto|on|off` (or `GPUMODE_EBPF`):
+     - `auto` *(default)*: attaches automatically when capabilities are present, or degrades gracefully to `UNAVAILABLE_UNPRIVILEGED` without failing benchmarks.
+     - `on`: enforces live eBPF attachment and exits upfront with an actionable error if probes cannot attach.
+     - `off`: disables eBPF tracing (`DISABLED`).
+   - **Rootless Setup (`./run.sh setcap`):** Grant minimal BPF capabilities once to the compiled binary instead of running the whole daemon under `sudo`:
+     ```bash
+     ./run.sh setcap   # runs sudo setcap cap_bpf,cap_perfmon,cap_sys_resource+ep ./gpumode && ./gpumode ebpf
+     ./run.sh ebpf     # inspect NVML + libcuda.so.1 + hooked symbols + active GPU PIDs (pass -json for JSON)
+     ./run.sh bpf-gen  # recompile internal/ebpftrace/bpf/cuda_trace.bpf.c via bpf2go when modifying BPF C code
+     ```
 
 ### Dynamic NVIDIA/CUDA Configuration
 
@@ -226,7 +269,13 @@ The following environment variables are supported:
 
 | Variable | Purpose |
 |---|---|
-| `GPUMODE_GPU_INDEX` | NVIDIA GPU index passed to CUDA and `nvidia-smi` |
+| `GPUMODE_GPU_INDEX` | NVIDIA GPU index passed to CUDA, NVML, and `nvidia-smi` |
+| `GPUMODE_TELEMETRY` | Telemetry backend mode: `auto` (default, prefers NVML), `nvml`, or `smi` |
+| `GPUMODE_NVML_LIB` | Explicit path override for `libnvidia-ml.so.1` |
+| `GPUMODE_EBPF` | Host-to-CUDA eBPF tracer mode: `auto` (default), `on`, or `off` |
+| `GPUMODE_TRACE_PID` | Explicit target PID for eBPF CUDA & scheduler tracing (`0` = auto-discover) |
+| `GPUMODE_LIBCUDA` | Explicit path override for `libcuda.so.1` (CUDA Driver API uprobes) |
+| `GPUMODE_LIBCUDART` | Explicit path override for `libcudart.so` (CUDA Runtime API fallback uprobes) |
 | `GPUMODE_NVCC` | `nvcc` executable override |
 | `GPUMODE_SANITIZER` | `compute-sanitizer` executable override |
 | `GPUMODE_NVIDIA_SMI` | `nvidia-smi` executable override |

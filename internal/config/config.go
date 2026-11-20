@@ -42,6 +42,9 @@ type DaemonConfig struct {
 	PresetsPath       string          `json:"presetsPath,omitempty"`
 	DeepSeekModelPath string          `json:"deepseekModelPath,omitempty"`
 	TelemetryInterval time.Duration   `json:"telemetryInterval"`
+	TelemetryBackend  string          `json:"telemetryBackend"`
+	EBPFMode          string          `json:"ebpfMode"`
+	TracePID          int             `json:"tracePid,omitempty"`
 	CompileWorkers    int             `json:"compileWorkers"`
 	KernelTimeout     time.Duration   `json:"kernelTimeout"`
 	Economics         EconomicsConfig `json:"economics"`
@@ -196,6 +199,44 @@ func DefaultGPUIndex() int {
 	return 0
 }
 
+// ResolveTelemetryBackend resolves GPUMODE_TELEMETRY into "auto", "nvml", or "smi" (default "auto").
+func ResolveTelemetryBackend() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GPUMODE_TELEMETRY"))) {
+	case "nvml":
+		return "nvml"
+	case "smi":
+		return "smi"
+	case "auto", "":
+		return "auto"
+	default:
+		return "auto"
+	}
+}
+
+// ResolveEBPFMode resolves GPUMODE_EBPF into "auto", "on", or "off" (default "auto").
+func ResolveEBPFMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GPUMODE_EBPF"))) {
+	case "on":
+		return "on"
+	case "off":
+		return "off"
+	case "auto", "":
+		return "auto"
+	default:
+		return "auto"
+	}
+}
+
+// ResolveTracePID resolves GPUMODE_TRACE_PID into a positive target PID or 0 (auto-discover).
+func ResolveTracePID() int {
+	if v := strings.TrimSpace(os.Getenv("GPUMODE_TRACE_PID")); v != "" {
+		if pid, err := strconv.Atoi(v); err == nil && pid > 0 {
+			return pid
+		}
+	}
+	return 0
+}
+
 // DefaultDaemonConfig returns a dynamically resolved configuration for Linux + NVIDIA CUDA.
 func DefaultDaemonConfig() DaemonConfig {
 	return DaemonConfig{
@@ -209,6 +250,9 @@ func DefaultDaemonConfig() DaemonConfig {
 		PresetsPath:       strings.TrimSpace(os.Getenv("GPUMODE_PRESETS_PATH")),
 		DeepSeekModelPath: ResolveDeepSeekModelPath(),
 		TelemetryInterval: 200 * time.Millisecond,
+		TelemetryBackend:  ResolveTelemetryBackend(),
+		EBPFMode:          ResolveEBPFMode(),
+		TracePID:          ResolveTracePID(),
 		CompileWorkers:    3,
 		KernelTimeout:     25 * time.Second,
 		Economics:         DefaultEconomicsConfig(),

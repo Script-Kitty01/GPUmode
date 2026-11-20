@@ -64,8 +64,42 @@ const dashboardHTML = `<!DOCTYPE html>
     border: 1px solid var(--border);
     border-radius: 10px;
     padding: 12px 14px;
-    margin-bottom: 16px;
+    margin-bottom: 12px;
     align-items: center;
+  }
+  .ebpf-strip {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 16px;
+  }
+  .ebpf-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 0.82rem;
+  }
+  .ebpf-hint {
+    font-size: 0.76rem;
+    color: var(--muted);
+  }
+  .ebpf-hint code {
+    background: #0d131f;
+    border: 1px solid var(--border);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--accent);
+  }
+  .ebpf-metrics {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 10px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
   }
   .t-item { display: flex; flex-direction: column; }
   .t-label { font-size: 0.72rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.04em; }
@@ -207,7 +241,7 @@ const dashboardHTML = `<!DOCTYPE html>
     color: #cbd5e1;
   }
   @media (max-width: 1024px) {
-    .telemetry-strip, .controls-grid, .charts-grid, .two-col {
+    .telemetry-strip, .ebpf-metrics, .controls-grid, .charts-grid, .two-col {
       grid-template-columns: 1fr;
     }
   }
@@ -228,7 +262,7 @@ const dashboardHTML = `<!DOCTYPE html>
 <!-- Live SSE Telemetry Strip -->
 <section class="telemetry-strip">
   <div class="t-item">
-    <span class="t-label">Live GPU Power</span>
+    <span class="t-label">Live GPU Power <span class="badge badge-blue" id="telemetrySourceBadge">PROBING</span></span>
     <span class="t-val" id="tPower">-- W</span>
   </div>
   <div class="t-item">
@@ -252,6 +286,39 @@ const dashboardHTML = `<!DOCTYPE html>
     <span class="t-val" id="tRidge">-- FLOP/B</span>
   </div>
   <canvas id="sparkCanvas" width="210" height="42"></canvas>
+</section>
+
+<!-- Host <-> CUDA Boundary (eBPF + Scheduler) Readout -->
+<section class="ebpf-strip" id="ebpfStrip">
+  <div class="ebpf-head">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <strong>Host &harr; CUDA Boundary (eBPF + Scheduler)</strong>
+      <span class="badge badge-blue" id="ebpfProvBadge">PROBING</span>
+    </div>
+    <span class="ebpf-hint" id="ebpfHint">Checking Linux eBPF uprobe &amp; scheduler capabilities...</span>
+  </div>
+  <div class="ebpf-metrics" id="ebpfMetrics" style="display:none;">
+    <div class="t-item">
+      <span class="t-label">Kernel Launches</span>
+      <span class="t-val" id="eLaunches">--</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">Inter-Launch CPU Gap</span>
+      <span class="t-val" id="eLaunchGap">-- &micro;s</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">PCIe H2D / D2H</span>
+      <span class="t-val" id="eMemcpy">-- / -- MiB</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">CUDA Sync Stall</span>
+      <span class="t-val" id="eSyncStall">-- ms</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">Scheduler Off-CPU</span>
+      <span class="t-val" id="eOffCpu">-- ms</span>
+    </div>
+  </div>
 </section>
 
 <!-- Controls: Live GPU Optimization Trigger -->
@@ -389,6 +456,12 @@ async function loadInitialState() {
     const data = await res.json();
     currentState = data;
     renderHardware(data.hardware);
+    if (data.telemetryBackend) {
+      updateTelemetryBadge(data.telemetryBackend);
+    }
+    if (data.ebpfStatus) {
+      renderEBPFTrace(null, data.ebpfStatus);
+    }
     if (data.telemetryHistory && data.telemetryHistory.length) {
       data.telemetryHistory.forEach(s => updateTelemetryUI(s, false));
       drawSparkline();
@@ -401,6 +474,56 @@ async function loadInitialState() {
     }
   } catch (e) {
     console.error("Failed to load initial state:", e);
+  }
+}
+
+function updateTelemetryBadge(source) {
+  const el = document.getElementById("telemetrySourceBadge");
+  if (!el || !source) return;
+  const upper = String(source).toUpperCase();
+  el.textContent = upper;
+  el.className = "badge " + (upper === "NVML" ? "badge-green" : "badge-blue");
+}
+
+function renderEBPFTrace(trace, fallbackStatus) {
+  const badge = document.getElementById("ebpfProvBadge");
+  const hint = document.getElementById("ebpfHint");
+  const metrics = document.getElementById("ebpfMetrics");
+  if (!badge || !hint || !metrics) return;
+
+  const t = (trace && trace.provenance) ? trace : fallbackStatus;
+  if (!t) return;
+
+  const prov = t.provenance || "DISABLED";
+  badge.textContent = prov;
+  if (prov === "MEASURED_EBPF") {
+    badge.className = "badge badge-green";
+  } else if (prov === "UNAVAILABLE_UNPRIVILEGED") {
+    badge.className = "badge badge-amber";
+  } else {
+    badge.className = "badge badge-blue";
+  }
+
+  if (t.active) {
+    metrics.style.display = "grid";
+    const launchRate = t.launchesPerSec > 0 ? " (" + fmtNum(t.launchesPerSec, 0) + "/s)" : "";
+    document.getElementById("eLaunches").textContent = (t.kernelLaunches || 0) + launchRate;
+    document.getElementById("eLaunchGap").textContent = fmtNum(t.avgLaunchGapUs, 1) + " µs";
+    document.getElementById("eMemcpy").textContent =
+      fmtNum(t.memcpyH2dMib, 2) + " / " + fmtNum(t.memcpyD2hMib, 2) + " MiB";
+    document.getElementById("eSyncStall").textContent =
+      fmtNum(t.syncStallMs, 2) + " ms (" + fmtNum(t.syncStallPct, 1) + "%)";
+    document.getElementById("eOffCpu").textContent =
+      fmtNum(t.offCpuMs, 2) + " ms (" + fmtNum(t.hostStarvationPct, 1) + "%)";
+    hint.textContent = t.statusDetail || "Live libcuda.so.1 uprobes + sched_switch tracepoint active";
+  } else {
+    metrics.style.display = "none";
+    if (prov === "UNAVAILABLE_UNPRIVILEGED") {
+      hint.innerHTML =
+        "Rootless eBPF capabilities not granted &mdash; run <code>./run.sh setcap</code> or execute with <code>sudo</code> to attach <code>libcuda.so.1</code> uprobes &amp; <code>sched_switch</code>.";
+    } else {
+      hint.textContent = t.statusDetail || "eBPF host-to-CUDA tracer disabled";
+    }
   }
 }
 
@@ -421,6 +544,9 @@ function renderHardware(hw) {
 
 function updateTelemetryUI(s, redraw = true) {
   if (!s) return;
+  if (s.source) {
+    updateTelemetryBadge(s.source);
+  }
   document.getElementById("tPower").textContent = fmtNum(s.powerWatts, 2) + " W";
   document.getElementById("tClock").textContent = fmtNum(s.smClockMhz, 0) + " / " + fmtNum(s.memClockMhz, 0) + " MHz";
   document.getElementById("tTemp").textContent = fmtNum(s.temperatureC, 1) + " °C";
@@ -500,6 +626,10 @@ async function triggerOptimize() {
 
 function renderReport(rep) {
   if (!rep) return;
+  if (rep.telemetryBackend) {
+    updateTelemetryBadge(rep.telemetryBackend);
+  }
+  renderEBPFTrace(rep.hostCudaTrace, currentState && currentState.ebpfStatus);
 
   // Digital Twin Table
   const twinBody = document.getElementById("twinBody");
@@ -574,13 +704,32 @@ async function triggerWorkload() {
     if (!res.ok) throw new Error(await res.text());
     const w = await res.json();
     status.textContent = "Measured " + fmtNum(w.throughputTokensPerS, 1) + " tok/s";
+    if (w.hostCudaTrace && w.hostCudaTrace.active) {
+      renderEBPFTrace(w.hostCudaTrace, currentState && currentState.ebpfStatus);
+    }
+    const telTag = w.telemetryBackend || (currentState && currentState.telemetryBackend) || "NVIDIA_SMI";
+    let ebpfHtml = "";
+    if (w.hostCudaTrace && w.hostCudaTrace.active) {
+      ebpfHtml = "<br><strong>Host&harr;CUDA eBPF [MEASURED_EBPF]:</strong> " +
+        fmtNum(w.launchesPerOutputToken, 1) + " launches/tok (" + (w.hostCudaTrace.kernelLaunches || 0) + " total) &bull; " +
+        "<strong>Avg Launch Gap:</strong> " + fmtNum(w.hostCudaTrace.avgLaunchGapUs, 1) + " &micro;s &bull; " +
+        "<strong>H2D/D2H:</strong> " + fmtNum(w.hostCudaTrace.memcpyH2dMib, 2) + "/" + fmtNum(w.hostCudaTrace.memcpyD2hMib, 2) + " MiB &bull; " +
+        "<strong>Sync Stall:</strong> " + fmtNum(w.hostCudaTrace.syncStallMs, 2) + " ms &bull; " +
+        "<strong>Off-CPU:</strong> " + fmtNum(w.hostCudaTrace.offCpuMs, 2) + " ms";
+    } else {
+      const wProv = (w.hostCudaTrace && w.hostCudaTrace.provenance) ? w.hostCudaTrace.provenance : "DISABLED";
+      const setcapNote = wProv === "UNAVAILABLE_UNPRIVILEGED" ? " (run <code>./run.sh setcap</code> for rootless CUDA uprobes)" : "";
+      ebpfHtml = "<br><strong>Host&harr;CUDA eBPF:</strong> <span class='badge badge-amber'>" + wProv + "</span>" + setcapNote;
+    }
     box.innerHTML =
       "<strong>[" + w.provenance + "]</strong> " + w.modelName + " &bull; " +
+      "<strong>Telemetry:</strong> " + telTag + " &bull; " +
       "<strong>TTFT (p50/p95):</strong> " + fmtNum(w.medianTtftMs, 1) + " / " + fmtNum(w.p95TtftMs, 1) + " ms &bull; " +
       "<strong>TPOT:</strong> " + fmtNum(w.medianTpotMs, 2) + " ms/tok &bull; " +
       "<strong>Throughput:</strong> " + fmtNum(w.throughputTokensPerS, 2) + " tok/s &bull; " +
       "<strong>Peak VRAM:</strong> " + fmtNum(w.measuredPeakVramMib, 0) + " MiB &bull; " +
-      "<strong>Energy:</strong> " + fmtNum(w.joulesPer1kTokens, 1) + " J/1K tokens (" + fmtNum(w.energy.activePowerWatts, 1) + "W active)";
+      "<strong>Energy:</strong> " + fmtNum(w.joulesPer1kTokens, 1) + " J/1K tokens (" + fmtNum(w.energy.activePowerWatts, 1) + "W active)" +
+      ebpfHtml;
   } catch (e) {
     status.textContent = "Error: " + e.message;
   } finally {

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"gpumode/internal/config"
+	"gpumode/internal/ebpftrace"
 	"gpumode/internal/optimizer"
 	"gpumode/internal/physics"
 	"gpumode/internal/profiler"
@@ -19,13 +20,14 @@ import (
 
 // Server is the real-time Go daemon serving REST endpoints, live SSE telemetry streams, and the Web Dashboard.
 type Server struct {
-	mu        sync.RWMutex
-	cfg       config.DaemonConfig
-	hardware  physics.GPUHardwareSpec
-	monitor   *telemetry.Monitor
-	pipeline  *profiler.Pipeline
-	store     *store.Store
-	runningOp bool
+	mu         sync.RWMutex
+	cfg        config.DaemonConfig
+	hardware   physics.GPUHardwareSpec
+	monitor    *telemetry.Monitor
+	pipeline   *profiler.Pipeline
+	store      *store.Store
+	ebpfStatus ebpftrace.Summary
+	runningOp  bool
 }
 
 func NewServer(
@@ -36,11 +38,12 @@ func NewServer(
 	st *store.Store,
 ) *Server {
 	return &Server{
-		cfg:      cfg,
-		hardware: hw,
-		monitor:  mon,
-		pipeline: pipe,
-		store:    st,
+		cfg:        cfg,
+		hardware:   hw,
+		monitor:    mon,
+		pipeline:   pipe,
+		store:      st,
+		ebpfStatus: ebpftrace.ProbeAvailability(ebpftrace.ParseMode(cfg.EBPFMode)),
 	}
 }
 
@@ -71,13 +74,16 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	econ := s.cfg.Economics
 	hw := s.hardware
 	busy := s.runningOp
+	ebpfStatus := s.ebpfStatus
 	s.mu.RUnlock()
 
 	latest, hasLatest := s.store.Latest()
 	history := s.store.List()
 	var latestSample telemetry.Sample
 	var samples []telemetry.Sample
+	telemetryBackend := ""
 	if s.monitor != nil {
+		telemetryBackend = s.monitor.Backend()
 		latestSample = s.monitor.Latest()
 		samples = s.monitor.History(60)
 	}
@@ -85,6 +91,8 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"hardware":         hw,
 		"economics":        econ,
+		"telemetryBackend": telemetryBackend,
+		"ebpfStatus":       ebpfStatus,
 		"supportedOps":     optimizer.SupportedOperations(),
 		"hasReport":        hasLatest,
 		"latestReport":     latest,
@@ -243,6 +251,12 @@ func (s *Server) handleWorkload(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
+	s.mu.RLock()
+	cfgModelPath := s.cfg.DeepSeekModelPath
+	cfgEBPFMode := s.cfg.EBPFMode
+	cfgTracePID := s.cfg.TracePID
+	s.mu.RUnlock()
+
 	def := workload.DefaultBenchmarkConfig()
 	if req.ServerURL == "" {
 		req.ServerURL = def.ServerURL
@@ -251,8 +265,8 @@ func (s *Server) handleWorkload(w http.ResponseWriter, r *http.Request) {
 		req.ModelName = def.ModelName
 	}
 	if req.ModelPath == "" {
-		if s.cfg.DeepSeekModelPath != "" {
-			req.ModelPath = s.cfg.DeepSeekModelPath
+		if cfgModelPath != "" {
+			req.ModelPath = cfgModelPath
 		} else {
 			req.ModelPath = def.ModelPath
 		}
@@ -262,6 +276,14 @@ func (s *Server) handleWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MaxTokens <= 0 {
 		req.MaxTokens = def.MaxTokens
+	}
+	if req.EBPFMode == "" {
+		req.EBPFMode = ebpftrace.ParseMode(cfgEBPFMode)
+	} else {
+		req.EBPFMode = ebpftrace.ParseMode(string(req.EBPFMode))
+	}
+	if req.TracePID == 0 {
+		req.TracePID = cfgTracePID
 	}
 
 	s.mu.Lock()

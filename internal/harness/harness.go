@@ -343,13 +343,23 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 	var lastOut HarnessOutput
 	var totalKernelMS float64
 
+	burstInterval := 50 * time.Millisecond
+	if r.Monitor != nil {
+		if bi := r.Monitor.BurstInterval(); bi > 0 {
+			burstInterval = bi
+		}
+	}
+
 	// Step 3: Run repeated benchmark windows with burst telemetry polling so energy uncertainty & confidence are quantified
 	for w := 0; w < repeatCount; w++ {
+		var burstWG sync.WaitGroup
 		burstCtx, burstCancel := context.WithCancel(ctx)
 		if r.Monitor != nil {
 			_, _ = r.Monitor.PollOnce(ctx)
-			go func() {
-				tk := time.NewTicker(50 * time.Millisecond)
+			burstWG.Add(1)
+			go func(interval time.Duration) {
+				defer burstWG.Done()
+				tk := time.NewTicker(interval)
 				defer tk.Stop()
 				for {
 					select {
@@ -359,7 +369,7 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 						_, _ = r.Monitor.PollOnce(burstCtx)
 					}
 				}
-			}()
+			}(burstInterval)
 		}
 
 		winStart := time.Now()
@@ -372,6 +382,7 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 		runErr := bCmd.Run()
 		bCancel()
 		burstCancel()
+		burstWG.Wait()
 
 		if r.Monitor != nil {
 			_, _ = r.Monitor.PollOnce(ctx)
@@ -452,7 +463,7 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 	}
 
 	if r.Monitor != nil && len(windowMeasurements) > 0 {
-		res.Energy = telemetry.AggregateWindowMeasurements(windowMeasurements, idlePowerW, totalKernelMS, r.Monitor.Interval())
+		res.Energy = telemetry.AggregateWindowMeasurements(windowMeasurements, idlePowerW, totalKernelMS, burstInterval)
 	} else {
 		completedReqs := lastOut.CompletedRequests
 		if completedReqs <= 0 {

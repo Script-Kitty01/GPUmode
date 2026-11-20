@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"gpumode/internal/config"
+	"gpumode/internal/ebpftrace"
 	"gpumode/internal/harness"
 	"gpumode/internal/optimizer"
 	"gpumode/internal/pareto"
@@ -63,8 +64,10 @@ type CausalChainReport struct {
 	BatchSize             int                          `json:"batchSize"`
 	HiddenDim             int                          `json:"hiddenDim"`
 	Strategy              optimizer.TuningStrategy     `json:"strategy"`
-	Hardware              physics.GPUHardwareSpec      `json:"hardware"`
-	EconomicsConfig       config.EconomicsConfig       `json:"economicsConfig"`
+	Hardware             physics.GPUHardwareSpec         `json:"hardware"`
+	TelemetryBackend     string                          `json:"telemetryBackend,omitempty"`
+	HostCUDATrace        ebpftrace.Summary               `json:"hostCudaTrace"`
+	EconomicsConfig      config.EconomicsConfig          `json:"economicsConfig"`
 	Trace                 PyTorchTrace                 `json:"trace"`
 	BaselineRoofline      roofline.Diagnosis           `json:"baselineRoofline"`
 	OptimizedRoofline     roofline.Diagnosis           `json:"optimizedRoofline"`
@@ -88,6 +91,8 @@ type Pipeline struct {
 	PythonPath  string
 	ScriptPath  string
 	PresetsPath string
+	EBPFMode    ebpftrace.Mode
+	TracePIDs   []int
 }
 
 func NewPipeline(
@@ -109,6 +114,7 @@ func NewPipeline(
 		Autotuner:  optimizer.NewAutotuner(optimizer.NewDeterministicProposerForHardware(hw), runner),
 		PythonPath: pythonPath,
 		ScriptPath: scriptPath,
+		EBPFMode:   ebpftrace.ModeAuto,
 	}
 }
 
@@ -136,20 +142,53 @@ func (p *Pipeline) Execute(
 		strategy = optimizer.StrategyBayesian
 	}
 
+	telemetryBackend := "NONE"
+	if p.Monitor != nil {
+		if b := p.Monitor.Backend(); b != "" {
+			telemetryBackend = b
+		}
+	}
+
+	ebpfMode := p.EBPFMode
+	if ebpfMode == "" {
+		ebpfMode = ebpftrace.ModeAuto
+	}
+	sess, ebpfErr := ebpftrace.StartSession(ebpfMode, p.TracePIDs)
+
 	trace := p.collectPyTorchTrace(ctx, batchSize, hiddenDim)
 
 	// Run CUDA compilation, verification, energy measurement, and Bayesian/Grid autotuning
 	autoSummary := p.Autotuner.Run(ctx, opCategory, batchSize, hiddenDim, iterations, strategy, econ)
+
+	var ebpfSum ebpftrace.Summary
+	if sess != nil {
+		ebpfSum = sess.Stop()
+	}
+	if ebpfErr != nil {
+		ebpfSum = ebpftrace.Summary{
+			Enabled:      true,
+			Active:       false,
+			Mode:         ebpfMode,
+			Provenance:   ebpftrace.ProvenanceUnavailableUnsupported,
+			StatusDetail: ebpfErr.Error(),
+		}
+	}
+
 	baseRes := autoSummary.BaselineResult
 	bestRes := autoSummary.BestResult
 
 	// Diagnose baseline and optimized kernels on the Roofline model
 	baseProfile := roofline.EstimateOpProfile(opCategory, batchSize, hiddenDim, baseRes.MedianLatencyMS)
+	if ebpfSum.Active && ebpfSum.KernelLaunches > 0 {
+		baseProfile.HostLaunchGapUS = ebpfSum.AvgLaunchGapUS
+		baseProfile.HostSyncStallPct = ebpfSum.SyncStallPct
+		baseProfile.HostStarvationPct = ebpfSum.HostStarvationPct
+		baseProfile.HostBoundaryProvenance = ebpfSum.Provenance
+	}
 	baseDiag := roofline.Diagnose(baseProfile, p.Hardware)
 
-	optProfile := baseProfile
+	optProfile := roofline.EstimateOpProfile(opCategory, batchSize, hiddenDim, bestRes.MedianLatencyMS)
 	optProfile.Name = bestRes.Spec.Name
-	optProfile.MeasuredLatencyMS = bestRes.MedianLatencyMS
 	optProfile.LaunchCount = 1
 	// Fused kernel cuts global memory traffic by eliminating intermediate tensor read/write
 	if bestRes.Spec.Fused {
@@ -215,7 +254,7 @@ func (p *Pipeline) Execute(
 	schedPlan := twin.ScheduleWorkloads(nil, p.Hardware.TotalVRAMMiB, econ)
 	autoscale := twin.ForecastAutoscaling(nil, optMetrics.ThroughputRPS, econ)
 
-	answers := buildSevenAnswers(p.Hardware, trace, baseDiag, optDiag, baseRes, bestRes, autoSummary.ParetoRecommendations, econComp, twinScenarios)
+	answers := buildSevenAnswers(p.Hardware, trace, baseDiag, optDiag, baseRes, bestRes, autoSummary.ParetoRecommendations, econComp, twinScenarios, ebpfSum)
 	extCode := GeneratePyTorchExtension(bestRes.Spec)
 
 	return CausalChainReport{
@@ -226,6 +265,8 @@ func (p *Pipeline) Execute(
 		HiddenDim:            hiddenDim,
 		Strategy:             strategy,
 		Hardware:             p.Hardware,
+		TelemetryBackend:     telemetryBackend,
+		HostCUDATrace:        ebpfSum,
 		EconomicsConfig:      econ,
 		Trace:                trace,
 		BaselineRoofline:     baseDiag,
@@ -294,6 +335,7 @@ func RecomputeEconomics(rep CausalChainReport, econ config.EconomicsConfig) Caus
 	rep.SevenAnswers = buildSevenAnswers(
 		rep.Hardware, rep.Trace, rep.BaselineRoofline, rep.OptimizedRoofline,
 		baseRes, bestRes, rep.Autotune.ParetoRecommendations, rep.EconomicsComparison, rep.DigitalTwinScenarios,
+		rep.HostCUDATrace,
 	)
 	return rep
 }
@@ -355,6 +397,7 @@ func buildSevenAnswers(
 	paretoRecs pareto.ModeRecommendations,
 	econComp physics.SavingsComparison,
 	twinScenarios []twin.DigitalTwinScenario,
+	ebpfSum ebpftrace.Summary,
 ) SevenQuestionAnswers {
 	q1 := fmt.Sprintf("[%s] %s", baseDiag.Classification, baseDiag.UnderutilizationReason)
 
@@ -371,6 +414,17 @@ func buildSevenAnswers(
 		"[%s] %s accounts for %.1f%% of memory-bound execution time, issuing multiple unfused kernel launches and transferring %.1f GB/s across DRAM while keeping FP32 compute units at only %.1f%% capacity.",
 		trace.Provenance, topOp, topShare, baseDiag.AchievedBandwidthGBps, baseDiag.ComputeUtilizationPct,
 	)
+	if ebpfSum.Active && ebpfSum.KernelLaunches > 0 {
+		q2 += fmt.Sprintf(
+			" [MEASURED_EBPF] Host-boundary trace captured %d CUDA driver kernel launches (%.1f µs avg inter-launch gap), %.2f / %.2f MiB PCIe H2D/D2H transfers, %.2f ms host sync stall, and %.2f ms scheduler off-CPU time.",
+			ebpfSum.KernelLaunches,
+			ebpfSum.AvgLaunchGapUS,
+			ebpfSum.MemcpyH2DMiB,
+			ebpfSum.MemcpyD2HMiB,
+			ebpfSum.SyncStallMS,
+			ebpfSum.OffCPUMS,
+		)
+	}
 
 	q3 := fmt.Sprintf(
 		"Selected %s (Block=%d, VecWidth=float%d, %d registers/thread, %d B shared mem), fusing intermediate memory round-trips into registers and using __shfl_xor_sync warp reductions to achieve a %.2f× measured speedup (%.3f ms → %.3f ms).",
