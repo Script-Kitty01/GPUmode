@@ -2,8 +2,6 @@ package physics
 
 import (
 	"context"
-	_ "embed"
-	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -12,15 +10,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"gpumode/internal/config"
 )
 
-//go:embed presets.json
-var embeddedPresetsJSON []byte
-
 // GPUHardwareSpec captures the hardware physics ceiling and architecture traits
-// of a physical or reference NVIDIA GPU device.
+// of a physical NVIDIA GPU device.
 type GPUHardwareSpec struct {
 	GPUIndex               int     `json:"gpuIndex"`
 	Name                   string  `json:"name"`
@@ -184,46 +177,6 @@ func DetectHardwareForDevice(ctx context.Context, gpuIndex int, nvccPath, nvidia
 		)
 	}
 	return spec, nil
-}
-
-// LoadReferenceHardwarePresets returns localHW followed by reference SKUs loaded from
-// presetsPath (or GPUMODE_PRESETS_PATH, or the embedded presets.json if unset).
-func LoadReferenceHardwarePresets(presetsPath string, localHW GPUHardwareSpec) []GPUHardwareSpec {
-	raw := embeddedPresetsJSON
-	if strings.TrimSpace(presetsPath) == "" {
-		presetsPath = strings.TrimSpace(os.Getenv("GPUMODE_PRESETS_PATH"))
-	}
-	if presetsPath != "" {
-		if b, err := os.ReadFile(presetsPath); err == nil && len(b) > 0 {
-			raw = b
-		}
-	}
-
-	var skuPresets []GPUHardwareSpec
-	if err := json.Unmarshal(raw, &skuPresets); err != nil {
-		return []GPUHardwareSpec{localHW}
-	}
-
-	out := make([]GPUHardwareSpec, 0, len(skuPresets)+1)
-	out = append(out, localHW)
-	for _, s := range skuPresets {
-		if s.RidgePointFLOPsPerByte <= 0 {
-			s.RidgePointFLOPsPerByte = computeRidgePoint(s.PeakFP32TFLOPS, s.PeakMemBandwidthGBps)
-		}
-		out = append(out, s)
-	}
-	return out
-}
-
-// ReferenceHardwarePresets returns the dynamically detected local GPU followed by reference SKUs.
-func ReferenceHardwarePresets() []GPUHardwareSpec {
-	local, _ := DetectHardwareForDevice(
-		context.Background(),
-		config.DefaultGPUIndex(),
-		config.ResolveNVCCPath(),
-		config.ResolveNvidiaSMIPath(),
-	)
-	return LoadReferenceHardwarePresets("", local)
 }
 
 type smiQueryResult struct {

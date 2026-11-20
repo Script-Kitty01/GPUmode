@@ -2,9 +2,7 @@ package physics
 
 import (
 	"context"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -61,29 +59,6 @@ func TestDetectHardwareLiveAndFailure(t *testing.T) {
 	if invalidSpec.Name != "" || invalidSpec.ArchFlag != "" || invalidSpec.SMCount != 0 ||
 		invalidSpec.PeakFP32TFLOPS != 0 || invalidSpec.PeakMemBandwidthGBps != 0 {
 		t.Errorf("expected no fabricated hardware spec on probe failure, got %+v", invalidSpec)
-	}
-}
-
-func TestReferenceHardwarePresets(t *testing.T) {
-	presets := ReferenceHardwarePresets()
-	if len(presets) < 2 {
-		t.Fatalf("expected at least 2 reference hardware presets, got %d", len(presets))
-	}
-	for i, p := range presets {
-		if p.Name == "" || p.PeakFP32TFLOPS <= 0 || p.PeakMemBandwidthGBps <= 0 || p.RidgePointFLOPsPerByte <= 0 {
-			t.Errorf("preset[%d] has invalid physics fields: %+v", i, p)
-		}
-	}
-
-	// Verify external JSON presets loading overrides embedded list
-	customPath := filepath.Join(t.TempDir(), "custom_presets.json")
-	customJSON := `[{"name":"Custom NVIDIA H200","computeCapability":"9.0","archFlag":"sm_90","smCount":132,"totalVramMib":144384,"peakFp32Tflops":67.0,"peakMemBandwidthGbps":4800.0,"tdpWatts":700.0}]`
-	if err := os.WriteFile(customPath, []byte(customJSON), 0o600); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-	custom := LoadReferenceHardwarePresets(customPath, presets[0])
-	if len(custom) != 2 || custom[1].Name != "Custom NVIDIA H200" {
-		t.Fatalf("expected custom preset to load, got %+v", custom)
 	}
 }
 

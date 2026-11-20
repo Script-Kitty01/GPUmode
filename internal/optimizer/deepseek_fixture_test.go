@@ -51,7 +51,6 @@ func TestOfflineDeepSeekFixtureWithLiveEnergyAndSanitizerOnCUDA(t *testing.T) {
 
 	econ := config.DefaultEconomicsConfig()
 	mon := telemetry.NewMonitorForGPU(smiPath, gpuIdx, 150*time.Millisecond, 100)
-	mon.SetHardwareDefaults(hw.MaxSMClockMHz, hw.TDPWatts)
 	mon.Start(ctx)
 
 	runner := harness.NewRunner(nvccPath, config.ResolveSanitizerPath(), hw.ArchFlag, 3, 25*time.Second, mon)
@@ -112,7 +111,6 @@ func TestLocalDeepSeekGGUFModelLiveProposalAndVerification(t *testing.T) {
 	proposer := NewLocalDeepSeekProposerForHardware("llama-cli", modelPath, hw)
 	econ := config.DefaultEconomicsConfig()
 	mon := telemetry.NewMonitorForGPU(smiPath, gpuIdx, 150*time.Millisecond, 100)
-	mon.SetHardwareDefaults(hw.MaxSMClockMHz, hw.TDPWatts)
 	mon.Start(ctx)
 
 	runner := harness.NewRunner(nvccPath, config.ResolveSanitizerPath(), hw.ArchFlag, 3, 25*time.Second, mon)

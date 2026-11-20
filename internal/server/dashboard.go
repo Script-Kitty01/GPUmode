@@ -363,46 +363,6 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
 </section>
 
-<!-- Digital Twin SKU Right-Sizing & DVFS Power-Clock Policies -->
-<section class="two-col">
-  <div class="card">
-    <h2>GPU Digital Twin &amp; Fleet Right-Sizing Simulator <span class="badge badge-amber" id="twinProvBadge">LOCAL MEASURED / CROSS-SKU SIMULATED</span></h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Scenario</th>
-          <th>Source</th>
-          <th>Latency</th>
-          <th>Fleet Cap (RPS)</th>
-          <th>VRAM Fit</th>
-          <th>Calibration Basis</th>
-          <th>Decision</th>
-        </tr>
-      </thead>
-      <tbody id="twinBody"></tbody>
-    </table>
-  </div>
-
-  <div class="card">
-    <h2>Power-Aware DVFS Execution &amp; Workload Bin-Packing Scheduler</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>DVFS Clock Policy</th>
-          <th>Source</th>
-          <th>Target Clock</th>
-          <th>Est. Power</th>
-          <th>Throughput</th>
-          <th>Joules / 1K</th>
-          <th>SLA</th>
-        </tr>
-      </thead>
-      <tbody id="dvfsBody"></tbody>
-    </table>
-    <div id="scheduleBox" style="margin-top:12px;padding:10px;background:var(--panel-alt);border-radius:6px;font-size:0.8rem;"></div>
-  </div>
-</section>
-
 <!-- Real Local OpenAI-Compatible / Ollama Inference Workload Adapter -->
 <section class="card" style="margin-bottom:18px;">
   <h2>2. Production LLM Workload Adapter (Local llama-server / Ollama Streaming Benchmark) <span class="badge badge-blue" id="workloadProvBadge">MEASURED END-TO-END</span></h2>
@@ -491,7 +451,10 @@ function renderEBPFTrace(trace, fallbackStatus) {
   const metrics = document.getElementById("ebpfMetrics");
   if (!badge || !hint || !metrics) return;
 
-  const t = (trace && trace.provenance) ? trace : fallbackStatus;
+  let t = (trace && trace.provenance) ? trace : fallbackStatus;
+  if (fallbackStatus && fallbackStatus.active && (!trace || !trace.active)) {
+    t = fallbackStatus;
+  }
   if (!t) return;
 
   const prov = t.provenance || "DISABLED";
@@ -630,52 +593,6 @@ function renderReport(rep) {
     updateTelemetryBadge(rep.telemetryBackend);
   }
   renderEBPFTrace(rep.hostCudaTrace, currentState && currentState.ebpfStatus);
-
-  // Digital Twin Table
-  const twinBody = document.getElementById("twinBody");
-  twinBody.innerHTML = (rep.digitalTwinScenarios || []).map(sc => {
-    let bcls = "badge-blue";
-    if (sc.decision === "RECOMMENDED") bcls = "badge-green";
-    else if (sc.decision === "BASELINE") bcls = "badge-amber";
-    else if (sc.decision.includes("EXCEEDED") || sc.decision.includes("INSUFFICIENT")) bcls = "badge-red";
-    const provCls = sc.provenance === "MEASURED" ? "badge-green" : "badge-amber";
-    return "<tr>" +
-      "<td><strong>" + sc.scenarioName + "</strong></td>" +
-      "<td><span class='badge " + provCls + "'>" + (sc.provenance || "SIMULATED") + " (" + fmtNum(sc.confidenceScorePct, 0) + "%)</span></td>" +
-      "<td>" + fmtNum(sc.estimatedLatencyMs, 2) + " ms</td>" +
-      "<td>" + fmtNum(sc.estimatedThroughputRps, 0) + " req/s</td>" +
-      "<td>" + fmtNum(sc.requiredVramMib, 0) + " / " + fmtNum(sc.availableVramMib, 0) + " MiB</td>" +
-      "<td style='font-size:0.74rem;color:var(--muted);'>" + (sc.calibrationBasis || sc.unlockedByOptimization) + "</td>" +
-      "<td><span class='badge " + bcls + "'>" + sc.decision + "</span></td>" +
-      "</tr>";
-  }).join("");
-
-  // DVFS Table
-  const dvfsBody = document.getElementById("dvfsBody");
-  dvfsBody.innerHTML = (rep.dvfsPolicies || []).map(p => {
-    const pCls = p.provenance === "MEASURED" ? "badge-green" : "badge-amber";
-    return "<tr>" +
-      "<td>" + p.policyName + "</td>" +
-      "<td><span class='badge " + pCls + "'>" + (p.provenance || "SIMULATED") + "</span></td>" +
-      "<td>" + fmtNum(p.targetSmClockMhz, 0) + " MHz</td>" +
-      "<td>" + fmtNum(p.estimatedPowerWatts, 1) + " W (" + fmtNum(p.powerChangePct, 1) + "%)</td>" +
-      "<td>" + fmtNum(p.estimatedThroughputRps, 0) + " req/s</td>" +
-      "<td>" + fmtNum(p.joulesPer1kRequests, 1) + " J</td>" +
-      "<td><span class='badge " + (p.meetsLatencySla ? "badge-green" : "badge-red") + "'>" +
-      (p.meetsLatencySla ? "SLA OK" : "SLA VIOLATION") + "</span></td>" +
-      "</tr>";
-  }).join("");
-
-  // Workload Bin-Packing & Predictive Autoscaler summary
-  const sp = rep.workloadSchedule;
-  const af = rep.autoscaleForecast;
-  if (sp && af) {
-    document.getElementById("scheduleBox").innerHTML =
-      "<strong>Multi-Workload Bin-Packing Scheduler (J = &alpha;C + &beta;E + &gamma;L = " + fmtNum(sp.objectiveScoreJ, 2) + "):</strong> " +
-      "Consolidates " + sp.separateGpusBefore + " separate inference workloads onto <strong>" + sp.consolidatedGpus + " GPU(s)</strong>.<br>" +
-      "<strong>Predictive Autoscaler (15-min Holt Forecast):</strong> Current " + fmtNum(af.currentTrafficRps, 0) +
-      " req/s &rarr; Predicted " + fmtNum(af.predictedTraffic15Min, 0) + " req/s &bull; <em>" + af.action + "</em>";
-  }
 
   // Code boxes
   if (rep.autotune && rep.autotune.bestResult && rep.autotune.bestResult.spec) {

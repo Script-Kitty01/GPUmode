@@ -37,37 +37,69 @@ else
 fi
 
 if (( needs_build )); then
-  had_caps=0
-  if command -v getcap >/dev/null 2>&1 && getcap ./gpumode 2>/dev/null | grep -q "cap_bpf"; then
-    had_caps=1
-  fi
   go build -o ./gpumode ./cmd/gpumode
-  if (( had_caps )) && [[ "$MODE" != "setcap" ]]; then
-    echo "[gpuMode] Note: rebuilt ./gpumode from updated sources; re-run './run.sh setcap' if you want rootless eBPF."
-  fi
 fi
+
+ensure_ebpf_caps() {
+  local required="${1:-0}"
+  if [[ "${GPUMODE_EBPF:l}" == "off" ]]; then
+    return 0
+  fi
+  if (( EUID == 0 )); then
+    export GPUMODE_EBPF="${GPUMODE_EBPF:-on}"
+    return 0
+  fi
+  if ! command -v setcap >/dev/null 2>&1 || ! command -v getcap >/dev/null 2>&1; then
+    return 0
+  fi
+  local cur_caps
+  cur_caps="$(getcap ./gpumode 2>/dev/null || true)"
+  if [[ "$cur_caps" == *"cap_bpf"* && "$cur_caps" == *"cap_perfmon"* && "$cur_caps" == *"cap_sys_admin"* ]]; then
+    export GPUMODE_EBPF="${GPUMODE_EBPF:-on}"
+    return 0
+  fi
+  echo "[gpuMode] Granting rootless eBPF capabilities (cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep) to ./gpumode..."
+  local rc=0
+  if [[ -n "${SUDO_ASKPASS:-}" ]]; then
+    sudo -A setcap cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep ./gpumode || rc=$?
+  else
+    sudo setcap cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep ./gpumode || rc=$?
+  fi
+  if (( rc != 0 )); then
+    if (( required )); then
+      return $rc
+    fi
+    echo "[gpuMode] Warning: could not grant eBPF capabilities; continuing with -ebpf=auto fallback."
+    return 0
+  fi
+  export GPUMODE_EBPF="${GPUMODE_EBPF:-on}"
+  return 0
+}
 
 case "$MODE" in
   setcap)
-    echo "[gpuMode] Granting rootless eBPF & perf capabilities (cap_bpf,cap_perfmon,cap_sys_resource+ep) to ./gpumode..."
-    sudo setcap cap_bpf,cap_perfmon,cap_sys_resource+ep ./gpumode
+    ensure_ebpf_caps 1
     echo "[gpuMode] Verifying rootless NVML + eBPF CUDA attachment..."
     ./gpumode ebpf
     ;;
   ebpf|probe)
+    ensure_ebpf_caps
     shift || true
     ./gpumode ebpf "$@"
     ;;
   optimize|analyze)
+    ensure_ebpf_caps
     shift || true
     ./gpumode optimize "$@"
     ;;
   deepseek)
+    ensure_ebpf_caps
     shift || true
     echo "[gpuMode] Querying local DeepSeek-V4-9B GGUF model & running live GPU verification..."
     ./gpumode deepseek -proposer deepseek "$@"
     ;;
   workload)
+    ensure_ebpf_caps
     shift || true
     echo "[gpuMode] Running real streaming inference workload benchmark against local DeepSeek/Ollama server..."
     ./gpumode workload "$@"
@@ -80,6 +112,7 @@ case "$MODE" in
     go test -v ./...
     ;;
   dashboard|serve|*)
+    ensure_ebpf_caps
     echo "[gpuMode] Running initial PyTorch/CUDA trace & starting Web Dashboard at http://${ADDR} ..."
     python3 ./scripts/profile_pytorch.py
     echo ""

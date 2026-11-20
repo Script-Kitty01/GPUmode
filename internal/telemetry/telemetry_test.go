@@ -214,58 +214,6 @@ func TestRingBufferConcurrencyAndPubSub(t *testing.T) {
 	}
 }
 
-func TestSimulateDVFSPolicies(t *testing.T) {
-	m := NewMonitor("nvidia-smi", 150*time.Millisecond, 30)
-	base := EnergyMeasurement{
-		DurationSec:         1.0,
-		TotalEnergyJoules:   50.0,
-		AvgPowerWatts:       50.0,
-		AvgSMClockMHz:       2400.0,
-		JoulesPerRequest:    0.5,
-		JoulesPer1KRequests: 500.0,
-	}
-
-	// Memory-bound workload (e.g. RMSNorm / Softmax with 0.85 memory-bound fraction)
-	policies := m.SimulateDVFSPolicies(base, 10.0, 12.0, 0.85)
-	if len(policies) < 3 {
-		t.Fatalf("expected at least 3 DVFS candidate policies, got %d", len(policies))
-	}
-
-	baseline := policies[0]
-	sweetSpot := policies[1] // -15% SM Clock
-	eco := policies[2]       // -25% SM Clock
-
-	if baseline.TargetSMClockMHz != 2400 {
-		t.Errorf("baseline clock = %v, want 2400", baseline.TargetSMClockMHz)
-	}
-	if sweetSpot.TargetSMClockMHz != 2040 {
-		t.Errorf("sweetSpot (-15%%) clock = %v, want 2040", sweetSpot.TargetSMClockMHz)
-	}
-
-	// Sweet spot (-15% clock) should save >20% power while losing <6% throughput on memory-bound workload
-	if sweetSpot.PowerChangePct > -20.0 {
-		t.Errorf("expected sweetSpot power reduction > 20%%, got %.2f%%", sweetSpot.PowerChangePct)
-	}
-	if sweetSpot.ThroughputChangePct < -6.5 {
-		t.Errorf("expected memory-bound sweetSpot throughput change better than -6.5%%, got %.2f%%", sweetSpot.ThroughputChangePct)
-	}
-	if sweetSpot.JoulesPer1KRequests >= baseline.JoulesPer1KRequests {
-		t.Errorf("expected sweetSpot Joules/1K (%v) < baseline (%v)", sweetSpot.JoulesPer1KRequests, baseline.JoulesPer1KRequests)
-	}
-	if !sweetSpot.MeetsLatencySLA {
-		t.Errorf("expected sweetSpot to meet 12ms SLA, estimated latency = %.2fms", sweetSpot.EstimatedLatencyMS)
-	}
-	if !strings.Contains(sweetSpot.Note, "power.limit") {
-		t.Errorf("expected DVFS note to explain mobile GPU power.limit / simulation, got %q", sweetSpot.Note)
-	}
-	if eco.EstimatedPowerWatts >= sweetSpot.EstimatedPowerWatts {
-		t.Errorf("expected eco power (%v) < sweetSpot power (%v)", eco.EstimatedPowerWatts, sweetSpot.EstimatedPowerWatts)
-	}
-	if baseline.Provenance != "MEASURED" || sweetSpot.Provenance != "SIMULATED" {
-		t.Errorf("expected baseline=MEASURED and sweetSpot=SIMULATED provenance, got %q and %q", baseline.Provenance, sweetSpot.Provenance)
-	}
-}
-
 func TestAggregateWindowMeasurementsIdleSubtractionAndUncertainty(t *testing.T) {
 	w1 := EnergyMeasurement{
 		DurationSec:         1.0,

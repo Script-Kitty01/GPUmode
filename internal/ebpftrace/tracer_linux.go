@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -103,9 +104,16 @@ func startSessionInternal(mode Mode, targetPIDs []int, failHard bool) (*Session,
 	// Best-effort memlock removal for kernels < 5.11; ignore errors when unprivileged.
 	_ = rlimit.RemoveMemlock()
 
+	// Capability-elevated binaries (setcap) start with PR_SET_DUMPABLE=0, which blocks
+	// cilium/ebpf's vDSO /proc/self/mem kernel-version probe with EACCES.
+	// Temporarily enable dumpable across object load (and populate KernelVersion from uname
+	// as a fallback) so rootless setcap execution attaches without CAP_SYS_PTRACE.
+	restoreDumpable := enableTempDumpable()
 	var objs cudaTraceObjects
-	if err := loadCudaTraceObjects(&objs, nil); err != nil {
-		return handleSessionStartFailure(mode, failHard, err, libCudaPath, libCudartPath, targetSet, now)
+	loadErr := loadCudaTraceObjectsWithFallback(&objs)
+	restoreDumpable()
+	if loadErr != nil {
+		return handleSessionStartFailure(mode, failHard, loadErr, libCudaPath, libCudartPath, targetSet, now)
 	}
 
 	// Pre-seed target TGIDs so sched_switch tracks target processes even before first CUDA call.
@@ -483,4 +491,60 @@ func isPermissionError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "operation not permitted") ||
 		strings.Contains(msg, "permission denied")
+}
+
+func enableTempDumpable() func() {
+	dumpable, err := unix.PrctlRetInt(unix.PR_GET_DUMPABLE, 0, 0, 0, 0)
+	if err != nil || dumpable != 0 {
+		return func() {}
+	}
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 1, 0, 0, 0); err != nil {
+		return func() {}
+	}
+	return func() {
+		_ = unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
+	}
+}
+
+func loadCudaTraceObjectsWithFallback(objs *cudaTraceObjects) error {
+	spec, err := loadCudaTrace()
+	if err != nil {
+		return err
+	}
+	if kv := unameKernelVersionCode(); kv != 0 {
+		for _, prog := range spec.Programs {
+			if prog.KernelVersion == 0 {
+				prog.KernelVersion = kv
+			}
+		}
+	}
+	return spec.LoadAndAssign(objs, nil)
+}
+
+func unameKernelVersionCode() uint32 {
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err != nil {
+		return 0
+	}
+	rel := unix.ByteSliceToString(uts.Release[:])
+	parts := strings.SplitN(rel, "-", 2)[0]
+	nums := strings.Split(parts, ".")
+	if len(nums) < 2 {
+		return 0
+	}
+	major, err1 := strconv.Atoi(nums[0])
+	minor, err2 := strconv.Atoi(nums[1])
+	if err1 != nil || err2 != nil {
+		return 0
+	}
+	patch := 0
+	if len(nums) >= 3 {
+		if p, err := strconv.Atoi(nums[2]); err == nil {
+			if p > 255 {
+				p = 255
+			}
+			patch = p
+		}
+	}
+	return uint32((major << 16) + (minor << 8) + patch)
 }

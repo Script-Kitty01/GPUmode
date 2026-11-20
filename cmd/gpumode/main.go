@@ -43,7 +43,6 @@ func main() {
 	telemetryBackend := fs.String("telemetry", cfg.TelemetryBackend, "Telemetry backend (auto, nvml, or smi)")
 	ebpfModeFlag := fs.String("ebpf", cfg.EBPFMode, "eBPF host-to-CUDA tracer mode (auto, on, or off)")
 	tracePIDFlag := fs.Int("trace-pid", cfg.TracePID, "Optional target PID for eBPF CUDA/scheduler tracing (0 = auto-discover)")
-	presetsPath := fs.String("presets", cfg.PresetsPath, "Path to JSON file of Digital Twin reference GPU presets")
 	op := fs.String("op", "rmsnorm_residual", "Target operation (rmsnorm_residual, rmsnorm, layernorm, softmax, swiglu)")
 	strategy := fs.String("strategy", string(optimizer.StrategyBayesian), "Autotuning strategy (BAYESIAN_UCB or GRID_SEARCH)")
 	batch := fs.Int("batch", 256, "Batch x sequence token count")
@@ -74,7 +73,6 @@ func main() {
 	} else {
 		cfg.TracePID = 0
 	}
-	cfg.PresetsPath = *presetsPath
 	cfg.DeepSeekModelPath = *deepseekModel
 	cfg.PythonPath = *pythonPath
 	cfg.Economics.TargetQPS = *qps
@@ -123,13 +121,11 @@ func main() {
 		telemetry.ParseBackendMode(cfg.TelemetryBackend),
 	)
 	defer mon.Close()
-	mon.SetHardwareDefaults(hw.MaxSMClockMHz, hw.TDPWatts)
 	mon.Start(ctx)
 
 	runner := harness.NewRunner(cfg.NVCCPath, cfg.SanitizerPath, hw.ArchFlag, cfg.CompileWorkers, cfg.KernelTimeout, mon)
 	runner.GPUIndex = cfg.GPUIndex
 	pipe := profiler.NewPipeline(hw, mon, runner, cfg.PythonPath, "scripts/profile_pytorch.py")
-	pipe.PresetsPath = cfg.PresetsPath
 	pipe.EBPFMode = ebpfMode
 	if len(targetPIDs) > 0 {
 		pipe.TracePIDs = targetPIDs
@@ -226,8 +222,11 @@ func main() {
 		printWorkloadReportCLI(wRep)
 
 	case "dashboard", "serve":
-		// Pre-warm an initial verified causal report if the store has none yet
-		if _, ok := st.Latest(); !ok {
+		// Pre-warm an initial verified causal report if none exists yet, or if eBPF is now
+		// active while the latest cached report predates eBPF capability attachment.
+		latest, hasLatest := st.Latest()
+		ebpfReady := ebpfMode != ebpftrace.ModeOff && ebpftrace.ProbeAvailability(ebpfMode).Active
+		if !hasLatest || (ebpfReady && !latest.HostCUDATrace.Active) {
 			fmt.Printf("[gpumode] Running initial CUDA-to-Economics verification on %s (%s)...\n", hw.Name, hw.ArchFlag)
 			rep := pipe.Execute(ctx, *op, *batch, *hidden, *iters, optimizer.StrategyBayesian, cfg.Economics)
 			_ = st.Save(rep)
@@ -289,7 +288,7 @@ func printEBPFDiagnosticCLI(
 		fmt.Printf("  • Hooked Symbols      : none (probes not attached)\n")
 	}
 	if sum.Provenance == ebpftrace.ProvenanceUnavailableUnprivileged {
-		fmt.Printf("  • Rootless Setup Hint : run './run.sh setcap' to grant cap_bpf,cap_perfmon,cap_sys_resource+ep\n")
+		fmt.Printf("  • Rootless Setup Hint : run './run.sh setcap' to grant cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep\n")
 	}
 	fmt.Printf("================================================================================\n")
 }

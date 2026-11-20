@@ -17,7 +17,6 @@ gpuMode is NVIDIA-CUDA dynamic:
 - It does not use a fabricated RTX 4050, `sm_89`, VRAM, power, or clock fallback.
 - The target GPU architecture is passed to `nvcc`; use `-gpu <index>` to select another NVIDIA GPU in a multi-GPU system.
 - CUDA binaries are resolved through CLI flags, `GPUMODE_*` environment variables, `PATH`, `CUDA_HOME`/`CUDA_PATH`, and standard install paths.
-- Reference GPU SKUs used in the Digital Twin remain clearly labeled as **SIMULATED** and can be overridden with `-presets <path>`.
 
 ---
 
@@ -53,8 +52,8 @@ For every workload, **gpuMode** traces the full causal chain from low-level CUDA
    - **Live Power Integration:** Integrates live GPU power sensors ($E = \int_{t_0}^{t_1} P(t)\,dt$) during execution to report board `Joules / 1K inferences`, PUE-adjusted server `kWh/month` saved, Energy-Delay Product ($\text{EDP}$) improvement, and grid carbon reduction ($\text{kg CO}_2\text{e/month}$).
    - *Verified `sm_89` Example:* `Reduces GPU board energy by 69.7% (42.68 J → 12.95 J per 1K inferences at 6.0 W average board power), improves Energy-Delay Product (EDP) by 7.42×, and saves kWh/month (including PUE).`
 6. **Can fewer or cheaper GPUs now serve the workload?**
-   - **Pareto & Digital Twin Right-Sizing:** Combines **Multi-Objective Pareto Optimization**, **Digital Twin SKU Simulation**, and **Multi-Workload Bin-Packing** to determine whether throughput gains or VRAM activation savings unlock fewer instances or a cheaper hardware tier.
-   - *Verified `sm_89` Example:* `YES: Peak activation VRAM drops by 8 MiB (532 → 524 MiB) and single-GPU capacity rises from 205 to 461 req/s (737,644 → 1,660,670 Requests/GPU-hr). Recommended Digital Twin target: Optimized on 1× NVIDIA L4 24GB (CUDA Kernel Speedup (Fusion + float4)); Pareto Balanced winner: Online Softmax — Fused Scalar + Warp Shuffle (Block 128).`
+   - **Pareto Right-Sizing:** Uses **Multi-Objective Pareto Optimization** and measured throughput/VRAM gains to determine whether fewer GPU instances can serve the target QPS within SLA.
+   - *Verified `sm_89` Example:* `Peak activation VRAM drops by 8 MiB (532 → 524 MiB) and single-GPU capacity rises from 205 to 461 req/s (737,644 → 1,660,670 Requests/GPU-hr). Pareto Balanced winner: Online Softmax — Fused Scalar + Warp Shuffle (Block 128).`
 7. **How much money does the business save monthly?**
    - **Unit & Fleet Economics:** Quantifies unit cost reduction (`$/1M inferences`) and monthly/annual savings (`$/month`, `$/year`) across GPU infrastructure and datacenter electricity under user-configurable tariffs and SLAs.
    - *Verified `sm_89` Example:* `Cuts unit cost by 55.6% ($2.0443 → $0.9077 per 1M inferences) in combined GPU infrastructure and PUE-adjusted electricity costs.`
@@ -90,12 +89,9 @@ For every workload, **gpuMode** traces the full causal chain from low-level CUDA
                            - Interleaved CUDA Events + Dynamic 2x L2-Cache Flush + Power Sync
                                           │
                                           ▼
-                        6. MULTI-OBJECTIVE & DIGITAL TWIN ENGINE
+                        6. MULTI-OBJECTIVE PARETO ENGINE
                            - Pareto Frontier (Latency, Energy, Cost, VRAM)
                            - Modes: Performance | Energy-Saving | Cost-Saving | Balanced
-                           - Digital Twin Hardware Capacity & Fleet Right-Sizing
-                           - Multi-Workload Bin-Packing Scheduler (J = αC + βE + γL)
-                           - Holt Double-Exponential Predictive Autoscaler
                                           │
                                           ▼
                         7. LOCAL WEB DASHBOARD (Live SSE + Interactive UI)
@@ -134,7 +130,6 @@ gpuMode/
 │   ├── physics/
 │   │   ├── physics.go                 # Live CUDA cudaGetDeviceProperties + nvidia-smi hardware probe
 │   │   ├── economics.go               # $/1M inferences, Joules/1K, Requests/GPU-hr, and monthly ROI
-│   │   ├── presets.json               # Reference NVIDIA SKU presets for the Digital Twin
 │   │   └── physics_test.go
 │   ├── telemetry/
 │   │   ├── telemetry.go               # Direct NVML (10ms burst) + nvidia-smi fallback, SSE, & E = ∫P(t)dt
@@ -154,9 +149,6 @@ gpuMode/
 │   ├── pareto/
 │   │   ├── pareto.go                  # Multi-objective non-dominated Pareto solver (4 business modes)
 │   │   └── pareto_test.go
-│   ├── twin/
-│   │   ├── twin.go                    # Digital Twin hardware simulator, bin-packer, & predictive autoscaler
-│   │   └── twin_test.go
 │   ├── profiler/
 │   │   ├── causal.go                  # 7-Step CausalChainReport pipeline & PyTorch C++ extension generator
 │   │   └── causal_test.go
@@ -214,7 +206,7 @@ You can also run specific modes directly via `./run.sh` or `./gpumode`:
 # Inspect NVML telemetry backend, discovered libcuda.so.1/libcudart.so, active GPU PIDs, and eBPF capability status
 ./run.sh ebpf
 
-# Grant rootless eBPF capabilities (cap_bpf,cap_perfmon,cap_sys_resource+ep) to ./gpumode without running the daemon as root
+# Grant rootless eBPF capabilities (cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep) to ./gpumode without running the daemon as root
 ./run.sh setcap
 
 # Run the complete unit & live GPU hardware verification test suite
@@ -236,9 +228,9 @@ gpuMode includes two kernel/driver-level observability subsystems that eliminate
      - `auto` *(default)*: attaches automatically when capabilities are present, or degrades gracefully to `UNAVAILABLE_UNPRIVILEGED` without failing benchmarks.
      - `on`: enforces live eBPF attachment and exits upfront with an actionable error if probes cannot attach.
      - `off`: disables eBPF tracing (`DISABLED`).
-   - **Rootless Setup (`./run.sh setcap`):** Grant minimal BPF capabilities once to the compiled binary instead of running the whole daemon under `sudo`:
+   - **Rootless Setup (`./run.sh setcap`):** `./run.sh` automatically grants the required Linux capabilities (`cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep`) to `./gpumode` by default when launching, or you can apply and test them explicitly:
      ```bash
-     ./run.sh setcap   # runs sudo setcap cap_bpf,cap_perfmon,cap_sys_resource+ep ./gpumode && ./gpumode ebpf
+     ./run.sh setcap   # runs sudo setcap cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep ./gpumode && ./gpumode ebpf
      ./run.sh ebpf     # inspect NVML + libcuda.so.1 + hooked symbols + active GPU PIDs (pass -json for JSON)
      ./run.sh bpf-gen  # recompile internal/ebpftrace/bpf/cuda_trace.bpf.c via bpf2go when modifying BPF C code
      ```
@@ -280,7 +272,6 @@ The following environment variables are supported:
 | `GPUMODE_SANITIZER` | `compute-sanitizer` executable override |
 | `GPUMODE_NVIDIA_SMI` | `nvidia-smi` executable override |
 | `GPUMODE_PYTHON` | Python interpreter for PyTorch profiling |
-| `GPUMODE_PRESETS_PATH` | External Digital Twin GPU preset JSON |
 | `GPUMODE_MODEL_PATH` | GGUF model file override |
 | `GPUMODE_MODEL_DIR` | Directory containing a discoverable GGUF model |
 | `GPUMODE_NGL` | GPU layers passed to `llama-server`/`llama-cli` |

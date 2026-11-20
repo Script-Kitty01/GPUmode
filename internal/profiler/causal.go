@@ -18,7 +18,6 @@ import (
 	"gpumode/internal/physics"
 	"gpumode/internal/roofline"
 	"gpumode/internal/telemetry"
-	"gpumode/internal/twin"
 )
 
 // HotspotOp represents an operation identified in a PyTorch/LLM inference profile.
@@ -73,26 +72,21 @@ type CausalChainReport struct {
 	OptimizedRoofline     roofline.Diagnosis           `json:"optimizedRoofline"`
 	RooflinePoints        []roofline.RooflinePoint     `json:"rooflinePoints"`
 	Autotune              optimizer.AutotuneSummary    `json:"autotune"`
-	DVFSPolicies          []telemetry.DVFSCandidatePolicy `json:"dvfsPolicies"`
 	EconomicsComparison   physics.SavingsComparison    `json:"economicsComparison"`
-	DigitalTwinScenarios  []twin.DigitalTwinScenario   `json:"digitalTwinScenarios"`
-	WorkloadSchedule      twin.SchedulePlan            `json:"workloadSchedule"`
-	AutoscaleForecast     twin.AutoscaleForecast       `json:"autoscaleForecast"`
 	SevenAnswers          SevenQuestionAnswers         `json:"sevenAnswers"`
 	PyTorchExtensionCode  string                       `json:"pytorchExtensionCode"`
 }
 
-// Pipeline coordinates all 7 engines to produce a hardware-verified CausalChainReport.
+// Pipeline coordinates the engines to produce a hardware-verified CausalChainReport.
 type Pipeline struct {
-	Hardware    physics.GPUHardwareSpec
-	Monitor     *telemetry.Monitor
-	Runner      *harness.Runner
-	Autotuner   *optimizer.Autotuner
-	PythonPath  string
-	ScriptPath  string
-	PresetsPath string
-	EBPFMode    ebpftrace.Mode
-	TracePIDs   []int
+	Hardware   physics.GPUHardwareSpec
+	Monitor    *telemetry.Monitor
+	Runner     *harness.Runner
+	Autotuner  *optimizer.Autotuner
+	PythonPath string
+	ScriptPath string
+	EBPFMode   ebpftrace.Mode
+	TracePIDs  []int
 }
 
 func NewPipeline(
@@ -235,26 +229,7 @@ func (p *Pipeline) Execute(
 	}
 	econComp := physics.CompareWorkloadEconomics(baseMetrics, optMetrics, econ)
 
-	memBoundFrac := 0.85
-	if baseDiag.Classification == roofline.BottleneckComputeBound {
-		memBoundFrac = 0.25
-	}
-
-	var dvfsPolicies []telemetry.DVFSCandidatePolicy
-	if p.Monitor != nil {
-		dvfsPolicies = p.Monitor.SimulateDVFSPolicies(bestRes.Energy, bestRes.MedianLatencyMS, econ.LatencySLAMS, memBoundFrac)
-	} else {
-		tmpMon := telemetry.NewMonitorForGPU(config.ResolveNvidiaSMIPath(), p.Hardware.GPUIndex, 200*time.Millisecond, 30)
-		tmpMon.SetHardwareDefaults(p.Hardware.MaxSMClockMHz, p.Hardware.TDPWatts)
-		dvfsPolicies = tmpMon.SimulateDVFSPolicies(bestRes.Energy, bestRes.MedianLatencyMS, econ.LatencySLAMS, memBoundFrac)
-	}
-
-	presets := physics.LoadReferenceHardwarePresets(p.PresetsPath, p.Hardware)
-	twinScenarios := twin.SimulateDigitalTwinWithPresets(p.Hardware, presets, baseMetrics, optMetrics, memBoundFrac, econ)
-	schedPlan := twin.ScheduleWorkloads(nil, p.Hardware.TotalVRAMMiB, econ)
-	autoscale := twin.ForecastAutoscaling(nil, optMetrics.ThroughputRPS, econ)
-
-	answers := buildSevenAnswers(p.Hardware, trace, baseDiag, optDiag, baseRes, bestRes, autoSummary.ParetoRecommendations, econComp, twinScenarios, ebpfSum)
+	answers := buildSevenAnswers(p.Hardware, trace, baseDiag, optDiag, baseRes, bestRes, autoSummary.ParetoRecommendations, econComp, ebpfSum)
 	extCode := GeneratePyTorchExtension(bestRes.Spec)
 
 	return CausalChainReport{
@@ -273,18 +248,14 @@ func (p *Pipeline) Execute(
 		OptimizedRoofline:    optDiag,
 		RooflinePoints:       rooflinePts,
 		Autotune:             autoSummary,
-		DVFSPolicies:         dvfsPolicies,
 		EconomicsComparison:  econComp,
-		DigitalTwinScenarios: twinScenarios,
-		WorkloadSchedule:     schedPlan,
-		AutoscaleForecast:    autoscale,
 		SevenAnswers:         answers,
 		PyTorchExtensionCode: extCode,
 	}
 }
 
-// RecomputeEconomics re-evaluates the financial, Pareto, Digital Twin, and 7-question narrative
-// dynamically when the user adjusts $/GPU-hr, $/kWh, PUE, carbon intensity, Target QPS, or SLA in the Web UI.
+// RecomputeEconomics re-evaluates the financial, Pareto, and narrative metrics
+// dynamically when the user adjusts Target QPS, SLA, or multi-objective weights in the Web UI.
 func RecomputeEconomics(rep CausalChainReport, econ config.EconomicsConfig) CausalChainReport {
 	rep.EconomicsConfig = econ
 	baseRes := rep.Autotune.BaselineResult
@@ -325,16 +296,9 @@ func RecomputeEconomics(rep CausalChainReport, econ config.EconomicsConfig) Caus
 	}
 	rep.Autotune.ParetoRecommendations = pareto.Solve(rep.Autotune.ParetoCandidates, econ)
 
-	memBoundFrac := 0.85
-	if rep.BaselineRoofline.Classification == roofline.BottleneckComputeBound {
-		memBoundFrac = 0.25
-	}
-	rep.DigitalTwinScenarios = twin.SimulateDigitalTwin(rep.Hardware, baseMetrics, optMetrics, memBoundFrac, econ)
-	rep.WorkloadSchedule = twin.ScheduleWorkloads(nil, rep.Hardware.TotalVRAMMiB, econ)
-	rep.AutoscaleForecast = twin.ForecastAutoscaling(nil, optMetrics.ThroughputRPS, econ)
 	rep.SevenAnswers = buildSevenAnswers(
 		rep.Hardware, rep.Trace, rep.BaselineRoofline, rep.OptimizedRoofline,
-		baseRes, bestRes, rep.Autotune.ParetoRecommendations, rep.EconomicsComparison, rep.DigitalTwinScenarios,
+		baseRes, bestRes, rep.Autotune.ParetoRecommendations, rep.EconomicsComparison,
 		rep.HostCUDATrace,
 	)
 	return rep
@@ -396,7 +360,6 @@ func buildSevenAnswers(
 	baseRes, bestRes harness.BenchmarkResult,
 	paretoRecs pareto.ModeRecommendations,
 	econComp physics.SavingsComparison,
-	twinScenarios []twin.DigitalTwinScenario,
 	ebpfSum ebpftrace.Summary,
 ) SevenQuestionAnswers {
 	q1 := fmt.Sprintf("[%s] %s", baseDiag.Classification, baseDiag.UnderutilizationReason)
@@ -456,20 +419,13 @@ func buildSevenAnswers(
 		edpRatio,
 	)
 
-	recTwin := "current GPU fleet with fewer instances"
-	for _, sc := range twinScenarios {
-		if sc.Decision == "RECOMMENDED" {
-			recTwin = fmt.Sprintf("[%s, %.0f%% conf] %s (%s)", sc.Provenance, sc.ConfidenceScorePct, sc.ScenarioName, sc.UnlockedByOptimization)
-			break
-		}
-	}
 	q6 := fmt.Sprintf(
-		"[MEASURED local / SIMULATED cross-SKU] Peak activation VRAM drops by %.0f MiB (%.0f → %.0f MiB) and single-GPU capacity rises from %.0f to %.0f req/s (%.0f → %.0f Requests/GPU-hr). Fleet requirement drops from %d to %d GPU(s) (Recommended Digital Twin target: %s; Pareto Balanced winner: %s).",
+		"[MEASURED] Peak activation VRAM drops by %.0f MiB (%.0f → %.0f MiB) and single-GPU capacity rises from %.0f to %.0f req/s (%.0f → %.0f Requests/GPU-hr). Fleet requirement drops from %d to %d GPU(s) (Pareto Balanced winner: %s).",
 		econComp.VRAMReductionMiB, baseRes.PeakVRAMMiB, bestRes.PeakVRAMMiB,
 		baseRes.ThroughputRPS, bestRes.ThroughputRPS,
 		econComp.Baseline.RequestsPerGPUHour, econComp.Optimized.RequestsPerGPUHour,
 		econComp.Baseline.GPUsRequiredForTargetQPS, econComp.Optimized.GPUsRequiredForTargetQPS,
-		recTwin, paretoRecs.Balanced.Name,
+		paretoRecs.Balanced.Name,
 	)
 
 	return SevenQuestionAnswers{

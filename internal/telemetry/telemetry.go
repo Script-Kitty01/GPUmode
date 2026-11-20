@@ -89,26 +89,11 @@ type EnergyMeasurement struct {
 	Provenance              string  `json:"provenance"`            // "MEASURED", "INTERPOLATED", "ESTIMATED"
 }
 
-// DVFSCandidatePolicy represents a simulated Dynamic Voltage and Frequency Scaling (DVFS) operating point.
-type DVFSCandidatePolicy struct {
-	PolicyName             string  `json:"policyName"`
-	TargetSMClockMHz       float64 `json:"targetSmClockMhz"`
-	EstimatedPowerWatts    float64 `json:"estimatedPowerWatts"`
-	EstimatedLatencyMS     float64 `json:"estimatedLatencyMs"`
-	EstimatedThroughputRPS float64 `json:"estimatedThroughputRps"`
-	JoulesPer1KRequests    float64 `json:"joulesPer1kRequests"`
-	PowerChangePct         float64 `json:"powerChangePct"`
-	ThroughputChangePct    float64 `json:"throughputChangePct"`
-	MeetsLatencySLA        bool    `json:"meetsLatencySla"`
-	Provenance             string  `json:"provenance"` // "MEASURED" or "SIMULATED"
-	Note                   string  `json:"note"`
-}
-
 // SamplerFunc allows overriding the hardware query in unit tests.
 type SamplerFunc func(ctx context.Context) (Sample, error)
 
 // Monitor manages a thread-safe telemetry ring buffer, live SSE pub/sub channels,
-// trapezoidal energy integration, and DVFS policy simulation.
+// and trapezoidal energy integration.
 type Monitor struct {
 	mu            sync.RWMutex
 	nvidiaSMIPath string
@@ -118,9 +103,6 @@ type Monitor struct {
 	ring          []Sample
 	head          int
 	count         int
-
-	defaultMaxClockMHz float64
-	defaultPowerWatts  float64
 
 	subMu       sync.Mutex
 	nextSubID   int
@@ -191,15 +173,6 @@ func NewMonitorWithBackend(nvidiaSMIPath string, gpuIndex int, interval time.Dur
 
 func isStandardNvidiaSMIPath(raw string) bool {
 	return raw == "" || raw == "nvidia-smi" || strings.HasSuffix(raw, "/nvidia-smi")
-}
-
-// SetHardwareDefaults configures the detected GPU's max SM clock and TDP/idle power
-// so DVFS simulation scales from actual hardware properties rather than fixed defaults.
-func (m *Monitor) SetHardwareDefaults(maxClockMHz, tdpWatts float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.defaultMaxClockMHz = maxClockMHz
-	m.defaultPowerWatts = tdpWatts
 }
 
 // SetSampler overrides the hardware polling function (useful for deterministic testing).
@@ -970,130 +943,4 @@ func finalizeEnergyMeasurement(em EnergyMeasurement, completedRequests int, late
 		}
 	}
 	return em
-}
-
-// SimulateDVFSPolicies models Dynamic Voltage and Frequency Scaling (DVFS) operating points.
-// It uses CMOS dynamic power physics (P = P_static + P_dyn * (f / f_0)^2.2) and memory-bound
-// sensitivity (memory-bound ops depend primarily on HBM/GDDR bandwidth rather than SM clock,
-// losing very little throughput when SM clock drops by 15-20% while saving 22-30% power).
-func (m *Monitor) SimulateDVFSPolicies(base EnergyMeasurement, baseLatencyMS float64, slaMS float64, memoryBoundFraction float64) []DVFSCandidatePolicy {
-	m.mu.RLock()
-	defClock := m.defaultMaxClockMHz
-	defPower := m.defaultPowerWatts
-	m.mu.RUnlock()
-	return ComputeDVFSPoliciesWithDefaults(base, baseLatencyMS, slaMS, memoryBoundFraction, defClock, defPower)
-}
-
-// ComputeDVFSPolicies is a package-level helper for simulating DVFS power/clock policies.
-func ComputeDVFSPolicies(base EnergyMeasurement, baseLatencyMS float64, slaMS float64, memoryBoundFraction float64) []DVFSCandidatePolicy {
-	return ComputeDVFSPoliciesWithDefaults(base, baseLatencyMS, slaMS, memoryBoundFraction, 0, 0)
-}
-
-// ComputeDVFSPoliciesWithDefaults models DVFS operating points using detected GPU clock/power defaults when live averages are absent.
-func ComputeDVFSPoliciesWithDefaults(base EnergyMeasurement, baseLatencyMS float64, slaMS float64, memoryBoundFraction float64, defaultClockMHz, defaultPowerW float64) []DVFSCandidatePolicy {
-	memFrac := math.Max(0.0, math.Min(1.0, memoryBoundFraction))
-	computeFrac := 1.0 - memFrac
-
-	baseClock := base.AvgSMClockMHz
-	if baseClock <= 0 {
-		baseClock = defaultClockMHz
-	}
-	if baseClock <= 0 {
-		return nil
-	}
-	basePower := base.AvgPowerWatts
-	if basePower <= 0 {
-		if defaultPowerW > 0 {
-			basePower = defaultPowerW * 0.65
-		} else {
-			return nil
-		}
-	}
-	if baseLatencyMS <= 0 {
-		baseLatencyMS = 1.0
-	}
-	if slaMS <= 0 {
-		slaMS = baseLatencyMS * 1.25
-	}
-
-	baseRPS := 1000.0 / baseLatencyMS
-	staticPowerFrac := 0.22 // ~22% static/leakage + board VRAM power, 78% dynamic SM core power
-	dynamicPowerFrac := 1.0 - staticPowerFrac
-	dvfsExponent := 2.2 // P_dyn ∝ V^2 * f ≈ f^2.2
-
-	type spec struct {
-		name       string
-		clockScale float64
-		note       string
-	}
-
-	specs := []spec{
-		{
-			name:       "Max Boost (Current)",
-			clockScale: 1.00,
-			note:       "Hardware observation at unlocked boost clock; baseline telemetry measurement.",
-		},
-		{
-			name:       "Balanced Sweet-Spot (-15% Clock)",
-			clockScale: 0.85,
-			note:       "DVFS simulation (nvidia-smi -lgc / power.limit locked on mobile GPUs): -15% SM clock yields ~23-26% power reduction with minimal throughput loss on memory-bound kernels.",
-		},
-		{
-			name:       "Eco SLA-Aware (-25% Clock)",
-			clockScale: 0.75,
-			note:       "DVFS simulation (power.limit locked on mobile GPUs): -25% SM clock maximizes Joules/1K inference savings while checking p95 SLA compliance.",
-		},
-		{
-			name:       "Ultra-Low Power Cap (-35% Clock)",
-			clockScale: 0.65,
-			note:       "DVFS simulation (power.limit locked on mobile GPUs): aggressive underclock for off-peak batch or thermal-throttled envelopes.",
-		},
-	}
-
-	out := make([]DVFSCandidatePolicy, 0, len(specs))
-	for _, sp := range specs {
-		targetClock := math.Round(baseClock * sp.clockScale)
-
-		// Dynamic power scales super-linearly with frequency due to V-f curve: P(f) = P0 * (static + dyn * scale^2.2)
-		powerScale := staticPowerFrac + dynamicPowerFrac*math.Pow(sp.clockScale, dvfsExponent)
-		estPower := basePower * powerScale
-
-		// Latency execution time model:
-		// Compute-bound portion scales inversely with SM frequency (1 / clockScale).
-		// Memory-bound portion is governed by GDDR6 memory clock, with only a small L2/issue sensitivity (0.18) to SM clock.
-		memSlowdown := 1.0 + 0.18*(1.0/sp.clockScale-1.0)
-		computeSlowdown := 1.0 / sp.clockScale
-		latencyScale := memFrac*memSlowdown + computeFrac*computeSlowdown
-		if sp.clockScale == 1.0 {
-			latencyScale = 1.0
-		}
-
-		estLatencyMS := baseLatencyMS * latencyScale
-		estRPS := 1000.0 / estLatencyMS
-		joulesPerReq := estPower * (estLatencyMS / 1000.0)
-		joulesPer1K := joulesPerReq * 1000.0
-
-		powerChangePct := ((estPower - basePower) / basePower) * 100.0
-		throughputChangePct := ((estRPS - baseRPS) / baseRPS) * 100.0
-
-		prov := "SIMULATED"
-		if sp.clockScale == 1.0 {
-			prov = "MEASURED"
-		}
-		out = append(out, DVFSCandidatePolicy{
-			PolicyName:             sp.name,
-			TargetSMClockMHz:       targetClock,
-			EstimatedPowerWatts:    estPower,
-			EstimatedLatencyMS:     estLatencyMS,
-			EstimatedThroughputRPS: estRPS,
-			JoulesPer1KRequests:    joulesPer1K,
-			PowerChangePct:         powerChangePct,
-			ThroughputChangePct:    throughputChangePct,
-			MeetsLatencySLA:        estLatencyMS <= slaMS,
-			Provenance:             prov,
-			Note:                   sp.note,
-		})
-	}
-
-	return out
 }

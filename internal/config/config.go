@@ -39,7 +39,6 @@ type DaemonConfig struct {
 	SanitizerPath     string          `json:"sanitizerPath"`
 	NvidiaSMIPath     string          `json:"nvidiaSmiPath"`
 	PythonPath        string          `json:"pythonPath"`
-	PresetsPath       string          `json:"presetsPath,omitempty"`
 	DeepSeekModelPath string          `json:"deepseekModelPath,omitempty"`
 	TelemetryInterval time.Duration   `json:"telemetryInterval"`
 	TelemetryBackend  string          `json:"telemetryBackend"`
@@ -247,7 +246,6 @@ func DefaultDaemonConfig() DaemonConfig {
 		SanitizerPath:     ResolveSanitizerPath(),
 		NvidiaSMIPath:     ResolveNvidiaSMIPath(),
 		PythonPath:        ResolvePythonPath(),
-		PresetsPath:       strings.TrimSpace(os.Getenv("GPUMODE_PRESETS_PATH")),
 		DeepSeekModelPath: ResolveDeepSeekModelPath(),
 		TelemetryInterval: 200 * time.Millisecond,
 		TelemetryBackend:  ResolveTelemetryBackend(),
