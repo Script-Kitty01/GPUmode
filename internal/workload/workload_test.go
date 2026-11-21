@@ -3,6 +3,7 @@ package workload
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -77,6 +78,8 @@ func TestRunInferenceBenchmarkWithMockStreamingServer(t *testing.T) {
 			Timestamp:   time.Now(),
 			GPUName:     "RTX 4050 Mock",
 			PowerWatts:  42.0,
+			GPUUtilPct:  55.0,
+			MemUtilPct:  35.0,
 			VRAMUsedMiB: 5420.0,
 		}, nil
 	})
@@ -140,6 +143,21 @@ func TestRunInferenceBenchmarkWithMockStreamingServer(t *testing.T) {
 	}
 	if repOff.TelemetryBackend != "CUSTOM" {
 		t.Errorf("expected TelemetryBackend=CUSTOM for ModeOff, got %q", repOff.TelemetryBackend)
+	}
+	if rep.RunMode != "baseline" || math.Abs(rep.AvgGPUUtilPct-55.0) > 1e-6 || math.Abs(rep.PeakGPUUtilPct-55.0) > 1e-6 {
+		t.Errorf("unexpected baseline runMode/GPU util: mode=%q avg=%.6f peak=%.6f", rep.RunMode, rep.AvgGPUUtilPct, rep.PeakGPUUtilPct)
+	}
+
+	// Verify buildLlamaServerArgs distinguishes baseline vs optimized modes.
+	tmpGGUF := filepath.Join(t.TempDir(), "test.gguf")
+	_ = os.WriteFile(tmpGGUF, make([]byte, 1024*1024), 0o600)
+	_, baseFlags, baseProf, baseNGL := buildLlamaServerArgs(BenchmarkConfig{ModelPath: tmpGGUF, CtxSize: 1024}, "baseline", "18081", 6141, 500, 0)
+	_, optFlags, optProf, optNGL := buildLlamaServerArgs(BenchmarkConfig{ModelPath: tmpGGUF, CtxSize: 1024}, "optimized", "18082", 6141, 500, 0)
+	if baseNGL != 24 || optNGL != 99 {
+		t.Errorf("expected baseline ngl=24 and optimized ngl=99 for small GGUF on 6GiB GPU, got %d / %d", baseNGL, optNGL)
+	}
+	if baseProf == optProf || fmt.Sprint(baseFlags) == fmt.Sprint(optFlags) {
+		t.Errorf("expected distinct baseline vs optimized llama-server flags")
 	}
 }
 

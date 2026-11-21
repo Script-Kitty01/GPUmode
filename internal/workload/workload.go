@@ -28,17 +28,21 @@ import (
 
 // BenchmarkConfig configures a real HTTP inference benchmark against a local llama-server or Ollama endpoint.
 type BenchmarkConfig struct {
-	ServerURL   string         `json:"serverUrl"`   // e.g. http://127.0.0.1:8081
-	ModelName   string         `json:"modelName"`   // e.g. deepseek-v4-9b or ollama model tag
-	ModelPath   string         `json:"modelPath"`   // GGUF path when AutoStartServer is true
-	AutoServer  bool           `json:"autoServer"`  // Launch temporary llama-server if none is running
-	GPULayers   int            `json:"gpuLayers"`   // -ngl for llama-server
-	CtxSize     int            `json:"ctxSize"`     // -c for llama-server
-	NumRequests int            `json:"numRequests"` // Number of real streaming inference requests
-	MaxTokens   int            `json:"maxTokens"`   // max_tokens per request
-	Prompts     []string       `json:"prompts,omitempty"`
-	EBPFMode    ebpftrace.Mode `json:"ebpfMode,omitempty"`
-	TracePID    int            `json:"tracePid,omitempty"`
+	ServerURL       string         `json:"serverUrl"`                 // e.g. http://127.0.0.1:8081
+	ModelID         string         `json:"modelId,omitempty"`         // Optional discovered model ID
+	ModelName       string         `json:"modelName"`                 // e.g. deepseek-v4-9b or ollama model tag
+	ModelPath       string         `json:"modelPath"`                 // GGUF path when AutoServer is true
+	ModelSource     string         `json:"modelSource,omitempty"`     // gguf_local, hf_cache, ollama, llama_server
+	Mode            string         `json:"mode,omitempty"`            // "baseline" (without project) or "optimized" (with project)
+	ForceLocalSpawn bool           `json:"forceLocalSpawn,omitempty"` // Launch dedicated llama-server for ModelPath on a free port
+	AutoServer      bool           `json:"autoServer"`                // Launch temporary llama-server if none is running
+	GPULayers       int            `json:"gpuLayers"`                 // -ngl for llama-server
+	CtxSize         int            `json:"ctxSize"`                   // -c for llama-server
+	NumRequests     int            `json:"numRequests"`               // Number of real streaming inference requests
+	MaxTokens       int            `json:"maxTokens"`                 // max_tokens per request
+	Prompts         []string       `json:"prompts,omitempty"`
+	EBPFMode        ebpftrace.Mode `json:"ebpfMode,omitempty"`
+	TracePID        int            `json:"tracePid,omitempty"`
 }
 
 // RequestMeasurement holds real streaming timings for a single LLM inference call.
@@ -56,9 +60,13 @@ type RequestMeasurement struct {
 // WorkloadBenchmarkReport captures end-to-end measured inference, energy, VRAM, and production economics.
 type WorkloadBenchmarkReport struct {
 	Timestamp              time.Time                   `json:"timestamp"`
+	RunMode                string                      `json:"runMode"` // "baseline" or "optimized"
+	RuntimeProfile         string                      `json:"runtimeProfile"`
+	AppliedFlags           []string                    `json:"appliedFlags,omitempty"`
 	Adapter                string                      `json:"adapter"`
 	ServerURL              string                      `json:"serverUrl"`
 	ModelName              string                      `json:"modelName"`
+	ModelSource            string                      `json:"modelSource,omitempty"`
 	Provenance             string                      `json:"provenance"` // "MEASURED"
 	TelemetryBackend       string                      `json:"telemetryBackend,omitempty"`
 	HostCUDATrace          ebpftrace.Summary           `json:"hostCudaTrace"`
@@ -74,6 +82,10 @@ type WorkloadBenchmarkReport struct {
 	ThroughputTokensPerS   float64                     `json:"throughputTokensPerS"`
 	ThroughputRPS          float64                     `json:"throughputRps"`
 	MeasuredPeakVRAMMiB    float64                     `json:"measuredPeakVramMib"`
+	AvgGPUUtilPct          float64                     `json:"avgGpuUtilPct"`
+	PeakGPUUtilPct         float64                     `json:"peakGpuUtilPct"`
+	AvgMemUtilPct          float64                     `json:"avgMemUtilPct"`
+	PeakMemUtilPct         float64                     `json:"peakMemUtilPct"`
 	Energy                 telemetry.EnergyMeasurement `json:"energy"`
 	JoulesPer1KTokens      float64                     `json:"joulesPer1kTokens"`
 	Economics              physics.BusinessKPIs        `json:"economics"`
@@ -81,18 +93,13 @@ type WorkloadBenchmarkReport struct {
 }
 
 func DefaultBenchmarkConfig() BenchmarkConfig {
-	ngl := 24
-	if v := strings.TrimSpace(os.Getenv("GPUMODE_NGL")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			ngl = n
-		}
-	}
 	return BenchmarkConfig{
 		ServerURL:   "http://127.0.0.1:8081",
 		ModelName:   strings.TrimSpace(os.Getenv("GPUMODE_MODEL_NAME")),
 		ModelPath:   optimizer.ResolveDefaultModelPath(),
+		Mode:        "baseline",
 		AutoServer:  true,
-		GPULayers:   ngl,
+		GPULayers:   0,
 		CtxSize:     1024,
 		NumRequests: 4,
 		MaxTokens:   48,
@@ -129,16 +136,25 @@ func RunInferenceBenchmark(
 		cfg.Prompts = DefaultBenchmarkConfig().Prompts
 	}
 
+	runMode := normalizeRunMode(cfg.Mode)
+
 	var idlePowerW float64
 	var vramTotalMiB float64
+	var vramUsedMiB float64
 	if mon != nil {
 		idlePowerW = mon.MeasureIdleBaseline(ctx, 2)
-		vramTotalMiB = mon.Latest().VRAMTotalMiB
+		latest := mon.Latest()
+		vramTotalMiB = latest.VRAMTotalMiB
+		vramUsedMiB = latest.VRAMUsedMiB
 	}
 
-	// Auto-launch llama-server if requested and endpoint is not already reachable
+	// Auto-launch llama-server if requested and either endpoint is not reachable or ForceLocalSpawn is set for a selected GGUF.
 	var serverCmd *exec.Cmd
-	if cfg.AutoServer && !isEndpointHealthy(ctx, cfg.ServerURL) {
+	runtimeProfile := "External Inference Endpoint (" + cfg.ServerURL + ")"
+	var appliedFlags []string
+
+	shouldSpawn := cfg.AutoServer && (cfg.ForceLocalSpawn || !isEndpointHealthy(ctx, cfg.ServerURL))
+	if shouldSpawn {
 		if cfg.ModelPath == "" {
 			cfg.ModelPath = optimizer.ResolveDefaultModelPath()
 		}
@@ -151,47 +167,27 @@ func RunInferenceBenchmark(
 		if _, err := os.Stat(cfg.ModelPath); err != nil {
 			return WorkloadBenchmarkReport{}, fmt.Errorf("auto-server requested but GGUF model not found at %s: %w", cfg.ModelPath, err)
 		}
+
 		port := extractPort(cfg.ServerURL, "8081")
-		ngl := cfg.GPULayers
-		if ngl <= 0 {
-			if vramTotalMiB >= 12000 {
-				ngl = 99
-			} else if vramTotalMiB > 0 {
-				ngl = int(vramTotalMiB / 256.0)
-				if ngl < 8 {
-					ngl = 8
-				}
-			} else {
-				ngl = 24
+		if cfg.ForceLocalSpawn || isEndpointHealthy(ctx, cfg.ServerURL) {
+			if freePort, err := findFreeTCPPort(); err == nil {
+				port = freePort
+				cfg.ServerURL = "http://127.0.0.1:" + port
 			}
 		}
-		ctxSz := cfg.CtxSize
-		if ctxSz <= 0 {
-			ctxSz = 1024
-		}
-		serverCmd = exec.CommandContext(
-			ctx,
-			"llama-server",
-			"-m", cfg.ModelPath,
-			"-ngl", fmt.Sprintf("%d", ngl),
-			"-c", fmt.Sprintf("%d", ctxSz),
-			"--reasoning", "off",
-			"--host", "127.0.0.1",
-			"--port", port,
-		)
-		if err := serverCmd.Start(); err != nil {
-			return WorkloadBenchmarkReport{}, fmt.Errorf("failed to start llama-server: %w", err)
+
+		var launchErr error
+		serverCmd, appliedFlags, runtimeProfile, launchErr = launchLlamaServer(ctx, cfg, runMode, port, vramTotalMiB, vramUsedMiB)
+		if launchErr != nil {
+			return WorkloadBenchmarkReport{}, launchErr
 		}
 		defer func() {
-			if serverCmd.Process != nil {
+			if serverCmd != nil && serverCmd.Process != nil {
 				_ = serverCmd.Process.Kill()
 				_, _ = serverCmd.Process.Wait()
 			}
 		}()
 
-		if err := waitForHealthy(ctx, cfg.ServerURL, 45*time.Second); err != nil {
-			return WorkloadBenchmarkReport{}, fmt.Errorf("llama-server did not become healthy: %w", err)
-		}
 		if cfg.ModelName == "" {
 			cfg.ModelName = strings.TrimSuffix(filepath.Base(cfg.ModelPath), filepath.Ext(cfg.ModelPath))
 		}
@@ -342,9 +338,13 @@ func RunInferenceBenchmark(
 
 	return WorkloadBenchmarkReport{
 		Timestamp:              time.Now(),
+		RunMode:                runMode,
+		RuntimeProfile:         runtimeProfile,
+		AppliedFlags:           appliedFlags,
 		Adapter:                "OpenAI-Compatible Local Inference Adapter (llama-server / Ollama)",
 		ServerURL:              cfg.ServerURL,
 		ModelName:              cfg.ModelName,
+		ModelSource:            cfg.ModelSource,
 		Provenance:             "MEASURED",
 		TelemetryBackend:       telemetryBackend,
 		HostCUDATrace:          ebpfSum,
@@ -360,11 +360,182 @@ func RunInferenceBenchmark(
 		ThroughputTokensPerS:   tokPerSec,
 		ThroughputRPS:          rps,
 		MeasuredPeakVRAMMiB:    em.PeakVRAMMiB,
+		AvgGPUUtilPct:          em.AvgGPUUtilPct,
+		PeakGPUUtilPct:         em.PeakGPUUtilPct,
+		AvgMemUtilPct:          em.AvgMemUtilPct,
+		PeakMemUtilPct:         em.PeakMemUtilPct,
 		Energy:                 em,
 		JoulesPer1KTokens:      joulesPer1KTokens,
 		Economics:              kpi,
 		Requests:               results,
 	}, nil
+}
+
+func normalizeRunMode(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "optimized", "with_project", "gpumode":
+		return "optimized"
+	default:
+		return "baseline"
+	}
+}
+
+func buildLlamaServerArgs(
+	cfg BenchmarkConfig,
+	runMode string,
+	port string,
+	vramTotalMiB, vramUsedMiB float64,
+	nglOverride int,
+) (args []string, flags []string, profile string, ngl int) {
+	ctxSz := cfg.CtxSize
+	if ctxSz <= 0 {
+		ctxSz = 1024
+	}
+
+	ngl = nglOverride
+	if ngl <= 0 && cfg.GPULayers > 0 {
+		ngl = cfg.GPULayers
+	}
+	if ngl <= 0 {
+		if v := strings.TrimSpace(os.Getenv("GPUMODE_NGL")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				ngl = n
+			}
+		}
+	}
+
+	var modelSizeMiB float64
+	if info, err := os.Stat(cfg.ModelPath); err == nil && info.Size() > 0 {
+		modelSizeMiB = float64(info.Size()) / (1024.0 * 1024.0)
+	}
+
+	if runMode == "optimized" {
+		if ngl <= 0 {
+			freeMiB := vramTotalMiB - vramUsedMiB
+			if vramTotalMiB <= 0 {
+				ngl = 28
+			} else if modelSizeMiB > 0 && freeMiB > 0 {
+				if freeMiB >= modelSizeMiB+750 {
+					ngl = 99
+				} else {
+					avail := math.Max(512, freeMiB-650)
+					ratio := avail / modelSizeMiB
+					est := int(math.Round(ratio * 36.0))
+					if est < 12 {
+						est = 12
+					}
+					if est > 36 {
+						est = 36
+					}
+					ngl = est
+				}
+			} else if vramTotalMiB >= 12000 {
+				ngl = 99
+			} else {
+				ngl = 28
+			}
+		}
+
+		flags = []string{
+			"-ngl", fmt.Sprintf("%d", ngl),
+			"-c", fmt.Sprintf("%d", ctxSz),
+			"-fa", "on",
+			"-ctk", "q8_0",
+			"-ctv", "q8_0",
+			"-b", "1024",
+			"-ub", "512",
+		}
+		profile = fmt.Sprintf("gpuMode Tuned (ngl=%d, fa=on, kv=q8_0, b=1024, ub=512)", ngl)
+	} else {
+		if ngl <= 0 {
+			if vramTotalMiB > 0 && vramTotalMiB < 5000 {
+				ngl = 16
+			} else {
+				ngl = 24
+			}
+		}
+		flags = []string{
+			"-ngl", fmt.Sprintf("%d", ngl),
+			"-c", fmt.Sprintf("%d", ctxSz),
+			"-fa", "off",
+			"-ctk", "f16",
+			"-ctv", "f16",
+			"-b", "512",
+			"-ub", "256",
+		}
+		profile = fmt.Sprintf("Baseline Default (ngl=%d, fa=off, kv=f16, b=512, ub=256)", ngl)
+	}
+
+	args = append([]string{"-m", cfg.ModelPath}, flags...)
+	args = append(args, "--reasoning", "off", "--host", "127.0.0.1", "--port", port)
+	return args, flags, profile, ngl
+}
+
+func launchLlamaServer(
+	ctx context.Context,
+	cfg BenchmarkConfig,
+	runMode string,
+	port string,
+	vramTotalMiB, vramUsedMiB float64,
+) (*exec.Cmd, []string, string, error) {
+	args, flags, profile, ngl := buildLlamaServerArgs(cfg, runMode, port, vramTotalMiB, vramUsedMiB, 0)
+	cmd, err := startAndWaitLlamaServer(ctx, cfg.ServerURL, args)
+	if err == nil {
+		return cmd, flags, profile, nil
+	}
+
+	// If optimized mode overshot tight VRAM, step down -ngl once and retry cleanly.
+	if runMode == "optimized" && ngl > 16 && ctx.Err() == nil {
+		fallbackNGL := ngl - 6
+		if fallbackNGL < 12 {
+			fallbackNGL = 12
+		}
+		if ngl == 99 {
+			fallbackNGL = 28
+		}
+		args2, flags2, profile2, _ := buildLlamaServerArgs(cfg, runMode, port, vramTotalMiB, vramUsedMiB, fallbackNGL)
+		if cmd2, err2 := startAndWaitLlamaServer(ctx, cfg.ServerURL, args2); err2 == nil {
+			return cmd2, flags2, profile2, nil
+		}
+	}
+	return nil, flags, profile, err
+}
+
+func startAndWaitLlamaServer(ctx context.Context, serverURL string, args []string) (*exec.Cmd, error) {
+	cmd := exec.CommandContext(ctx, "llama-server", args...)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start llama-server: %w", err)
+	}
+	if err := waitForHealthy(ctx, serverURL, 45*time.Second); err != nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+		errTail := strings.TrimSpace(errBuf.String())
+		if len(errTail) > 240 {
+			errTail = errTail[len(errTail)-240:]
+		}
+		if errTail != "" {
+			return nil, fmt.Errorf("llama-server did not become healthy: %w (%s)", err, errTail)
+		}
+		return nil, fmt.Errorf("llama-server did not become healthy: %w", err)
+	}
+	return cmd, nil
+}
+
+func findFreeTCPPort() (string, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	defer ln.Close()
+	addr, ok := ln.Addr().(*net.TCPAddr)
+	if !ok {
+		return "", fmt.Errorf("unexpected listener address %T", ln.Addr())
+	}
+	return strconv.Itoa(addr.Port), nil
 }
 
 func resolveBenchmarkTargetPIDs(cfg BenchmarkConfig, serverCmd *exec.Cmd, mon *telemetry.Monitor) []int {

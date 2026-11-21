@@ -393,3 +393,31 @@ func TestMonitorNVMLAndFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestIntegrateSamplesWindowGPUUtilStats(t *testing.T) {
+	t0 := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	samples := []Sample{
+		{Timestamp: t0, PowerWatts: 30, GPUUtilPct: 40, MemUtilPct: 20, VRAMUsedMiB: 2000},
+		{Timestamp: t0.Add(1 * time.Second), PowerWatts: 50, GPUUtilPct: 80, MemUtilPct: 60, VRAMUsedMiB: 4500},
+		{Timestamp: t0.Add(2 * time.Second), PowerWatts: 40, GPUUtilPct: 60, MemUtilPct: 40, VRAMUsedMiB: 4200},
+	}
+	em := IntegrateSamplesWindow(samples, t0, t0.Add(2*time.Second), 2, 1000)
+	if math.Abs(em.AvgGPUUtilPct-65.0) > 1e-6 {
+		t.Errorf("AvgGPUUtilPct = %v, want 65.0", em.AvgGPUUtilPct)
+	}
+	if em.PeakGPUUtilPct != 80.0 {
+		t.Errorf("PeakGPUUtilPct = %v, want 80.0", em.PeakGPUUtilPct)
+	}
+	if math.Abs(em.AvgMemUtilPct-45.0) > 1e-6 {
+		t.Errorf("AvgMemUtilPct = %v, want 45.0", em.AvgMemUtilPct)
+	}
+	if em.PeakMemUtilPct != 60.0 {
+		t.Errorf("PeakMemUtilPct = %v, want 60.0", em.PeakMemUtilPct)
+	}
+
+	agg := AggregateWindowMeasurements([]EnergyMeasurement{em}, 5.0, 2000, 100*time.Millisecond)
+	if math.Abs(agg.AvgGPUUtilPct-65.0) > 1e-6 || agg.PeakGPUUtilPct != 80.0 {
+		t.Errorf("AggregateWindowMeasurements GPU util = avg %.1f peak %.1f, want 65.0 / 80.0", agg.AvgGPUUtilPct, agg.PeakGPUUtilPct)
+	}
+}
+

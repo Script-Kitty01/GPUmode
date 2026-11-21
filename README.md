@@ -119,6 +119,9 @@ gpuMode/
 │   │   ├── nvml_linux.go              # Direct libnvidia-ml.so.1 bindings (10ms power/clock/PIDs)
 │   │   ├── nvml_other.go              # Non-Linux graceful fallback stub
 │   │   └── nvml_test.go
+│   ├── models/
+│   │   ├── discover.go                # Multi-source local AI model discovery (GGUF, HF cache, Ollama, llama-server)
+│   │   └── discover_test.go
 │   ├── ebpftrace/
 │   │   ├── bpf/cuda_trace.bpf.c       # Kernel BPF C program (libcuda uprobes + sched_switch)
 │   │   ├── gen.go                     # bpf2go code generation directive
@@ -156,7 +159,7 @@ gpuMode/
 │   │   ├── store.go                   # Thread-safe local JSON persistence for optimization history
 │   │   └── store_test.go
 │   ├── server/
-│   │   ├── server.go                  # REST API (/api/state, /api/optimize, /api/recompute, /api/workload) & SSE
+│   │   ├── server.go                  # REST API (/api/state, /api/models, /api/optimize, /api/recompute, /api/workload) & SSE
 │   │   ├── dashboard.go               # Embedded zero-dependency interactive Web Dashboard
 │   │   └── server_test.go
 │   └── workload/
@@ -277,12 +280,16 @@ The following environment variables are supported:
 | `GPUMODE_NGL` | GPU layers passed to `llama-server`/`llama-cli` |
 | `GPUMODE_PASSES_PER_REQ` | Configurable layer passes used in kernel benchmark harnesses |
 
-### Optional End-to-End LLM Workload Benchmark
+### Optional End-to-End LLM Workload Benchmark & Before/After Dashboard Runner
 
-The main gpuMode dashboard is available on port `8080`. The LLM benchmark is optional and expects a
-running OpenAI-compatible inference server or an Ollama server. It does not require a separate dashboard.
+The main gpuMode dashboard is available on port `8080`. In Section 2 of the dashboard (**Local AI Model Runner & Before/After GPU Usage Comparison**), you can:
 
-When no server is running, gpuMode can start `llama-server` for a configured local GGUF model:
+1. **Enter a Direct Model Path** (`/abs/path/to/model.gguf`, `~/Downloads/model.gguf`, or a folder containing a `.gguf` file) in **Direct Model Path** to run any local model immediately without placing it under `~/models` or `~/AI/Models`, **or** scan custom/standard folders (`~/AI/Models`, `~/models`, `./models`, `~/.cache/huggingface/hub`, and running `llama-server` / Ollama endpoints) via **Scan Models** (`GET /api/models?dir=...`).
+2. Select either a detected local AI model or `Direct Local Model Path` (auto-selected as soon as you type a direct path).
+3. Click **Run Without Project (Baseline)** to measure raw baseline GPU utilization, VRAM, power, throughput, and eBPF overhead.
+4. Click **Run With Project (gpuMode)** to apply `gpuMode`'s VRAM-fitted `llama-server` tuning (`-ngl`, `-fa on`, KV cache quantization) **plus** CUDA kernel optimization & verification, then review the side-by-side Before/After comparison table.
+
+From the CLI, the LLM benchmark is optional and expects a running OpenAI-compatible inference server or an Ollama server (or auto-starts `llama-server` for a configured local GGUF model):
 
 ```bash
 GPUMODE_MODEL_PATH=/path/to/model.gguf ./gpumode workload \

@@ -74,6 +74,10 @@ type EnergyMeasurement struct {
 	PeakPowerWatts          float64 `json:"peakPowerWatts"`
 	AvgSMClockMHz           float64 `json:"avgSmClockMhz"`
 	AvgMemClockMHz          float64 `json:"avgMemClockMhz"`
+	AvgGPUUtilPct           float64 `json:"avgGpuUtilPct"`
+	PeakGPUUtilPct          float64 `json:"peakGpuUtilPct"`
+	AvgMemUtilPct           float64 `json:"avgMemUtilPct"`
+	PeakMemUtilPct          float64 `json:"peakMemUtilPct"`
 	PeakTempC               float64 `json:"peakTempC"`
 	PeakVRAMMiB             float64 `json:"peakVramMib"`
 	JoulesPerRequest        float64 `json:"joulesPerRequest"`
@@ -630,7 +634,11 @@ func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedReq
 	var totalEnergyJoules float64
 	var weightedSMClock float64
 	var weightedMemClock float64
+	var weightedGPUUtil float64
+	var weightedMemUtil float64
 	var peakPower float64
+	var peakGPUUtil float64
+	var peakMemUtil float64
 	var peakTemp float64
 	var peakVRAM float64
 
@@ -641,6 +649,12 @@ func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedReq
 	for _, s := range statSamples {
 		if s.PowerWatts > peakPower {
 			peakPower = s.PowerWatts
+		}
+		if s.GPUUtilPct > peakGPUUtil {
+			peakGPUUtil = s.GPUUtilPct
+		}
+		if s.MemUtilPct > peakMemUtil {
+			peakMemUtil = s.MemUtilPct
 		}
 		if s.TemperatureC > peakTemp {
 			peakTemp = s.TemperatureC
@@ -660,11 +674,15 @@ func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedReq
 		totalEnergyJoules += 0.5 * (p0.PowerWatts + p1.PowerWatts) * dt
 		weightedSMClock += 0.5 * (p0.SMClockMHz + p1.SMClockMHz) * dt
 		weightedMemClock += 0.5 * (p0.MemClockMHz + p1.MemClockMHz) * dt
+		weightedGPUUtil += 0.5 * (p0.GPUUtilPct + p1.GPUUtilPct) * dt
+		weightedMemUtil += 0.5 * (p0.MemUtilPct + p1.MemUtilPct) * dt
 	}
 
 	avgPower := totalEnergyJoules / durationSec
 	avgSMClock := weightedSMClock / durationSec
 	avgMemClock := weightedMemClock / durationSec
+	avgGPUUtil := weightedGPUUtil / durationSec
+	avgMemUtil := weightedMemUtil / durationSec
 
 	if avgPower > peakPower {
 		peakPower = avgPower
@@ -699,6 +717,10 @@ func IntegrateSamplesWindow(samples []Sample, start, end time.Time, completedReq
 		PeakPowerWatts:        peakPower,
 		AvgSMClockMHz:         avgSMClock,
 		AvgMemClockMHz:        avgMemClock,
+		AvgGPUUtilPct:         avgGPUUtil,
+		PeakGPUUtilPct:        peakGPUUtil,
+		AvgMemUtilPct:         avgMemUtil,
+		PeakMemUtilPct:        peakMemUtil,
 		PeakTempC:             peakTemp,
 		PeakVRAMMiB:           peakVRAM,
 		SampleCount:           sampleCount,
@@ -727,6 +749,7 @@ func AggregateWindowMeasurements(
 	}
 
 	var sumPower, sumPeakPower, sumSM, sumMem, sumTemp, sumVRAM float64
+	var sumGPUUtil, sumPeakGPUUtil, sumMemUtil, sumPeakMemUtil float64
 	var sumJ1K, sumJReq, sumEDP, sumPerfW, sumDur, sumTotJ float64
 	var totalSamples int
 	measuredCount := 0
@@ -738,6 +761,14 @@ func AggregateWindowMeasurements(
 		}
 		sumSM += w.AvgSMClockMHz
 		sumMem += w.AvgMemClockMHz
+		sumGPUUtil += w.AvgGPUUtilPct
+		if w.PeakGPUUtilPct > sumPeakGPUUtil {
+			sumPeakGPUUtil = w.PeakGPUUtilPct
+		}
+		sumMemUtil += w.AvgMemUtilPct
+		if w.PeakMemUtilPct > sumPeakMemUtil {
+			sumPeakMemUtil = w.PeakMemUtilPct
+		}
 		if w.PeakTempC > sumTemp {
 			sumTemp = w.PeakTempC
 		}
@@ -821,6 +852,10 @@ func AggregateWindowMeasurements(
 		PeakPowerWatts:          sumPeakPower,
 		AvgSMClockMHz:           sumSM / n,
 		AvgMemClockMHz:          sumMem / n,
+		AvgGPUUtilPct:           sumGPUUtil / n,
+		PeakGPUUtilPct:          sumPeakGPUUtil,
+		AvgMemUtilPct:           sumMemUtil / n,
+		PeakMemUtilPct:          sumPeakMemUtil,
 		PeakTempC:               sumTemp,
 		PeakVRAMMiB:             sumVRAM,
 		JoulesPerRequest:        meanJReq,

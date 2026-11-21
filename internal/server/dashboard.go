@@ -135,7 +135,7 @@ const dashboardHTML = `<!DOCTYPE html>
     margin-bottom: 10px;
   }
   label { display: block; font-size: 0.74rem; color: var(--muted); margin-bottom: 4px; }
-  select, input[type="number"] {
+  select, input[type="number"], input[type="text"] {
     width: 100%;
     background: #0d131f;
     border: 1px solid var(--border);
@@ -144,7 +144,7 @@ const dashboardHTML = `<!DOCTYPE html>
     border-radius: 6px;
     font-size: 0.84rem;
   }
-  .btn-row { display: flex; gap: 10px; align-items: center; margin-top: 6px; }
+  .btn-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
   button {
     background: var(--accent);
     color: #06101e;
@@ -163,6 +163,12 @@ const dashboardHTML = `<!DOCTYPE html>
     color: var(--text);
     border: 1px solid var(--border);
   }
+  .btn-green {
+    background: var(--green);
+    color: #05140b;
+  }
+  .delta-good { color: #4ade80; font-weight: 700; }
+  .delta-warn { color: #fbbf24; font-weight: 700; }
   .status-msg { font-size: 0.8rem; color: var(--amber); }
 
   /* 7-Question Causal Chain */
@@ -363,13 +369,30 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
 </section>
 
-<!-- Real Local OpenAI-Compatible / Ollama Inference Workload Adapter -->
+<!-- Local AI Model Selector & Without-Project vs With-Project Benchmark -->
 <section class="card" style="margin-bottom:18px;">
-  <h2>2. Production LLM Workload Adapter (Local llama-server / Ollama Streaming Benchmark) <span class="badge badge-blue" id="workloadProvBadge">MEASURED END-TO-END</span></h2>
-  <div class="form-row">
+  <h2>2. Local AI Model Runner &amp; Before/After GPU Usage Comparison <span class="badge badge-blue" id="workloadProvBadge">MEASURED END-TO-END</span></h2>
+  <div class="form-row" style="grid-template-columns: 1.2fr 1fr auto; align-items: end;">
     <div>
-      <label for="llmUrl">Inference Server URL (llama-server / Ollama)</label>
-      <input type="text" id="llmUrl" value="http://127.0.0.1:8081" style="width:100%;background:#0d131f;border:1px solid var(--border);color:var(--text);padding:7px 9px;border-radius:6px;font-size:0.84rem;">
+      <label for="directModelPathInput">Direct Model Path (.gguf file or folder — runs directly without /models)</label>
+      <input type="text" id="directModelPathInput" placeholder="e.g. ~/Downloads/model.gguf or /abs/path/to/model.gguf" oninput="onDirectPathInput()">
+    </div>
+    <div>
+      <label for="modelDirInput">Optional Scan Folder / Repo Path (for auto-discovery)</label>
+      <input type="text" id="modelDirInput" placeholder="Optional folder to scan (e.g. ~/AI/Models or /path/to/repo)">
+    </div>
+    <div>
+      <button id="scanModelsBtn" class="btn-secondary" onclick="scanLocalModels()">Scan Models</button>
+    </div>
+  </div>
+  <div class="form-row">
+    <div style="grid-column: span 2;">
+      <label for="modelSelect">Model Source / Detected Local AI Model</label>
+      <select id="modelSelect" onchange="onModelSelectionChanged()"></select>
+    </div>
+    <div>
+      <label for="llmUrl">Inference Server URL (when using external server)</label>
+      <input type="text" id="llmUrl" value="http://127.0.0.1:8081">
     </div>
     <div>
       <label for="llmReqs">Streaming Requests</label>
@@ -380,12 +403,16 @@ const dashboardHTML = `<!DOCTYPE html>
       <input type="number" id="llmTokens" value="48" min="16" max="256">
     </div>
   </div>
+  <div id="modelScanMeta" style="margin-bottom:8px;font-size:0.78rem;color:var(--muted);">
+    Scanning local AI models...
+  </div>
   <div class="btn-row">
-    <button id="runWorkloadBtn" onclick="triggerWorkload()">Benchmark Local Inference Server (TTFT, TPOT, VRAM, J/1K Tok)</button>
+    <button id="runBaselineBtn" class="btn-secondary" onclick="triggerWorkload('baseline')">Run Without Project (Baseline)</button>
+    <button id="runOptimizedBtn" class="btn-green" onclick="triggerWorkload('optimized')">Run With Project (gpuMode)</button>
     <span class="status-msg" id="workloadStatus"></span>
   </div>
-  <div id="workloadResultBox" style="margin-top:10px;font-size:0.82rem;color:var(--muted);">
-    Click above to measure real streaming TTFT, TPOT, tokens/sec, peak VRAM, and Joules/1K tokens against your local OpenAI-compatible or Ollama server.
+  <div id="workloadResultBox" style="margin-top:12px;font-size:0.82rem;color:var(--muted);">
+    Select a detected local AI model above, run it <strong>Without Project</strong> to record baseline GPU usage, then run it <strong>With Project</strong> to apply gpuMode runtime &amp; CUDA kernel optimizations and compare results side-by-side.
   </div>
 </section>
 
@@ -404,10 +431,22 @@ const dashboardHTML = `<!DOCTYPE html>
 <script>
 let powerHistory = [];
 let currentState = null;
+let discoveredModels = [];
+let comparisonsByModel = {};
+let directPathKeyMap = {};
+let latestCausalForWorkload = null;
 
 function fmtNum(v, d = 2) {
   if (v === undefined || v === null || isNaN(v)) return "--";
   return Number(v).toFixed(d);
+}
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 async function loadInitialState() {
@@ -426,14 +465,132 @@ async function loadInitialState() {
       data.telemetryHistory.forEach(s => updateTelemetryUI(s, false));
       drawSparkline();
     }
+    if (data.customModelDir) {
+      document.getElementById("modelDirInput").value = data.customModelDir;
+    }
+    if (data.directModelPath) {
+      document.getElementById("directModelPathInput").value = data.directModelPath;
+    }
+    if (data.comparisonsByModel) {
+      comparisonsByModel = data.comparisonsByModel;
+    }
+    if (data.discoveredModels) {
+      renderModelOptions(data.discoveredModels);
+      if (data.directModelPath) {
+        document.getElementById("modelSelect").value = "__direct_path__";
+        onModelSelectionChanged();
+      }
+    }
     if (data.hasReport && data.latestReport) {
+      latestCausalForWorkload = data.latestReport;
       renderReport(data.latestReport);
     } else {
       // Automatically run an initial hardware-verified report if store is empty
       triggerOptimize();
     }
+    renderWorkloadComparison();
   } catch (e) {
     console.error("Failed to load initial state:", e);
+  }
+}
+
+function renderModelOptions(disc) {
+  const sel = document.getElementById("modelSelect");
+  const meta = document.getElementById("modelScanMeta");
+  if (!sel || !disc) return;
+
+  const prevVal = sel.value;
+  discoveredModels = disc.models || [];
+  sel.innerHTML = "";
+
+  discoveredModels.forEach(m => {
+    const opt = document.createElement("option");
+    opt.value = m.id;
+    const parts = [m.name, "[" + (m.sourceLabel || m.source) + "]"];
+    if (m.sizeHuman) parts.push(m.sizeHuman);
+    if (m.quantization) parts.push(m.quantization);
+    if (m.running) parts.push("RUNNING");
+    opt.textContent = parts.join(" • ");
+    sel.appendChild(opt);
+  });
+
+  const directOpt = document.createElement("option");
+  directOpt.value = "__direct_path__";
+  directOpt.textContent = "Direct Local Model Path (use Direct Model Path field above)";
+  sel.appendChild(directOpt);
+
+  const customOpt = document.createElement("option");
+  customOpt.value = "__custom_url__";
+  customOpt.textContent = "Custom External Inference URL (use Server URL field)";
+  sel.appendChild(customOpt);
+
+  if (prevVal && Array.from(sel.options).some(o => o.value === prevVal)) {
+    sel.value = prevVal;
+  } else if (discoveredModels.length > 0) {
+    sel.value = discoveredModels[0].id;
+  } else {
+    sel.value = "__direct_path__";
+  }
+
+  const dirs = (disc.scannedDirs || []).join(", ") || "none";
+  const notes = (disc.notes && disc.notes.length) ? (" • " + disc.notes.join("; ")) : "";
+  meta.innerHTML =
+    "Detected <strong>" + discoveredModels.length + "</strong> model(s) • Scanned: <code>" + escapeHtml(dirs) + "</code>" +
+    " • Or enter any <code>.gguf</code> path directly above" + escapeHtml(notes);
+  onModelSelectionChanged();
+}
+
+function getSelectedModel() {
+  const sel = document.getElementById("modelSelect");
+  if (!sel) return null;
+  const id = sel.value;
+  return discoveredModels.find(m => m.id === id) || null;
+}
+
+function onDirectPathInput() {
+  const directVal = document.getElementById("directModelPathInput").value.trim();
+  const sel = document.getElementById("modelSelect");
+  if (directVal && sel && sel.value !== "__direct_path__") {
+    sel.value = "__direct_path__";
+  }
+  onModelSelectionChanged();
+}
+
+function onModelSelectionChanged() {
+  const sel = document.getElementById("modelSelect");
+  const selVal = sel ? sel.value : "";
+  const m = getSelectedModel();
+  const urlInput = document.getElementById("llmUrl");
+  if (selVal === "__direct_path__") {
+    urlInput.disabled = true;
+  } else if (m && m.endpointUrl) {
+    urlInput.value = m.endpointUrl;
+    urlInput.disabled = true;
+  } else if (m && m.path) {
+    urlInput.disabled = true;
+  } else {
+    urlInput.disabled = false;
+  }
+  renderWorkloadComparison();
+}
+
+async function scanLocalModels() {
+  const btn = document.getElementById("scanModelsBtn");
+  const dir = document.getElementById("modelDirInput").value.trim();
+  const llmUrl = document.getElementById("llmUrl").value.trim();
+  btn.disabled = true;
+  try {
+    const params = new URLSearchParams();
+    params.set("dir", dir);
+    if (llmUrl) params.set("llmUrl", llmUrl);
+    const res = await fetch("/api/models?" + params.toString());
+    if (!res.ok) throw new Error(await res.text());
+    const disc = await res.json();
+    renderModelOptions(disc);
+  } catch (e) {
+    document.getElementById("modelScanMeta").textContent = "Scan error: " + e.message;
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -601,57 +758,185 @@ function renderReport(rep) {
   document.getElementById("torchExtBox").textContent = rep.pytorchExtensionCode || "";
 }
 
-async function triggerWorkload() {
-  const btn = document.getElementById("runWorkloadBtn");
+async function triggerWorkload(mode) {
+  const baseBtn = document.getElementById("runBaselineBtn");
+  const optBtn = document.getElementById("runOptimizedBtn");
   const status = document.getElementById("workloadStatus");
-  const box = document.getElementById("workloadResultBox");
-  btn.disabled = true;
-  status.textContent = "Launching/querying local DeepSeek-V4-9B inference server & measuring live power/VRAM...";
+  baseBtn.disabled = true;
+  optBtn.disabled = true;
+
+  const selVal = document.getElementById("modelSelect").value;
+  const directPath = document.getElementById("directModelPathInput").value.trim();
+  const selModel = getSelectedModel();
+
+  if (selVal === "__direct_path__" && !directPath) {
+    status.textContent = "Enter a direct .gguf file or model folder path first.";
+    baseBtn.disabled = false;
+    optBtn.disabled = false;
+    document.getElementById("directModelPathInput").focus();
+    return;
+  }
+
+  const modelLabel = selVal === "__direct_path__"
+    ? directPath
+    : (selModel ? selModel.name : document.getElementById("llmUrl").value);
+  status.textContent = mode === "optimized"
+    ? ("Running " + modelLabel + " WITH gpuMode (tuned runtime + CUDA kernel optimization)...")
+    : ("Running " + modelLabel + " WITHOUT gpuMode (baseline inference)...");
+
   try {
+    const payload = {
+      mode: mode,
+      customDir: document.getElementById("modelDirInput").value.trim(),
+      serverUrl: document.getElementById("llmUrl").value.trim(),
+      numRequests: parseInt(document.getElementById("llmReqs").value) || 3,
+      maxTokens: parseInt(document.getElementById("llmTokens").value) || 48,
+      autoServer: true,
+      opCategory: document.getElementById("opSelect").value,
+      strategy: document.getElementById("strategySelect").value,
+      batchSize: parseInt(document.getElementById("batchInput").value) || 256,
+      hiddenDim: parseInt(document.getElementById("hiddenInput").value) || 4096,
+      iterations: parseInt(document.getElementById("iterInput").value) || 50
+    };
+    if (selVal === "__direct_path__") {
+      payload.modelId = "__direct_path__";
+      payload.directModelPath = directPath;
+      payload.forceLocalSpawn = true;
+    } else if (selVal === "__custom_url__") {
+      payload.modelId = "__custom_url__";
+      payload.autoServer = false;
+    } else if (selModel) {
+      payload.modelId = selModel.id;
+      payload.modelName = selModel.name;
+      payload.modelSource = selModel.source;
+      if (selModel.path) {
+        payload.modelPath = selModel.path;
+        payload.forceLocalSpawn = true;
+      }
+      if (selModel.endpointUrl) {
+        payload.serverUrl = selModel.endpointUrl;
+        payload.autoServer = false;
+      }
+    }
+
     const res = await fetch("/api/workload", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        serverUrl: document.getElementById("llmUrl").value,
-        numRequests: parseInt(document.getElementById("llmReqs").value) || 3,
-        maxTokens: parseInt(document.getElementById("llmTokens").value) || 48,
-        autoServer: true
-      })
+      body: JSON.stringify(payload)
     });
     if (!res.ok) throw new Error(await res.text());
-    const w = await res.json();
-    status.textContent = "Measured " + fmtNum(w.throughputTokensPerS, 1) + " tok/s";
-    if (w.hostCudaTrace && w.hostCudaTrace.active) {
+    const data = await res.json();
+    const w = data.workload;
+
+    if (data.modelKey) {
+      if (selVal === "__direct_path__" && directPath) {
+        directPathKeyMap[directPath] = data.modelKey;
+      }
+      if (!comparisonsByModel[data.modelKey]) comparisonsByModel[data.modelKey] = {};
+      if (data.baseline) comparisonsByModel[data.modelKey].baseline = data.baseline;
+      if (data.optimized) comparisonsByModel[data.modelKey].optimized = data.optimized;
+    }
+    if (data.causalReport) {
+      latestCausalForWorkload = data.causalReport;
+      renderReport(data.causalReport);
+    }
+    if (w && w.hostCudaTrace && w.hostCudaTrace.active) {
       renderEBPFTrace(w.hostCudaTrace, currentState && currentState.ebpfStatus);
     }
-    const telTag = w.telemetryBackend || (currentState && currentState.telemetryBackend) || "NVIDIA_SMI";
-    let ebpfHtml = "";
-    if (w.hostCudaTrace && w.hostCudaTrace.active) {
-      ebpfHtml = "<br><strong>Host&harr;CUDA eBPF [MEASURED_EBPF]:</strong> " +
-        fmtNum(w.launchesPerOutputToken, 1) + " launches/tok (" + (w.hostCudaTrace.kernelLaunches || 0) + " total) &bull; " +
-        "<strong>Avg Launch Gap:</strong> " + fmtNum(w.hostCudaTrace.avgLaunchGapUs, 1) + " &micro;s &bull; " +
-        "<strong>H2D/D2H:</strong> " + fmtNum(w.hostCudaTrace.memcpyH2dMib, 2) + "/" + fmtNum(w.hostCudaTrace.memcpyD2hMib, 2) + " MiB &bull; " +
-        "<strong>Sync Stall:</strong> " + fmtNum(w.hostCudaTrace.syncStallMs, 2) + " ms &bull; " +
-        "<strong>Off-CPU:</strong> " + fmtNum(w.hostCudaTrace.offCpuMs, 2) + " ms";
-    } else {
-      const wProv = (w.hostCudaTrace && w.hostCudaTrace.provenance) ? w.hostCudaTrace.provenance : "DISABLED";
-      const setcapNote = wProv === "UNAVAILABLE_UNPRIVILEGED" ? " (run <code>./run.sh setcap</code> for rootless CUDA uprobes)" : "";
-      ebpfHtml = "<br><strong>Host&harr;CUDA eBPF:</strong> <span class='badge badge-amber'>" + wProv + "</span>" + setcapNote;
-    }
-    box.innerHTML =
-      "<strong>[" + w.provenance + "]</strong> " + w.modelName + " &bull; " +
-      "<strong>Telemetry:</strong> " + telTag + " &bull; " +
-      "<strong>TTFT (p50/p95):</strong> " + fmtNum(w.medianTtftMs, 1) + " / " + fmtNum(w.p95TtftMs, 1) + " ms &bull; " +
-      "<strong>TPOT:</strong> " + fmtNum(w.medianTpotMs, 2) + " ms/tok &bull; " +
-      "<strong>Throughput:</strong> " + fmtNum(w.throughputTokensPerS, 2) + " tok/s &bull; " +
-      "<strong>Peak VRAM:</strong> " + fmtNum(w.measuredPeakVramMib, 0) + " MiB &bull; " +
-      "<strong>Energy:</strong> " + fmtNum(w.joulesPer1kTokens, 1) + " J/1K tokens (" + fmtNum(w.energy.activePowerWatts, 1) + "W active)" +
-      ebpfHtml;
+    renderWorkloadComparison(data.modelKey);
+    status.textContent = (mode === "optimized" ? "With Project" : "Without Project") +
+      " measured: " + fmtNum(w.throughputTokensPerS, 1) + " tok/s, " +
+      fmtNum(w.avgGpuUtilPct, 0) + "% avg GPU SM, " +
+      fmtNum(w.measuredPeakVramMib, 0) + " MiB VRAM";
   } catch (e) {
     status.textContent = "Error: " + e.message;
   } finally {
-    btn.disabled = false;
+    baseBtn.disabled = false;
+    optBtn.disabled = false;
   }
+}
+
+function fmtDelta(baseVal, optVal, unit, lowerIsBetter) {
+  if (baseVal === undefined || optVal === undefined || baseVal === null || optVal === null || baseVal === 0) {
+    return "--";
+  }
+  const diff = optVal - baseVal;
+  const pct = (diff / baseVal) * 100.0;
+  const sign = diff > 0 ? "+" : "";
+  const improved = lowerIsBetter ? (diff < -1e-6) : (diff > 1e-6);
+  const cls = improved ? "delta-good" : (Math.abs(pct) < 1.0 ? "" : "delta-warn");
+  return "<span class='" + cls + "'>" + sign + fmtNum(diff, 2) + (unit ? " " + unit : "") + " (" + sign + fmtNum(pct, 1) + "%)</span>";
+}
+
+function renderWorkloadComparison(explicitKey) {
+  const box = document.getElementById("workloadResultBox");
+  if (!box) return;
+
+  const selEl = document.getElementById("modelSelect");
+  const selVal = selEl ? selEl.value : "";
+  const directPath = (document.getElementById("directModelPathInput") || {}).value
+    ? document.getElementById("directModelPathInput").value.trim()
+    : "";
+  const sel = getSelectedModel();
+  let key = explicitKey || "";
+  if (!key) {
+    if (selVal === "__direct_path__" && directPath && directPathKeyMap[directPath]) {
+      key = directPathKeyMap[directPath];
+    } else if (sel) {
+      key = sel.id;
+    }
+  }
+  let pair = key ? comparisonsByModel[key] : null;
+  if (!pair && selVal !== "__direct_path__") {
+    const keys = Object.keys(comparisonsByModel);
+    if (keys.length > 0 && !sel) {
+      pair = comparisonsByModel[keys[keys.length - 1]];
+    }
+  }
+  const b = pair && pair.baseline ? pair.baseline : null;
+  const o = pair && pair.optimized ? pair.optimized : null;
+
+  if (!b && !o) {
+    box.innerHTML = "Select a detected local AI model above, run it <strong>Without Project</strong> to record baseline GPU usage, then run it <strong>With Project</strong> to apply gpuMode runtime &amp; CUDA kernel optimizations and compare results side-by-side.";
+    return;
+  }
+
+  const cell = (r, fn) => r ? fn(r) : "<span style='color:var(--muted);'>Not run yet</span>";
+  const delta = (fn, unit, lowerBetter) => (b && o) ? fmtDelta(fn(b), fn(o), unit, lowerBetter) : "--";
+
+  const rows = [
+    ["Runtime Profile", cell(b, r => escapeHtml(r.runtimeProfile || "Baseline")), cell(o, r => escapeHtml(r.runtimeProfile || "gpuMode")), "--"],
+    ["GPU SM Util (Avg / Peak)", cell(b, r => fmtNum(r.avgGpuUtilPct, 1) + "% / " + fmtNum(r.peakGpuUtilPct, 0) + "%"), cell(o, r => fmtNum(r.avgGpuUtilPct, 1) + "% / " + fmtNum(r.peakGpuUtilPct, 0) + "%"), delta(r => r.avgGpuUtilPct, "%", false)],
+    ["Memory Ctrl Util (Avg / Peak)", cell(b, r => fmtNum(r.avgMemUtilPct, 1) + "% / " + fmtNum(r.peakMemUtilPct, 0) + "%"), cell(o, r => fmtNum(r.avgMemUtilPct, 1) + "% / " + fmtNum(r.peakMemUtilPct, 0) + "%"), delta(r => r.avgMemUtilPct, "%", false)],
+    ["Peak VRAM Used", cell(b, r => fmtNum(r.measuredPeakVramMib, 0) + " MiB"), cell(o, r => fmtNum(r.measuredPeakVramMib, 0) + " MiB"), delta(r => r.measuredPeakVramMib, "MiB", true)],
+    ["Power (Avg / Active)", cell(b, r => fmtNum(r.energy.avgPowerWatts, 1) + " W / " + fmtNum(r.energy.activePowerWatts, 1) + " W"), cell(o, r => fmtNum(r.energy.avgPowerWatts, 1) + " W / " + fmtNum(r.energy.activePowerWatts, 1) + " W"), delta(r => r.energy.avgPowerWatts, "W", true)],
+    ["Throughput", cell(b, r => fmtNum(r.throughputTokensPerS, 2) + " tok/s"), cell(o, r => fmtNum(r.throughputTokensPerS, 2) + " tok/s"), delta(r => r.throughputTokensPerS, "tok/s", false)],
+    ["Latency (TTFT / TPOT)", cell(b, r => fmtNum(r.medianTtftMs, 1) + " ms / " + fmtNum(r.medianTpotMs, 1) + " ms"), cell(o, r => fmtNum(r.medianTtftMs, 1) + " ms / " + fmtNum(r.medianTpotMs, 1) + " ms"), delta(r => r.medianTpotMs, "ms/tok", true)],
+    ["Energy / 1K Tokens", cell(b, r => fmtNum(r.joulesPer1kTokens, 1) + " J"), cell(o, r => fmtNum(r.joulesPer1kTokens, 1) + " J"), delta(r => r.joulesPer1kTokens, "J", true)],
+    ["eBPF Launches / Tok", cell(b, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.launchesPerOutputToken, 1) : (r.hostCudaTrace ? r.hostCudaTrace.provenance : "--")), cell(o, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.launchesPerOutputToken, 1) : (r.hostCudaTrace ? r.hostCudaTrace.provenance : "--")), (b && o && b.hostCudaTrace && b.hostCudaTrace.active && o.hostCudaTrace && o.hostCudaTrace.active) ? fmtDelta(b.launchesPerOutputToken, o.launchesPerOutputToken, "", true) : "--"],
+    ["eBPF Sync Stall", cell(b, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.hostCudaTrace.syncStallMs, 1) + " ms" : "--"), cell(o, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.hostCudaTrace.syncStallMs, 1) + " ms" : "--"), (b && o && b.hostCudaTrace && b.hostCudaTrace.active && o.hostCudaTrace && o.hostCudaTrace.active) ? fmtDelta(b.hostCudaTrace.syncStallMs, o.hostCudaTrace.syncStallMs, "ms", true) : "--"]
+  ];
+
+  let html = "<table><thead><tr><th>Metric</th><th>Without Project (Baseline)</th><th>With Project (gpuMode)</th><th>Change</th></tr></thead><tbody>";
+  rows.forEach(row => {
+    html += "<tr><td><strong>" + row[0] + "</strong></td><td>" + row[1] + "</td><td>" + row[2] + "</td><td>" + row[3] + "</td></tr>";
+  });
+  html += "</tbody></table>";
+
+  if (o && latestCausalForWorkload && latestCausalForWorkload.autotune && latestCausalForWorkload.economicsComparison) {
+    const ec = latestCausalForWorkload.economicsComparison;
+    const best = latestCausalForWorkload.autotune.bestResult || {};
+    const spec = best.spec || {};
+    html += "<div style='margin-top:10px;padding:10px;background:var(--panel-alt);border-left:3px solid var(--green);border-radius:6px;'>" +
+      "<strong>gpuMode CUDA Kernel Optimization Applied (" + escapeHtml(latestCausalForWorkload.opCategory) + "):</strong> " +
+      escapeHtml(spec.name || "Fused CUDA Kernel") + " &bull; " +
+      "<strong>Speedup:</strong> " + fmtNum(ec.speedupFactor, 2) + "&times; &bull; " +
+      "<strong>Energy Saved:</strong> " + fmtNum(ec.energySavedPct, 1) + "% &bull; " +
+      "<strong>Kernel Activation VRAM:</strong> -" + fmtNum(ec.vramReductionMib, 0) + " MiB &bull; " +
+      "<strong>Safety:</strong> " + (best.parityPassed && best.edgeCasePassed ? "PASS (Parity + Edge-Case" + (best.sanitizerPassed ? " + Sanitizer" : "") + ")" : "CHECK") +
+      "</div>";
+  }
+  box.innerHTML = html;
 }
 
 window.addEventListener("DOMContentLoaded", () => {
