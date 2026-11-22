@@ -288,7 +288,7 @@ const dashboardHTML = `<!DOCTYPE html>
     <span class="t-val" id="tVram">-- / -- MiB</span>
   </div>
   <div class="t-item">
-    <span class="t-label">Ridge Point</span>
+    <span class="t-label">Ridge / Throttle</span>
     <span class="t-val" id="tRidge">-- FLOP/B</span>
   </div>
   <canvas id="sparkCanvas" width="210" height="42"></canvas>
@@ -302,29 +302,30 @@ const dashboardHTML = `<!DOCTYPE html>
       <span class="badge badge-blue" id="ebpfProvBadge">PROBING</span>
       <a href="/api/trace/perfetto" target="_blank" class="badge badge-green" style="text-decoration:none;">Export Perfetto JSON</a>
       <a href="/metrics" target="_blank" class="badge badge-blue" style="text-decoration:none;">Prometheus /metrics</a>
+      <a href="/api/schedule" target="_blank" class="badge badge-amber" style="text-decoration:none;">Scheduler JSON</a>
     </div>
     <span class="ebpf-hint" id="ebpfHint">Checking Linux eBPF uprobe &amp; scheduler capabilities...</span>
   </div>
   <div class="ebpf-metrics" id="ebpfMetrics" style="display:none;">
     <div class="t-item">
-      <span class="t-label">Kernel Launches</span>
+      <span class="t-label">Kernel / Graph Launches</span>
       <span class="t-val" id="eLaunches">--</span>
     </div>
     <div class="t-item">
-      <span class="t-label">Inter-Launch CPU Gap</span>
+      <span class="t-label">Launch Gap (Avg / p95)</span>
       <span class="t-val" id="eLaunchGap">-- &micro;s</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">Avg Grid / Block</span>
+      <span class="t-val" id="eGeometry">--</span>
     </div>
     <div class="t-item">
       <span class="t-label">PCIe H2D / D2H</span>
       <span class="t-val" id="eMemcpy">-- / -- MiB</span>
     </div>
     <div class="t-item">
-      <span class="t-label">CUDA Sync Stall</span>
-      <span class="t-val" id="eSyncStall">-- ms</span>
-    </div>
-    <div class="t-item">
-      <span class="t-label">Scheduler Off-CPU</span>
-      <span class="t-val" id="eOffCpu">-- ms</span>
+      <span class="t-label">Sync Stall / Off-CPU</span>
+      <span class="t-val" id="eSyncStall">-- / -- ms</span>
     </div>
   </div>
 </section>
@@ -332,7 +333,10 @@ const dashboardHTML = `<!DOCTYPE html>
 <!-- Controls: Live GPU Optimization Trigger -->
 <section class="controls-grid">
   <div class="card">
-    <h2>1. Live CUDA Hardware Optimization &amp; Verification</h2>
+    <h2>
+      <span>1. Live CUDA Hardware Optimization, Occupancy &amp; PyTorch Verification</span>
+      <span class="badge badge-green" id="pytorchTraceBadge">PROBING PYTORCH</span>
+    </h2>
     <div class="form-row">
       <div>
         <label for="opSelect">Target Hotspot Operation</label>
@@ -371,6 +375,9 @@ const dashboardHTML = `<!DOCTYPE html>
       <button id="runOptBtn" onclick="triggerOptimize()">Compile, Verify &amp; Benchmark on GPU</button>
       <span class="status-msg" id="jobStatus"></span>
     </div>
+    <div id="pytorchInlineSummary" style="margin-top:10px;font-size:0.8rem;color:var(--muted);"></div>
+    <div class="causal-grid" id="causalAnswersGrid" style="margin-top:12px;"></div>
+    <div id="autotuneTrialsBox" style="margin-top:12px;overflow-x:auto;"></div>
   </div>
 </section>
 
@@ -401,7 +408,11 @@ const dashboardHTML = `<!DOCTYPE html>
     </div>
     <div>
       <label for="llmReqs">Streaming Requests</label>
-      <input type="number" id="llmReqs" value="3" min="1" max="16">
+      <input type="number" id="llmReqs" value="3" min="1" max="32">
+    </div>
+    <div>
+      <label for="llmConcurrency">Concurrent Clients</label>
+      <input type="number" id="llmConcurrency" value="1" min="1" max="32">
     </div>
     <div>
       <label for="llmTokens">Max Output Tokens / Req</label>
@@ -418,6 +429,38 @@ const dashboardHTML = `<!DOCTYPE html>
   </div>
   <div id="workloadResultBox" style="margin-top:12px;font-size:0.82rem;color:var(--muted);">
     Select a detected local AI model above, run it <strong>Without Project</strong> to record baseline GPU usage, then run it <strong>With Project</strong> to apply gpuMode runtime &amp; CUDA kernel optimizations and compare results side-by-side.
+  </div>
+</section>
+
+<!-- Section 3: Production GPU Fleet Cost, Placement, Admission Control & Scheduling Optimizer -->
+<section class="card" style="margin-bottom:18px;">
+  <h2>
+    <span>3. Production GPU Fleet Cost, VRAM Placement &amp; Admission Control Optimizer</span>
+    <span class="badge badge-green" id="schedWinnerBadge">COST + SLO PARETO ROUTER</span>
+  </h2>
+  <div class="form-row">
+    <div>
+      <label for="schedQpsInput">Target Fleet Traffic (QPS)</label>
+      <input type="number" id="schedQpsInput" value="120" min="1" max="10000" step="10">
+    </div>
+    <div>
+      <label for="schedSloInput">Decode TPOT Latency SLO (ms/tok)</label>
+      <input type="number" id="schedSloInput" value="25" min="2" max="250" step="1">
+    </div>
+    <div>
+      <label for="schedHourlyUsdInput">Local / Base GPU Rate ($/GPU-hr)</label>
+      <input type="number" id="schedHourlyUsdInput" value="0.75" min="0.05" max="20" step="0.05">
+    </div>
+    <div>
+      <label for="schedSpotDiscInput">Spot / Preemptible Discount (%)</label>
+      <input type="number" id="schedSpotDiscInput" value="65" min="10" max="90" step="5">
+    </div>
+    <div style="display:flex;align-items:end;">
+      <button id="runSchedBtn" class="btn-secondary" style="width:100%;" onclick="loadFleetSchedule(true)">Recompute Fleet Placement &amp; Cost</button>
+    </div>
+  </div>
+  <div id="fleetScheduleBox" style="margin-top:10px;font-size:0.81rem;color:var(--muted);">
+    Loading VRAM-aware GPU pool placement, priority admission control, and scheduling strategy simulation...
   </div>
 </section>
 
@@ -493,7 +536,14 @@ async function loadInitialState() {
       // Automatically run an initial hardware-verified report if store is empty
       triggerOptimize();
     }
+    if (data.economics) {
+      if (data.economics.targetQps) document.getElementById("schedQpsInput").value = data.economics.targetQps;
+      if (data.economics.latencySlaMs) document.getElementById("schedSloInput").value = data.economics.latencySlaMs;
+      if (data.economics.gpuHourlyCostUsd) document.getElementById("schedHourlyUsdInput").value = data.economics.gpuHourlyCostUsd;
+      if (data.economics.spotDiscountPct) document.getElementById("schedSpotDiscInput").value = data.economics.spotDiscountPct;
+    }
     renderWorkloadComparison();
+    loadFleetSchedule(false);
   } catch (e) {
     console.error("Failed to load initial state:", e);
   }
@@ -577,6 +627,7 @@ function onModelSelectionChanged() {
     urlInput.disabled = false;
   }
   renderWorkloadComparison();
+  loadFleetSchedule(false);
 }
 
 async function scanLocalModels() {
@@ -632,14 +683,19 @@ function renderEBPFTrace(trace, fallbackStatus) {
   if (t.active) {
     metrics.style.display = "grid";
     const launchRate = t.launchesPerSec > 0 ? " (" + fmtNum(t.launchesPerSec, 0) + "/s)" : "";
-    document.getElementById("eLaunches").textContent = (t.kernelLaunches || 0) + launchRate;
-    document.getElementById("eLaunchGap").textContent = fmtNum(t.avgLaunchGapUs, 1) + " µs";
+    const graphCnt = t.graphLaunches ? " • " + t.graphLaunches + " graphs" : "";
+    document.getElementById("eLaunches").textContent = (t.kernelLaunches || 0) + launchRate + graphCnt;
+    const p95Gap = t.p95LaunchGapUs ? " / " + fmtNum(t.p95LaunchGapUs, 1) + " µs" : "";
+    document.getElementById("eLaunchGap").textContent = fmtNum(t.avgLaunchGapUs, 1) + p95Gap;
+    const geomEl = document.getElementById("eGeometry");
+    if (geomEl) {
+      geomEl.textContent = (t.avgGridBlocks ? fmtNum(t.avgGridBlocks, 0) : "--") + " blk × " +
+        (t.avgBlockThreads ? fmtNum(t.avgBlockThreads, 0) : "--") + " thr";
+    }
     document.getElementById("eMemcpy").textContent =
       fmtNum(t.memcpyH2dMib, 2) + " / " + fmtNum(t.memcpyD2hMib, 2) + " MiB";
     document.getElementById("eSyncStall").textContent =
-      fmtNum(t.syncStallMs, 2) + " ms (" + fmtNum(t.syncStallPct, 1) + "%)";
-    document.getElementById("eOffCpu").textContent =
-      fmtNum(t.offCpuMs, 2) + " ms (" + fmtNum(t.hostStarvationPct, 1) + "%)";
+      fmtNum(t.syncStallMs, 2) + " / " + fmtNum(t.offCpuMs, 2) + " ms";
     hint.textContent = t.statusDetail || "Live libcuda.so.1 uprobes + sched_switch tracepoint active";
   } else {
     metrics.style.display = "none";
@@ -654,11 +710,12 @@ function renderEBPFTrace(trace, fallbackStatus) {
 
 function renderHardware(hw) {
   if (!hw) return;
+  const empDram = hw.empiricalDramBandwidthGbps ? " (Emp DRAM: " + fmtNum(hw.empiricalDramBandwidthGbps, 1) + " GB/s, L2: " + fmtNum(hw.empiricalL2BandwidthGbps, 0) + " GB/s)" : "";
   document.getElementById("hwBadge").innerHTML =
-    "<strong>" + hw.name + " (" + hw.archFlag + ")</strong> &bull; " +
+    "<strong>" + escapeHtml(hw.name) + " (" + escapeHtml(hw.archFlag) + ")</strong> &bull; " +
     hw.smCount + " SMs &bull; " +
     fmtNum(hw.peakFp32Tflops, 1) + " TFLOPS FP32 &bull; " +
-    fmtNum(hw.peakMemBandwidthGbps, 0) + " GB/s BW &bull; " +
+    fmtNum(hw.peakMemBandwidthGbps, 0) + " GB/s Peak BW" + escapeHtml(empDram) + " &bull; " +
     fmtNum(hw.totalVramMib, 0) + " MiB VRAM";
   document.getElementById("tRidge").textContent = fmtNum(hw.ridgePointFlopsPerByte, 1) + " FLOP/B";
   const heading = document.getElementById("optCodeHeading");
@@ -677,6 +734,10 @@ function updateTelemetryUI(s, redraw = true) {
   document.getElementById("tTemp").textContent = fmtNum(s.temperatureC, 1) + " °C";
   document.getElementById("tUtil").textContent = fmtNum(s.gpuUtilPct, 0) + "% / " + fmtNum(s.memUtilPct, 0) + "%";
   document.getElementById("tVram").textContent = fmtNum(s.vramUsedMib, 0) + " / " + fmtNum(s.vramTotalMib, 0) + " MiB";
+  if (s.throttleReasons && s.throttleReasons.length > 0 && currentState && currentState.hardware) {
+    document.getElementById("tRidge").textContent =
+      fmtNum(currentState.hardware.ridgePointFlopsPerByte, 1) + " (" + s.throttleReasons[0] + ")";
+  }
 
   if (s.powerWatts > 0) {
     powerHistory.push(s.powerWatts);
@@ -756,6 +817,96 @@ function renderReport(rep) {
   }
   renderEBPFTrace(rep.hostCudaTrace, currentState && currentState.ebpfStatus);
 
+  // 1. PyTorch Profiler & Inline Extension Badge
+  const ptBadge = document.getElementById("pytorchTraceBadge");
+  const ptSummary = document.getElementById("pytorchInlineSummary");
+  if (ptBadge && rep.trace) {
+    const isMeas = rep.trace.provenance === "MEASURED";
+    ptBadge.textContent = isMeas
+      ? ("PYTORCH " + (rep.trace.torchVersion || "") + " [MEASURED]")
+      : ("TRACE [" + (rep.trace.provenance || "ESTIMATED") + "]");
+    ptBadge.className = "badge " + (isMeas ? "badge-green" : "badge-amber");
+  }
+  if (ptSummary && rep.trace) {
+    let ptHtml = "<strong>Operator Profiler:</strong> " + escapeHtml(rep.trace.sourceNote || rep.trace.device || "");
+    if (rep.trace.extensionVerification && rep.trace.extensionVerification.verified) {
+      const ev = rep.trace.extensionVerification;
+      ptHtml += " &bull; <span class='badge badge-green'>" + escapeHtml(ev.provenance) + "</span> " +
+        "Kernel Launches: <strong>" + ev.beforeLaunches + " &rarr; " + ev.afterLaunches + "</strong> &bull; " +
+        "Activation VRAM: <strong>" + fmtNum((ev.beforeMemoryBytes || 0) / 1048576, 1) + " &rarr; " + fmtNum((ev.afterMemoryBytes || 0) / 1048576, 1) + " MiB (-50%)</strong> &bull; " +
+        "Max Parity Error: <code>" + Number(ev.maxAbsError || 0).toExponential(2) + "</code>";
+    }
+    ptSummary.innerHTML = ptHtml;
+  }
+
+  // 2. 6-Question Causal Verification Grid
+  const qGrid = document.getElementById("causalAnswersGrid");
+  if (qGrid && rep.sevenAnswers) {
+    const sa = rep.sevenAnswers;
+    const cards = [
+      { title: "1. Why is the GPU underutilized?", body: sa.q1WhyUnderutilized, cls: "" },
+      { title: "2. Which operations are responsible?", body: sa.q2WhichOpsResponsible, cls: "" },
+      { title: "3. What CUDA optimization helps?", body: sa.q3WhatOptimizationHelps, cls: "" },
+      { title: "4. Is that optimization numerically safe?", body: sa.q4IsItNumericallySafe, cls: "safe" },
+      { title: "5. How much energy does it save?", body: sa.q5HowMuchEnergySaved, cls: "safe" },
+      { title: "6. Can fewer/cheaper GPUs serve the workload?", body: sa.q6CanCheaperGpuServe, cls: "money" }
+    ];
+    qGrid.innerHTML = cards.map(c =>
+      "<div class='q-card " + c.cls + "'>" +
+        "<div class='q-title'>" + escapeHtml(c.title) + "</div>" +
+        "<div class='q-body'>" + escapeHtml(c.body) + "</div>" +
+      "</div>"
+    ).join("");
+  }
+
+  // 3. Autotune Trials, PTXAS Resources & SM Warp Occupancy Table
+  const trialsBox = document.getElementById("autotuneTrialsBox");
+  if (trialsBox && rep.autotune) {
+    const baseR = rep.autotune.baselineResult;
+    const bestID = rep.autotune.bestResult && rep.autotune.bestResult.spec ? rep.autotune.bestResult.spec.id : "";
+    const allRows = [];
+    if (baseR && baseR.spec) {
+      allRows.push({ label: "Baseline", r: baseR, isWinner: false });
+    }
+    (rep.autotune.trials || []).forEach(t => {
+      if (t.result && t.result.spec) {
+        allRows.push({ label: "Trial #" + t.iteration, r: t.result, isWinner: t.result.spec.id === bestID });
+      }
+    });
+    if (allRows.length > 0) {
+      let tHtml = "<table><thead><tr>" +
+        "<th>Candidate Kernel</th><th>Block / Vec</th><th>PTXAS Regs / SMEM / Spills</th>" +
+        "<th>SM Warp Occupancy</th><th>Latency (p50 / p95)</th><th>Achieved BW</th><th>Energy / 1K</th><th>Safety Gate</th>" +
+        "</tr></thead><tbody>";
+      allRows.forEach(item => {
+        const r = item.r;
+        const sp = r.spec || {};
+        const pt = r.ptxas || {};
+        const badge = item.isWinner
+          ? " <span class='badge badge-green'>WINNER</span>"
+          : (item.label === "Baseline" ? " <span class='badge badge-amber'>BASELINE</span>" : "");
+        const occ = r.theoreticalOccupancyPct
+          ? (fmtNum(r.theoreticalOccupancyPct, 0) + "% (" + (r.activeWarpsPerSm || 0) + "/" + (r.maxWarpsPerSm || 48) + " warps)")
+          : "--";
+        const safe = (r.compiledOk && r.parityPassed && r.edgeCasePassed && r.sanitizerPassed)
+          ? "<span class='badge badge-green'>VERIFIED (err=" + Number(r.maxAbsError || 0).toExponential(1) + ")</span>"
+          : "<span class='badge badge-red'>FAILED</span>";
+        tHtml += "<tr>" +
+          "<td><strong>" + escapeHtml(sp.name || sp.id) + "</strong>" + badge + "</td>" +
+          "<td>" + (sp.blockSize || "--") + " / float" + (sp.vecWidth || 1) + "</td>" +
+          "<td>" + (pt.registersPerThread || 0) + " regs / " + (pt.sharedMemBytes || 0) + " B / " + (pt.spillStoresBytes || 0) + " B</td>" +
+          "<td>" + occ + "</td>" +
+          "<td>" + fmtNum(r.medianLatencyMs, 4) + " / " + fmtNum(r.p95LatencyMs, 4) + " ms</td>" +
+          "<td>" + fmtNum(r.effectiveBwGbps, 1) + " GB/s</td>" +
+          "<td>" + fmtNum(r.energy ? r.energy.joulesPer1kRequests : 0, 2) + " J</td>" +
+          "<td>" + safe + "</td>" +
+          "</tr>";
+      });
+      tHtml += "</tbody></table>";
+      trialsBox.innerHTML = tHtml;
+    }
+  }
+
   // Code boxes
   if (rep.autotune && rep.autotune.bestResult && rep.autotune.bestResult.spec) {
     document.getElementById("optCodeBox").textContent = rep.autotune.bestResult.spec.displayKernel;
@@ -795,6 +946,7 @@ async function triggerWorkload(mode) {
       customDir: document.getElementById("modelDirInput").value.trim(),
       serverUrl: document.getElementById("llmUrl").value.trim(),
       numRequests: parseInt(document.getElementById("llmReqs").value) || 3,
+      concurrency: parseInt((document.getElementById("llmConcurrency") || {}).value) || 1,
       maxTokens: parseInt(document.getElementById("llmTokens").value) || 48,
       autoServer: true,
       opCategory: document.getElementById("opSelect").value,
@@ -849,6 +1001,7 @@ async function triggerWorkload(mode) {
       renderEBPFTrace(w.hostCudaTrace, currentState && currentState.ebpfStatus);
     }
     renderWorkloadComparison(data.modelKey);
+    loadFleetSchedule(false);
     status.textContent = (mode === "optimized" ? "With Project" : "Without Project") +
       " measured: " + fmtNum(w.throughputTokensPerS, 1) + " tok/s, " +
       fmtNum(w.avgGpuUtilPct, 0) + "% avg GPU SM, " +
@@ -918,6 +1071,9 @@ function renderWorkloadComparison(explicitKey) {
     ["Throughput", cell(b, r => fmtNum(r.throughputTokensPerS, 2) + " tok/s"), cell(o, r => fmtNum(r.throughputTokensPerS, 2) + " tok/s"), delta(r => r.throughputTokensPerS, "tok/s", false)],
     ["Latency (TTFT / TPOT)", cell(b, r => fmtNum(r.medianTtftMs, 1) + " ms / " + fmtNum(r.medianTpotMs, 1) + " ms"), cell(o, r => fmtNum(r.medianTtftMs, 1) + " ms / " + fmtNum(r.medianTpotMs, 1) + " ms"), delta(r => r.medianTpotMs, "ms/tok", true)],
     ["Energy / 1K Tokens", cell(b, r => fmtNum(r.joulesPer1kTokens, 1) + " J"), cell(o, r => fmtNum(r.joulesPer1kTokens, 1) + " J"), delta(r => r.joulesPer1kTokens, "J", true)],
+    ["Cost / 1M Tokens (On-Demand)", cell(b, r => "$" + fmtNum(r.costPer1mTokensUsd, 4)), cell(o, r => "$" + fmtNum(r.costPer1mTokensUsd, 4)), delta(r => r.costPer1mTokensUsd, "USD", true)],
+    ["Cost / 1M Tokens (Spot -65%)", cell(b, r => "$" + fmtNum(r.spotCostPer1mTokensUsd, 4)), cell(o, r => "$" + fmtNum(r.spotCostPer1mTokensUsd, 4)), delta(r => r.spotCostPer1mTokensUsd, "USD", true)],
+    ["Cost / 1K Requests", cell(b, r => "$" + fmtNum(r.costPer1kRequestsUsd, 4)), cell(o, r => "$" + fmtNum(r.costPer1kRequestsUsd, 4)), delta(r => r.costPer1kRequestsUsd, "USD", true)],
     ["eBPF Launches / Tok", cell(b, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.launchesPerOutputToken, 1) : (r.hostCudaTrace ? r.hostCudaTrace.provenance : "--")), cell(o, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.launchesPerOutputToken, 1) : (r.hostCudaTrace ? r.hostCudaTrace.provenance : "--")), (b && o && b.hostCudaTrace && b.hostCudaTrace.active && o.hostCudaTrace && o.hostCudaTrace.active) ? fmtDelta(b.launchesPerOutputToken, o.launchesPerOutputToken, "", true) : "--"],
     ["eBPF Sync Stall", cell(b, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.hostCudaTrace.syncStallMs, 1) + " ms" : "--"), cell(o, r => (r.hostCudaTrace && r.hostCudaTrace.active) ? fmtNum(r.hostCudaTrace.syncStallMs, 1) + " ms" : "--"), (b && o && b.hostCudaTrace && b.hostCudaTrace.active && o.hostCudaTrace && o.hostCudaTrace.active) ? fmtDelta(b.hostCudaTrace.syncStallMs, o.hostCudaTrace.syncStallMs, "ms", true) : "--"]
   ];
@@ -941,6 +1097,119 @@ function renderWorkloadComparison(explicitKey) {
       "<strong>Safety:</strong> " + (best.parityPassed && best.edgeCasePassed ? "PASS (Parity + Edge-Case" + (best.sanitizerPassed ? " + Sanitizer" : "") + ")" : "CHECK") +
       "</div>";
   }
+  box.innerHTML = html;
+}
+
+async function loadFleetSchedule(updateEconomics) {
+  const box = document.getElementById("fleetScheduleBox");
+  if (!box) return;
+  try {
+    if (updateEconomics) {
+      const econPayload = {
+        targetQps: parseFloat(document.getElementById("schedQpsInput").value) || 120,
+        latencySlaMs: parseFloat(document.getElementById("schedSloInput").value) || 25,
+        gpuHourlyCostUsd: parseFloat(document.getElementById("schedHourlyUsdInput").value) || 0.75,
+        spotDiscountPct: parseFloat(document.getElementById("schedSpotDiscInput").value) || 65,
+        alphaCostWeight: 0.45,
+        betaEnergyWeight: 0.35,
+        gammaMemoryWeight: 0.20,
+        electricityKwhUsd: 0.14
+      };
+      const recRes = await fetch("/api/recompute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(econPayload)
+      });
+      if (recRes.ok) {
+        const updatedRep = await recRes.json();
+        if (updatedRep && updatedRep.sevenAnswers) {
+          renderReport(updatedRep);
+        }
+      }
+    }
+
+    const sel = getSelectedModel();
+    let schedReq = {};
+    if (sel) {
+      schedReq.modelName = sel.name;
+      if (sel.sizeBytes > 0) {
+        schedReq.modelSizeMib = sel.sizeBytes / (1024 * 1024);
+      }
+    }
+    const res = await fetch("/api/schedule", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(schedReq)
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const rep = await res.json();
+    renderFleetSchedule(rep);
+  } catch (e) {
+    box.textContent = "Schedule error: " + e.message;
+  }
+}
+
+function renderFleetSchedule(rep) {
+  const box = document.getElementById("fleetScheduleBox");
+  if (!box || !rep) return;
+
+  const od = rep.recommendedOnDemandPool || {};
+  const sp = rep.recommendedSpotPool || {};
+  const mp = rep.modelProfile || {};
+
+  let html = "<div class='causal-grid' style='margin-bottom:12px;'>" +
+    "<div class='q-card safe'>" +
+      "<div class='q-title'>Recommended On-Demand Pool (" + escapeHtml(mp.modelName || "Model") + ")</div>" +
+      "<div class='q-body'><strong>" + escapeHtml(od.poolName || "--") + "</strong> &bull; " +
+      "VRAM Fit: <strong>" + (od.fitsFullVram ? "YES" : "PARTIAL") + " (" + fmtNum(od.vramUtilizationPct, 1) + "%)</strong> &bull; " +
+      "Est TPOT: <strong>" + fmtNum(od.estimatedTpotMs, 1) + " ms/tok (" + fmtNum(od.estimatedTokensPerSec, 1) + " tok/s)</strong> &bull; " +
+      "Cost: <strong>$" + fmtNum(od.costPer1mTokensUsd, 4) + " / 1M tok</strong> (" + (od.gpusRequiredForQps || 1) + " GPUs for target QPS)<br>" +
+      "<span style='color:var(--muted);font-size:0.76rem;'>Tuning: " + escapeHtml(od.recommendedQuantization || "") + " | " + escapeHtml(od.recommendedBatchFlags || "") + "</span></div>" +
+    "</div>" +
+    "<div class='q-card money'>" +
+      "<div class='q-title'>Recommended Spot / Preemptible Pool (Interruptible Batch)</div>" +
+      "<div class='q-body'><strong>" + escapeHtml(sp.poolName || "--") + "</strong> &bull; " +
+      "Spot Cost: <strong class='delta-good'>$" + fmtNum(sp.costPer1mTokensUsd, 4) + " / 1M tok</strong> &bull; " +
+      "Cost / 1K Reqs: <strong>$" + fmtNum(sp.costPer1kRequestsUsd, 4) + "</strong><br>" +
+      "<span style='color:var(--muted);font-size:0.76rem;'>Offloads BATCH_SPOT_INTERRUPTIBLE traffic onto Spot instances while keeping CRITICAL_REALTIME on primary On-Demand capacity.</span></div>" +
+    "</div>" +
+  "</div>";
+
+  // Priority Admission Control & Backpressure Table
+  html += "<div style='margin-top:8px;'><strong>Priority Admission Control &amp; Backpressure Gate:</strong></div>";
+  html += "<table><thead><tr><th>Workload Priority</th><th>Admission Action</th><th>Assigned Pool</th><th>Queue Depth Gate</th><th>Est p95 vs SLO</th><th>Micro-Batch (-ub)</th><th>Policy Reason</th></tr></thead><tbody>";
+  (rep.admissionPolicies || []).forEach(adm => {
+    const actCls = adm.action === "ADMIT_ON_DEMAND" ? "badge-green" : (adm.action === "ROUTE_TO_SPOT_POOL" ? "badge-blue" : "badge-red");
+    html += "<tr>" +
+      "<td><strong>" + escapeHtml(adm.priority) + "</strong></td>" +
+      "<td><span class='badge " + actCls + "'>" + escapeHtml(adm.action) + "</span></td>" +
+      "<td><code>" + escapeHtml(adm.assignedPoolId) + "</code></td>" +
+      "<td>" + adm.currentQueueDepth + " / " + adm.maxAllowedQueueDepth + "</td>" +
+      "<td>" + fmtNum(adm.estimatedTotalP95Ms, 1) + " ms / " + fmtNum(adm.latencySloMs, 1) + " ms</td>" +
+      "<td>" + (adm.dynamicMicroBatchSize || "--") + "</td>" +
+      "<td>" + escapeHtml(adm.reason) + "</td>" +
+      "</tr>";
+  });
+  html += "</tbody></table>";
+
+  // Multi-Strategy Scheduling Simulator Table
+  html += "<div style='margin-top:12px;'><strong>Multi-Strategy Fleet Scheduling Simulator (1,000-Request Trace):</strong></div>";
+  html += "<table><thead><tr><th>Scheduling Strategy</th><th>SLO Compliance</th><th>End-to-End Latency (p50 / p95)</th><th>Spot Traffic Share</th><th>Backpressure Shed (HTTP 429)</th><th>Cost / 1M Tokens</th><th>Cost / 1K Reqs</th><th>Savings vs Naive</th></tr></thead><tbody>";
+  (rep.strategyComparison || []).forEach(sim => {
+    const isBest = sim.strategy === "COST_SLO_WEIGHTED_PARETO";
+    html += "<tr>" +
+      "<td><strong>" + escapeHtml(sim.strategy) + "</strong>" + (isBest ? " <span class='badge badge-green'>OPTIMAL</span>" : "") + "</td>" +
+      "<td><strong>" + fmtNum(sim.sloCompliancePct, 1) + "%</strong></td>" +
+      "<td>" + fmtNum(sim.p50EndToEndLatencyMs, 1) + " / " + fmtNum(sim.p95EndToEndLatencyMs, 1) + " ms</td>" +
+      "<td>" + fmtNum(sim.spotTrafficSharePct, 1) + "% (" + sim.routedToSpotRequests + " reqs)</td>" +
+      "<td>" + sim.backpressureShed429 + " reqs</td>" +
+      "<td><strong>$" + fmtNum(sim.costPer1mTokensUsd, 4) + "</strong></td>" +
+      "<td>$" + fmtNum(sim.costPer1kRequestsUsd, 4) + "</td>" +
+      "<td><span class='" + (sim.costSavedVsNaivePct > 0 ? "delta-good" : "") + "'>-" + fmtNum(sim.costSavedVsNaivePct, 1) + "%</span></td>" +
+      "</tr>";
+  });
+  html += "</tbody></table>";
+
   box.innerHTML = html;
 }
 
