@@ -27,7 +27,9 @@ For the project overview, see [README.md](../README.md). For step-by-step setup 
 | **`dashboard`** *(default)* | `serve` | Run initial trace and start the live HTTP/SSE Web Dashboard (`http://127.0.0.1:8080`) | `./run.sh` or `./run.sh dashboard` |
 | **`optimize`** | `analyze` | Compile, sanitize, verify, and benchmark CUDA kernels in the terminal | `./run.sh optimize -op rmsnorm_residual` |
 | **`deepseek`** | — | Use a local GGUF LLM (`llama-cli`) to propose CUDA kernel configs + verify on GPU | `./run.sh deepseek -deepseek-model /path/to/model.gguf` |
-| **`workload`** | — | Benchmark end-to-end streaming LLM inference (TTFT, TPOT, tok/s, VRAM, Watts, eBPF) | `./run.sh workload -deepseek-model /path/to/model.gguf` |
+| **`workload`** | — | Benchmark end-to-end streaming LLM inference (TTFT, TPOT, tok/s, VRAM, Watts, `$/1M tok`, eBPF) | `./run.sh workload -deepseek-model /path/to/model.gguf` |
+| **`schedule`** | — | Run VRAM-aware GPU pool placement, priority admission control (`HTTP 429`), and strategy simulator | `./run.sh schedule -deepseek-model /path/to/model.gguf` |
+| **`check`** | — | CI/CD hardware regression gate (verifies speedup, `0` PTXAS spills, `compute-sanitizer`, and `1027` parity) | `./run.sh check -op rope_qkv -min-speedup 1.15` |
 | **`monitor`** | — | Print an instant GPU hardware, clock, VRAM, and live power snapshot | `./run.sh monitor` |
 | **`ebpf`** | `probe` | Inspect NVML backend, `libcuda.so.1` / `libcudart.so` paths, active GPU PIDs, and eBPF uprobes | `./run.sh ebpf` |
 | **`setcap`** | — | Grant rootless Linux eBPF capabilities to `./gpumode` and verify probe attachment | `./run.sh setcap` |
@@ -75,7 +77,7 @@ Runs the closed-loop CUDA optimization pipeline directly in the terminal (`Roofl
 ./run.sh optimize -op rmsnorm -json
 ```
 
-* **Supported `-op` values:** `rmsnorm_residual`, `rmsnorm`, `layernorm`, `softmax`, `swiglu`
+* **Supported `-op` values:** `rmsnorm_residual`, `rmsnorm`, `layernorm`, `softmax`, `swiglu`, `rope_qkv`, `qgemv_decode`, `gqa_attention`
 * **Supported `-strategy` values:** `BAYESIAN_UCB` *(default)*, `GRID_SEARCH`
 * Pass `-json` to emit the full `CausalChainReport` as formatted JSON.
 
@@ -131,7 +133,31 @@ Benchmarks real end-to-end OpenAI-compatible streaming inference (`TTFT`, `TPOT`
 
 ---
 
-### 5. `monitor`
+### 5. `schedule` (Production Fleet Cost, Placement & Admission Control Optimizer)
+
+Evaluates how a target model fits across your local GPU and cloud GPU tiers (`Local GPU`, `L4 24GB`, `A10G 24GB`, `L40S 48GB` — On-Demand & Spot), calculates `$ / 1M tokens` and `$ / 1K requests`, configures priority admission control (`CRITICAL_REALTIME`, `STANDARD_INTERACTIVE`, `BATCH_SPOT_INTERRUPTIBLE`), and simulates 3 fleet scheduling strategies (`ROUND_ROBIN`, `LEAST_LOADED_VRAM_AWARE`, `COST_SLO_WEIGHTED_PARETO`).
+
+```zsh
+# Evaluate placement and scheduling for a specific GGUF model
+./run.sh schedule -deepseek-model ~/AI/Models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf -llm-model Qwen3.5-4B-Q4_K_M
+
+# Emit full FleetScheduleReport as JSON
+./run.sh schedule -json
+```
+
+---
+
+### 6. `check` (CI/CD Hardware Regression Gate)
+
+Compiles and benchmarks the target operation on the live GPU and exits non-zero if speedup falls below `-min-speedup`, `nvcc -Xptxas -v` introduces register spills (`SpillStoresBytes > 0`), `compute-sanitizer` reports memory errors, or `hidden_dim = 1027` numerical parity fails.
+
+```zsh
+./run.sh check -op rope_qkv -batch 64 -hidden 2048 -iters 20 -min-speedup 1.15
+```
+
+---
+
+### 7. `monitor`
 
 Polls the GPU once and prints a single-line hardware and live telemetry summary (no root or eBPF capabilities required).
 
@@ -217,8 +243,10 @@ When auto-selecting a single default CLI model (`deepseek` / `workload`), filena
 | `-llm-url <url>` | `http://127.0.0.1:8081` | OpenAI-compatible or Ollama server URL for `workload` |
 | `-llm-model <name>` | Auto-discovered | Explicit served model ID/tag (e.g. `qwen2.5:7b` for Ollama) |
 | `-llm-reqs <n>` | `4` | Number of streaming inference requests in `workload` |
+| `-llm-concurrency <n>` | `1` | Concurrent client workers (`1..32`) for multi-client `workload` load testing |
 | `-llm-tokens <n>` | `48` | Max generated tokens per request in `workload` |
 | `-auto-server` | `true` | Auto-launch temporary `llama-server` using `-deepseek-model` when `-llm-url` is not running |
+| `-min-speedup <x>` | `1.10` | Minimum required speedup factor for `./run.sh check` CI hardware regression gate |
 
 ### 4. Core Hardware, Telemetry & SLA Flags
 

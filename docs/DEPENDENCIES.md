@@ -14,7 +14,7 @@
 | **NVIDIA Driver** | Provides `nvidia-smi`, `libnvidia-ml.so.1`, and `libcuda.so.1` | Loaded dynamically at runtime |
 | **CUDA Toolkit (`nvcc` & `compute-sanitizer`)** | Compiles parameterized CUDA C++ kernels (`-Xptxas -v`) and runs `memcheck` verification | Auto-resolved via `GPUMODE_*`, `PATH`, `CUDA_HOME`, `/opt/cuda/bin`, `/usr/local/cuda/bin` |
 | **Go Toolchain** | Builds the `gpumode` daemon and CLI (`go.mod` specifies Go `1.26` / `1.23+` compatible) | `go build -o ./gpumode ./cmd/gpumode` |
-| **Python 3 (`python3`)** | Executes `scripts/profile_pytorch.py` | Falls back cleanly if `torch` is not installed |
+| **Python 3 (`python3` / `.venv`)** | Executes `scripts/profile_pytorch.py` (`torch.profiler` + `torch.utils.cpp_extension.load_inline`) | Auto-discovers `.venv/bin/python3` first; falls back cleanly if `torch` is not installed |
 | **Zsh (`zsh`)** | Executes `./run.sh` wrapper script | `/usr/bin/env zsh` |
 
 ---
