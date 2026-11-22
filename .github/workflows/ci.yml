@@ -25,7 +25,7 @@ jobs:
       - name: Install system build & eBPF dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc clang llvm libcap2-bin zsh python3
+          sudo apt-get install -y gcc gcc-multilib clang llvm libbpf-dev linux-libc-dev libcap2-bin zsh python3
 
       - name: Set up Go
         uses: actions/setup-go@v5

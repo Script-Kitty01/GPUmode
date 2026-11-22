@@ -19,6 +19,7 @@ permissions:
 env:
   GOTOOLCHAIN: auto
   CGO_ENABLED: "1"
+  GOFLAGS: "-buildvcs=false"
 
 jobs:
   cuda-nvcc-compilation-and-ptxas-verify:

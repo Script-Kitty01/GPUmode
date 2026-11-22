@@ -13,6 +13,7 @@ permissions:
 env:
   GOTOOLCHAIN: auto
   CGO_ENABLED: "1"
+  GOFLAGS: "-buildvcs=false"
 
 jobs:
   linux-distro-compatibility:
