@@ -41,18 +41,18 @@ type Diagnosis struct {
 	OpName                      string          `json:"opName"`
 	Category                    string          `json:"category"`
 	Classification              BottleneckClass `json:"classification"`
-	ArithmeticIntensity         float64         `json:"arithmeticIntensity"`         // FLOPs / Byte
-	HardwareRidgePoint          float64         `json:"hardwareRidgePoint"`          // Peak FLOPs / Peak Bandwidth
-	RooflineCeilingTFLOPS       float64         `json:"rooflineCeilingTflops"`       // Min(PeakFP32, AI * PeakBW)
+	ArithmeticIntensity         float64         `json:"arithmeticIntensity"`   // FLOPs / Byte
+	HardwareRidgePoint          float64         `json:"hardwareRidgePoint"`    // Peak FLOPs / Peak Bandwidth
+	RooflineCeilingTFLOPS       float64         `json:"rooflineCeilingTflops"` // Min(PeakFP32, AI * PeakBW)
 	TensorCoreFP16CeilingTFLOPS float64         `json:"tensorCoreFp16CeilingTflops,omitempty"`
 	EmpiricalDRAMCeilingGBps    float64         `json:"empiricalDramCeilingGbps,omitempty"`
 	EmpiricalL2CeilingGBps      float64         `json:"empiricalL2CeilingGbps,omitempty"`
-	AchievedTFLOPS              float64         `json:"achievedTflops"`              // FLOPs / (LatencySec * 1e12)
-	AchievedBandwidthGBps       float64         `json:"achievedBandwidthGbps"`       // Bytes / (LatencySec * 1e9)
-	ComputeUtilizationPct       float64         `json:"computeUtilizationPct"`       // AchievedTFLOPS / PeakFP32TFLOPS * 100
-	BandwidthUtilizationPct     float64         `json:"bandwidthUtilizationPct"`     // AchievedBW / PeakBW * 100
+	AchievedTFLOPS              float64         `json:"achievedTflops"`          // FLOPs / (LatencySec * 1e12)
+	AchievedBandwidthGBps       float64         `json:"achievedBandwidthGbps"`   // Bytes / (LatencySec * 1e9)
+	ComputeUtilizationPct       float64         `json:"computeUtilizationPct"`   // AchievedTFLOPS / PeakFP32TFLOPS * 100
+	BandwidthUtilizationPct     float64         `json:"bandwidthUtilizationPct"` // AchievedBW / PeakBW * 100
 	L2BandwidthUtilizationPct   float64         `json:"l2BandwidthUtilizationPct,omitempty"`
-	RooflineEfficiencyPct       float64         `json:"rooflineEfficiencyPct"`       // AchievedTFLOPS / RooflineCeilingTFLOPS * 100
+	RooflineEfficiencyPct       float64         `json:"rooflineEfficiencyPct"` // AchievedTFLOPS / RooflineCeilingTFLOPS * 100
 	LaunchCount                 int             `json:"launchCount,omitempty"`
 	HostLaunchGapUS             float64         `json:"hostLaunchGapUs,omitempty"`
 	HostSyncStallPct            float64         `json:"hostSyncStallPct,omitempty"`

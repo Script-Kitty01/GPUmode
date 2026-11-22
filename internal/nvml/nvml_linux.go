@@ -490,7 +490,7 @@ var defaultLibCandidates = []string{
 type Client struct {
 	mu      sync.Mutex
 	handle  unsafe.Pointer
-	syms    C.gpumode_nvml_syms_t
+	syms    *C.gpumode_nvml_syms_t
 	libPath string
 	closed  bool
 }
@@ -519,22 +519,30 @@ func openWithLibPath(libPath string) (*Client, error) {
 			continue
 		}
 
-		var syms C.gpumode_nvml_syms_t
-		var missingSym *C.char
-		if C.gpumode_load_syms(handle, &syms, &missingSym) != 0 {
+		symsPtr := (*C.gpumode_nvml_syms_t)(C.calloc(1, C.size_t(unsafe.Sizeof(C.gpumode_nvml_syms_t{}))))
+		if symsPtr == nil {
 			C.dlclose(handle)
-			return nil, fmt.Errorf("%w: missing symbol %s in %q", ErrUnavailable, C.GoString(missingSym), cand)
+			return nil, fmt.Errorf("%w: calloc failed for %q", ErrUnavailable, cand)
 		}
 
-		if rc := C.gpumode_call_init(&syms); rc != C.GPUMODE_NVML_SUCCESS {
-			errText := nvmlErrorText(&syms, rc)
+		var missingSym *C.char
+		if C.gpumode_load_syms(handle, symsPtr, &missingSym) != 0 {
+			missingName := C.GoString(missingSym)
+			C.free(unsafe.Pointer(symsPtr))
+			C.dlclose(handle)
+			return nil, fmt.Errorf("%w: missing symbol %s in %q", ErrUnavailable, missingName, cand)
+		}
+
+		if rc := C.gpumode_call_init(symsPtr); rc != C.GPUMODE_NVML_SUCCESS {
+			errText := nvmlErrorText(symsPtr, rc)
+			C.free(unsafe.Pointer(symsPtr))
 			C.dlclose(handle)
 			return nil, fmt.Errorf("%w: nvmlInit failed (%s) in %q", ErrUnavailable, errText, cand)
 		}
 
 		return &Client{
 			handle:  handle,
-			syms:    syms,
+			syms:    symsPtr,
 			libPath: cand,
 		}, nil
 	}
@@ -546,8 +554,10 @@ func openWithLibPath(libPath string) (*Client, error) {
 }
 
 func nvmlErrorText(syms *C.gpumode_nvml_syms_t, rc C.gpumode_nvmlReturn_t) string {
-	if cStr := C.gpumode_call_error_string(syms, rc); cStr != nil {
-		return fmt.Sprintf("%s (code %d)", C.GoString(cStr), int(rc))
+	if syms != nil {
+		if cStr := C.gpumode_call_error_string(syms, rc); cStr != nil {
+			return fmt.Sprintf("%s (code %d)", C.GoString(cStr), int(rc))
+		}
 	}
 	return fmt.Sprintf("nvml error code %d", int(rc))
 }
@@ -566,8 +576,12 @@ func (c *Client) Close() error {
 
 	var shutdownErr error
 	if c.handle != nil {
-		if rc := C.gpumode_call_shutdown(&c.syms); rc != C.GPUMODE_NVML_SUCCESS {
-			shutdownErr = fmt.Errorf("nvml: nvmlShutdown failed: %s", nvmlErrorText(&c.syms, rc))
+		if c.syms != nil {
+			if rc := C.gpumode_call_shutdown(c.syms); rc != C.GPUMODE_NVML_SUCCESS {
+				shutdownErr = fmt.Errorf("nvml: nvmlShutdown failed: %s", nvmlErrorText(c.syms, rc))
+			}
+			C.free(unsafe.Pointer(c.syms))
+			c.syms = nil
 		}
 		C.dlclose(c.handle)
 		c.handle = nil
@@ -595,8 +609,8 @@ func (c *Client) DeviceCount() (int, error) {
 	}
 
 	var count C.uint
-	if rc := C.gpumode_call_device_count(&c.syms, &count); rc != C.GPUMODE_NVML_SUCCESS {
-		return 0, fmt.Errorf("nvml: nvmlDeviceGetCount failed: %s", nvmlErrorText(&c.syms, rc))
+	if rc := C.gpumode_call_device_count(c.syms, &count); rc != C.GPUMODE_NVML_SUCCESS {
+		return 0, fmt.Errorf("nvml: nvmlDeviceGetCount failed: %s", nvmlErrorText(c.syms, rc))
 	}
 	return int(count), nil
 }
@@ -618,12 +632,12 @@ func (c *Client) SampleDevice(gpuIndex int) (DeviceSample, error) {
 
 	var raw C.gpumode_nvml_raw_sample_t
 	var failedStep *C.char
-	if rc := C.gpumode_sample_device(&c.syms, C.uint(gpuIndex), &raw, &failedStep); rc != C.GPUMODE_NVML_SUCCESS {
+	if rc := C.gpumode_sample_device(c.syms, C.uint(gpuIndex), &raw, &failedStep); rc != C.GPUMODE_NVML_SUCCESS {
 		return DeviceSample{}, fmt.Errorf(
 			"nvml: %s failed for gpu %d: %s",
 			C.GoString(failedStep),
 			gpuIndex,
-			nvmlErrorText(&c.syms, rc),
+			nvmlErrorText(c.syms, rc),
 		)
 	}
 
@@ -666,13 +680,13 @@ func (c *Client) ListComputeProcesses(gpuIndex int) ([]ComputeProcess, error) {
 	var rawProcs *C.gpumode_nvml_raw_proc_t
 	var count C.uint
 	var failedStep *C.char
-	rc := C.gpumode_list_compute_procs(&c.syms, C.uint(gpuIndex), &rawProcs, &count, &failedStep)
+	rc := C.gpumode_list_compute_procs(c.syms, C.uint(gpuIndex), &rawProcs, &count, &failedStep)
 	if rc != C.GPUMODE_NVML_SUCCESS {
 		return nil, fmt.Errorf(
 			"nvml: %s failed for gpu %d: %s",
 			C.GoString(failedStep),
 			gpuIndex,
-			nvmlErrorText(&c.syms, rc),
+			nvmlErrorText(c.syms, rc),
 		)
 	}
 	if rawProcs != nil {

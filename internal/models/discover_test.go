@@ -147,4 +147,3 @@ func TestResolveDirectModelPath(t *testing.T) {
 		}
 	}
 }
-

@@ -28,7 +28,22 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 	cfg := config.DefaultDaemonConfig()
 	cfg.DataDir = t.TempDir()
 
-	hw, _ := physics.DetectHardware(ctx, cfg.NVCCPath, cfg.NvidiaSMIPath)
+	hw, hwErr := physics.DetectHardware(ctx, cfg.NVCCPath, cfg.NvidiaSMIPath)
+	if hwErr != nil {
+		hw = physics.GPUHardwareSpec{
+			Name:                       "Mock CI GPU",
+			ComputeCapability:          "8.9",
+			ArchFlag:                   "sm_89",
+			SMCount:                    20,
+			TotalVRAMMiB:               6141,
+			PeakFP32TFLOPS:             10.5,
+			PeakMemBandwidthGBps:       192.0,
+			EmpiricalDRAMBandwidthGBps: 151.0,
+			EmpiricalL2BandwidthGBps:   580.0,
+			RidgePointFLOPsPerByte:     54.8,
+			TDPWatts:                   65.0,
+		}
+	}
 	mon := telemetry.NewMonitorWithBackend(cfg.NvidiaSMIPath, cfg.GPUIndex, 200*time.Millisecond, 30, telemetry.ParseBackendMode(cfg.TelemetryBackend))
 	defer mon.Close()
 	runner := harness.NewRunner(cfg.NVCCPath, cfg.SanitizerPath, hw.ArchFlag, 2, 20*time.Second, mon)
@@ -167,8 +182,8 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 	if err := json.NewDecoder(res2.Body).Decode(&rep); err != nil {
 		t.Fatalf("failed to decode optimize report: %v", err)
 	}
-	if rep.EconomicsComparison.SpeedupFactor <= 1.0 {
-		t.Fatalf("expected >1.0x speedup from POST /api/optimize, got %.2f", rep.EconomicsComparison.SpeedupFactor)
+	if hwErr == nil && rep.EconomicsComparison.SpeedupFactor <= 1.0 {
+		t.Fatalf("expected >1.0x speedup from POST /api/optimize on live GPU, got %.2f", rep.EconomicsComparison.SpeedupFactor)
 	}
 
 	// 3. POST /api/recompute with updated QPS/SLA

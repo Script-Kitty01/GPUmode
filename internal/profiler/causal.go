@@ -77,24 +77,24 @@ type SevenQuestionAnswers struct {
 // CausalChainReport is the unified closed-loop output of gpuMode:
 // Observe -> Diagnose -> Optimize -> Verify -> Measure Energy -> Multi-Objective Pareto -> Recommend.
 type CausalChainReport struct {
-	ID                    string                       `json:"id"`
-	Timestamp             time.Time                    `json:"timestamp"`
-	OpCategory            string                       `json:"opCategory"`
-	BatchSize             int                          `json:"batchSize"`
-	HiddenDim             int                          `json:"hiddenDim"`
-	Strategy              optimizer.TuningStrategy     `json:"strategy"`
-	Hardware             physics.GPUHardwareSpec         `json:"hardware"`
-	TelemetryBackend     string                          `json:"telemetryBackend,omitempty"`
-	HostCUDATrace        ebpftrace.Summary               `json:"hostCudaTrace"`
-	EconomicsConfig      config.EconomicsConfig          `json:"economicsConfig"`
-	Trace                 PyTorchTrace                 `json:"trace"`
-	BaselineRoofline      roofline.Diagnosis           `json:"baselineRoofline"`
-	OptimizedRoofline     roofline.Diagnosis           `json:"optimizedRoofline"`
-	RooflinePoints        []roofline.RooflinePoint     `json:"rooflinePoints"`
-	Autotune              optimizer.AutotuneSummary    `json:"autotune"`
-	EconomicsComparison   physics.SavingsComparison    `json:"economicsComparison"`
-	SevenAnswers          SevenQuestionAnswers         `json:"sevenAnswers"`
-	PyTorchExtensionCode  string                       `json:"pytorchExtensionCode"`
+	ID                   string                    `json:"id"`
+	Timestamp            time.Time                 `json:"timestamp"`
+	OpCategory           string                    `json:"opCategory"`
+	BatchSize            int                       `json:"batchSize"`
+	HiddenDim            int                       `json:"hiddenDim"`
+	Strategy             optimizer.TuningStrategy  `json:"strategy"`
+	Hardware             physics.GPUHardwareSpec   `json:"hardware"`
+	TelemetryBackend     string                    `json:"telemetryBackend,omitempty"`
+	HostCUDATrace        ebpftrace.Summary         `json:"hostCudaTrace"`
+	EconomicsConfig      config.EconomicsConfig    `json:"economicsConfig"`
+	Trace                PyTorchTrace              `json:"trace"`
+	BaselineRoofline     roofline.Diagnosis        `json:"baselineRoofline"`
+	OptimizedRoofline    roofline.Diagnosis        `json:"optimizedRoofline"`
+	RooflinePoints       []roofline.RooflinePoint  `json:"rooflinePoints"`
+	Autotune             optimizer.AutotuneSummary `json:"autotune"`
+	EconomicsComparison  physics.SavingsComparison `json:"economicsComparison"`
+	SevenAnswers         SevenQuestionAnswers      `json:"sevenAnswers"`
+	PyTorchExtensionCode string                    `json:"pytorchExtensionCode"`
 }
 
 // Pipeline coordinates the engines to produce a hardware-verified CausalChainReport.

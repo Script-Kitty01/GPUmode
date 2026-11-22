@@ -71,16 +71,16 @@ type PlacementOption struct {
 
 // AdmissionDecision records the backpressure and routing decision for an incoming workload class.
 type AdmissionDecision struct {
-	Priority               WorkloadPriority `json:"priority"`
-	CurrentQueueDepth      int              `json:"currentQueueDepth"`
-	MaxAllowedQueueDepth   int              `json:"maxAllowedQueueDepth"`
-	EstimatedQueueWaitMS   float64          `json:"estimatedQueueWaitMs"`
-	EstimatedTotalP95MS    float64          `json:"estimatedTotalP95Ms"`
-	LatencySLOMS           float64          `json:"latencySloMs"`
-	Action                 string           `json:"action"` // "ADMIT_ON_DEMAND", "ROUTE_TO_SPOT_POOL", "BACKPRESSURE_SHED_429"
-	AssignedPoolID         string           `json:"assignedPoolId"`
-	DynamicMicroBatchSize  int              `json:"dynamicMicroBatchSize"`
-	Reason                 string           `json:"reason"`
+	Priority              WorkloadPriority `json:"priority"`
+	CurrentQueueDepth     int              `json:"currentQueueDepth"`
+	MaxAllowedQueueDepth  int              `json:"maxAllowedQueueDepth"`
+	EstimatedQueueWaitMS  float64          `json:"estimatedQueueWaitMs"`
+	EstimatedTotalP95MS   float64          `json:"estimatedTotalP95Ms"`
+	LatencySLOMS          float64          `json:"latencySloMs"`
+	Action                string           `json:"action"` // "ADMIT_ON_DEMAND", "ROUTE_TO_SPOT_POOL", "BACKPRESSURE_SHED_429"
+	AssignedPoolID        string           `json:"assignedPoolId"`
+	DynamicMicroBatchSize int              `json:"dynamicMicroBatchSize"`
+	Reason                string           `json:"reason"`
 }
 
 // StrategySimulationResult compares a scheduling strategy across a bursty multi-priority request trace.

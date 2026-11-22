@@ -2,7 +2,10 @@ package harness
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,4 +174,103 @@ int main() {
 		t.Errorf("expected HIGH MeasurementConfidence with burst polling, got %q (unc=%.2f%%, samples=%d)",
 			em.MeasurementConfidence, em.EnergyUncertaintyPct, em.SampleCount)
 	}
+}
+
+// createFakeNVCC creates a lightweight shell compiler that compiles a shell payload as the output binary,
+// allowing deterministic testing of interrupted CUDA processes, sanitizer faults, and corrupt output even on CPU-only CI runners.
+func createFakeNVCC(t *testing.T, dir, binaryBody string) string {
+	t.Helper()
+	fakeNVCC := filepath.Join(dir, "fake-nvcc")
+	script := `#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+  else
+    shift 1
+  fi
+done
+echo "ptxas info : Used 28 registers, 512 bytes smem, 0 bytes spill stores" >&2
+cat << 'INNER_EOF' > "$out"
+` + binaryBody + `
+INNER_EOF
+chmod +x "$out"
+exit 0
+`
+	if err := os.WriteFile(fakeNVCC, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake-nvcc: %v", err)
+	}
+	return fakeNVCC
+}
+
+func TestFailurePathsMissingCompilerInterruptedProcessAndSanitizerFault(t *testing.T) {
+	t.Run("missing nvcc compiler binary fails cleanly", func(t *testing.T) {
+		r := NewRunner("/nonexistent/nvcc-missing", "", "sm_89", 1, 2*time.Second, nil)
+		r.RunSanitizer = false
+		res := r.EvaluateBatch(context.Background(), []KernelSpec{{ID: "k1", CUDASource: "__global__ void k(){}"}})
+		if len(res) != 1 || res[0].CompiledOK || !strings.Contains(res[0].ErrorMessage, "nvcc error") {
+			t.Fatalf("expected missing nvcc compile failure, got: %+v", res)
+		}
+	})
+
+	t.Run("interrupted or hung CUDA kernel process killed by KernelTimeout", func(t *testing.T) {
+		dir := t.TempDir()
+		hungBin := "#!/bin/sh\nsleep 5\n"
+		fakeNVCC := createFakeNVCC(t, dir, hungBin)
+
+		r := NewRunner(fakeNVCC, "", "sm_89", 1, 150*time.Millisecond, nil)
+		r.RunSanitizer = false
+		r.RepeatWindows = 1
+
+		start := time.Now()
+		res := r.EvaluateBatch(context.Background(), []KernelSpec{{ID: "hung_kern", BlockSize: 256, CUDASource: "// test"}})
+		elapsed := time.Since(start)
+
+		if len(res) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(res))
+		}
+		if !res[0].CompiledOK {
+			t.Fatalf("expected fake compilation to succeed, got: %s", res[0].ErrorMessage)
+		}
+		if res[0].ParityPassed || !strings.Contains(res[0].ErrorMessage, "kernel execution failed") {
+			t.Fatalf("expected hung process timeout failure, got: %+v", res[0])
+		}
+		if elapsed > 3*time.Second {
+			t.Errorf("expected hung process to be killed promptly by 150ms KernelTimeout, took %v", elapsed)
+		}
+	})
+
+	t.Run("compute-sanitizer memory fault rejects kernel before benchmarking", func(t *testing.T) {
+		dir := t.TempDir()
+		okBin := "#!/bin/sh\necho '{\"parityPassed\":true,\"edgeCasePassed\":true,\"medianLatencyMs\":0.2}'\n"
+		fakeNVCC := createFakeNVCC(t, dir, okBin)
+
+		fakeSanitizer := filepath.Join(dir, "fake-sanitizer")
+		sanScript := "#!/bin/sh\necho '========= Invalid __global__ write of size 4'\necho '========= ERROR SUMMARY: 1 error'\nexit 99\n"
+		if err := os.WriteFile(fakeSanitizer, []byte(sanScript), 0o755); err != nil {
+			t.Fatalf("write fake-sanitizer: %v", err)
+		}
+
+		r := NewRunner(fakeNVCC, fakeSanitizer, "sm_89", 1, 2*time.Second, nil)
+		r.RunSanitizer = true
+		res := r.EvaluateBatch(context.Background(), []KernelSpec{{ID: "oob_kern", BlockSize: 256, CUDASource: "// oob"}})
+		if len(res) != 1 || res[0].SanitizerPassed || !strings.Contains(res[0].ErrorMessage, "compute-sanitizer failed") {
+			t.Fatalf("expected compute-sanitizer rejection, got: %+v", res)
+		}
+	})
+
+	t.Run("aborted CUDA process emitting truncated non-JSON output", func(t *testing.T) {
+		dir := t.TempDir()
+		corruptBin := "#!/bin/sh\necho 'CUDA error: an illegal memory access was encountered (truncated)'\nexit 0\n"
+		fakeNVCC := createFakeNVCC(t, dir, corruptBin)
+
+		r := NewRunner(fakeNVCC, "", "sm_89", 1, 2*time.Second, nil)
+		r.RunSanitizer = false
+		r.RepeatWindows = 1
+		res := r.EvaluateBatch(context.Background(), []KernelSpec{{ID: "corrupt_kern", BlockSize: 256, CUDASource: "// corrupt"}})
+		if len(res) != 1 || !strings.Contains(res[0].ErrorMessage, "failed to parse harness JSON output") {
+			t.Fatalf("expected truncated JSON parse error, got: %+v", res)
+		}
+	})
 }

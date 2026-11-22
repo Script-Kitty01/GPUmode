@@ -1,0 +1,58 @@
+name: Go Tests, Static Analysis & eBPF CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: auto
+  CGO_ENABLED: "1"
+
+jobs:
+  go-static-analysis-and-test:
+    name: Go Vet, Lint, eBPF & Unit/Mocked-NVML Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system build & eBPF dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc clang llvm libcap2-bin zsh python3
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Verify gofmt formatting
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal ./frontend)
+          if [ -n "$unformatted" ]; then
+            echo "The following Go files are not formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run go vet static analysis
+        run: go vet ./...
+
+      - name: Verify eBPF C bytecode & bpf2go codegen
+        run: go generate ./internal/ebpftrace/...
+
+      - name: Build gpumode binary
+        run: go build -v -o ./gpumode ./cmd/gpumode
+
+      - name: Verify Python profiler standalone fallback
+        run: python3 ./scripts/profile_pytorch.py --batch 64 --hidden 1024 --iters 2 > /dev/null
+
+      - name: Run unit, mocked-NVML (.so dlopen), and failure-path test suite
+        run: go test -v -race ./...

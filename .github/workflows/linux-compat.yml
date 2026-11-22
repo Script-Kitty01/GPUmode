@@ -1,0 +1,70 @@
+name: Linux Distribution Installation & Compatibility Matrix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: auto
+  CGO_ENABLED: "1"
+
+jobs:
+  linux-distro-compatibility:
+    name: Distro Compatibility (${{ matrix.distro_name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro_name: "Ubuntu 22.04 LTS (Jammy)"
+            image: "ubuntu:22.04"
+            pkg_family: "apt"
+          - distro_name: "Ubuntu 24.04 LTS (Noble)"
+            image: "ubuntu:24.04"
+            pkg_family: "apt"
+          - distro_name: "Debian 12 (Bookworm)"
+            image: "debian:bookworm"
+            pkg_family: "apt"
+          - distro_name: "Fedora 41"
+            image: "fedora:41"
+            pkg_family: "dnf"
+          - distro_name: "Arch Linux"
+            image: "archlinux:latest"
+            pkg_family: "pacman"
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Install OS packages, GCC, Zsh, Python 3 & Go bootstrap
+        run: |
+          set -e
+          case "${{ matrix.pkg_family }}" in
+            apt)
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y ca-certificates curl git gcc libc6-dev zsh python3 libcap2-bin
+              ;;
+            dnf)
+              dnf install -y ca-certificates curl git gcc glibc-devel zsh python3 libcap
+              ;;
+            pacman)
+              pacman -Sy --noconfirm ca-certificates curl git gcc zsh python libcap
+              ;;
+          esac
+          curl -fsSL https://go.dev/dl/go1.24.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build gpumode & verify modular frontend + mocked NVML dlopen compatibility
+        run: |
+          export PATH="/usr/local/go/bin:$PATH"
+          go build -v -o ./gpumode ./cmd/gpumode
+          python3 ./scripts/profile_pytorch.py --batch 32 --hidden 1024 --iters 2 > /dev/null
+          go test -v ./internal/config/... ./internal/nvml/... ./internal/telemetry/... ./internal/harness/... ./internal/scheduler/... ./internal/ebpftrace/... ./internal/pareto/... ./internal/roofline/... ./internal/store/... ./internal/models/...

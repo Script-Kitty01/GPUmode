@@ -310,6 +310,7 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 			sCtx, sCancel := context.WithTimeout(ctx, r.KernelTimeout)
 			sCmd := exec.CommandContext(sCtx, r.SanitizerPath, "--tool", "memcheck", "--error-exitcode", "99", art.binPath, "--verify-only")
 			sCmd.Env = r.cudaExecEnv()
+			sCmd.WaitDelay = 150 * time.Millisecond
 			var sOut bytes.Buffer
 			sCmd.Stdout = &sOut
 			sCmd.Stderr = &sOut
@@ -386,6 +387,7 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 		bCtx, bCancel := context.WithTimeout(ctx, r.KernelTimeout)
 		bCmd := exec.CommandContext(bCtx, art.binPath)
 		bCmd.Env = r.cudaExecEnv()
+		bCmd.WaitDelay = 150 * time.Millisecond
 		var bOut, bErr bytes.Buffer
 		bCmd.Stdout = &bOut
 		bCmd.Stderr = &bErr

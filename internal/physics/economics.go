@@ -30,15 +30,15 @@ type BusinessKPIs struct {
 
 // SavingsComparison quantifies the hardware, energy, and financial improvement between a baseline and optimized workload.
 type SavingsComparison struct {
-	Baseline             BusinessKPIs `json:"baseline"`
-	Optimized            BusinessKPIs `json:"optimized"`
-	SpeedupFactor        float64      `json:"speedupFactor"`
-	ThroughputGainPct    float64      `json:"throughputGainPct"`
-	EnergySavedPct       float64      `json:"energySavedPct"`
-	VRAMReductionMiB     float64      `json:"vramReductionMib"`
-	GPUsEliminated       int          `json:"gpusEliminated"`
-	UnitCostSavedPct     float64      `json:"unitCostSavedPct"`
-	AnnualFleetSavedUSD  float64      `json:"annualFleetSavedUsd"`
+	Baseline            BusinessKPIs `json:"baseline"`
+	Optimized           BusinessKPIs `json:"optimized"`
+	SpeedupFactor       float64      `json:"speedupFactor"`
+	ThroughputGainPct   float64      `json:"throughputGainPct"`
+	EnergySavedPct      float64      `json:"energySavedPct"`
+	VRAMReductionMiB    float64      `json:"vramReductionMib"`
+	GPUsEliminated      int          `json:"gpusEliminated"`
+	UnitCostSavedPct    float64      `json:"unitCostSavedPct"`
+	AnnualFleetSavedUSD float64      `json:"annualFleetSavedUsd"`
 }
 
 // ComputeBusinessKPIs summarizes measured GPU latency, energy, and capacity against target QPS and SLA.

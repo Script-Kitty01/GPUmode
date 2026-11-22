@@ -203,4 +203,3 @@ func TestRecomputeEconomicsAndSevenAnswersHostCUDATrace(t *testing.T) {
 		t.Fatalf("did not expect [MEASURED_EBPF] in Q2 when eBPF trace is inactive: %s", updatedUnpriv.SevenAnswers.Q2WhichOpsResponsible)
 	}
 }
-

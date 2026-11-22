@@ -2,7 +2,9 @@ package physics
 
 import (
 	"context"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -59,6 +61,20 @@ func TestDetectHardwareLiveAndFailure(t *testing.T) {
 	if invalidSpec.Name != "" || invalidSpec.ArchFlag != "" || invalidSpec.SMCount != 0 ||
 		invalidSpec.PeakFP32TFLOPS != 0 || invalidSpec.PeakMemBandwidthGBps != 0 {
 		t.Errorf("expected no fabricated hardware spec on probe failure, got %+v", invalidSpec)
+	}
+
+	// 3. Test driver communication failure and incomplete CSV output from nvidia-smi when nvcc is missing.
+	dir := t.TempDir()
+	failingSMI := filepath.Join(dir, "nvidia-smi-fail")
+	_ = os.WriteFile(failingSMI, []byte("#!/bin/sh\necho 'NVIDIA-SMI has failed because it could not communicate with the NVIDIA driver.' >&2\nexit 9\n"), 0o755)
+	if _, err := DetectHardwareForDevice(ctx, 0, "/nonexistent/nvcc", failingSMI); err == nil {
+		t.Errorf("expected error when nvidia-smi exits with driver communication failure")
+	}
+
+	malformedSMI := filepath.Join(dir, "nvidia-smi-malformed")
+	_ = os.WriteFile(malformedSMI, []byte("#!/bin/sh\necho 'NVIDIA Test GPU, 8.9'\n"), 0o755)
+	if _, err := DetectHardwareForDevice(ctx, 0, "/nonexistent/nvcc", malformedSMI); err == nil {
+		t.Errorf("expected error when nvidia-smi returns incomplete CSV columns and nvcc is absent")
 	}
 }
 

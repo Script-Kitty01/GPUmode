@@ -4,6 +4,9 @@ import (
 	"context"
 	"math"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -421,3 +424,100 @@ func TestIntegrateSamplesWindowGPUUtilStats(t *testing.T) {
 	}
 }
 
+func TestMonitorWithMockedNVMLAndSMIFallbackFailurePaths(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("mock NVML dlopen test requires Linux")
+	}
+	gccPath, err := exec.LookPath("gcc")
+	if err != nil {
+		t.Skip("gcc not available; skipping mock NVML monitor test")
+	}
+
+	dir := t.TempDir()
+	cPath := filepath.Join(dir, "mock_nvml_mon.c")
+	soPath := filepath.Join(dir, "libnvidia-ml.so.1")
+	cSrc := `
+#include <stdlib.h>
+#include <string.h>
+typedef int nvmlReturn_t;
+typedef void* nvmlDevice_t;
+typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilization_t;
+typedef struct { unsigned long long total; unsigned long long free; unsigned long long used; } nvmlMemory_t;
+typedef struct { unsigned int pid; unsigned long long usedGpuMemory; unsigned int gId; unsigned int cId; } nvmlProcessInfo_v2_t;
+
+nvmlReturn_t nvmlInit_v2(void) { return 0; }
+nvmlReturn_t nvmlShutdown(void) { return 0; }
+const char* nvmlErrorString(nvmlReturn_t r) { return "Mock Error"; }
+nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int* c) { *c = 1; return 0; }
+nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int idx, nvmlDevice_t* d) { *d = (void*)0x1; return 0; }
+nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t d, char* n, unsigned int c) { strncpy(n, "NVIDIA L40S Mock", c-1); n[c-1]=0; return 0; }
+nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t d, unsigned int* mw) {
+    const char* f = getenv("MOCK_FAIL_SAMPLE");
+    if (f && f[0] == '1') return 99;
+    *mw = 180000;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t d, int t, unsigned int* m) { *m = (t==1)?2100:5000; return 0; }
+nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t d, int s, unsigned int* t) { *t = 54; return 0; }
+nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t d, nvmlUtilization_t* u) { u->gpu = 88; u->memory = 62; return 0; }
+nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t d, nvmlMemory_t* m) { m->total = 48ULL<<30; m->used = 12ULL<<30; m->free = 36ULL<<30; return 0; }
+nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t d, unsigned int* c, nvmlProcessInfo_v2_t* p) {
+    if (!p || *c < 1) { *c = 1; return 7; }
+    p[0].pid = 77777;
+    p[0].usedGpuMemory = 1024ULL<<20;
+    *c = 1;
+    return 0;
+}
+`
+	if err := os.WriteFile(cPath, []byte(cSrc), 0o600); err != nil {
+		t.Fatalf("write mock_nvml_mon.c: %v", err)
+	}
+	if out, err := exec.Command(gccPath, "-shared", "-fPIC", cPath, "-o", soPath).CombinedOutput(); err != nil {
+		t.Fatalf("compile mock_nvml_mon.so: %v (%s)", err, string(out))
+	}
+
+	// Create a fake nvidia-smi script to verify automatic fallback when NVML sample fails in BackendAuto
+	fakeSMI := filepath.Join(dir, "nvidia-smi")
+	smiScript := "#!/bin/sh\necho 'NVIDIA L40S SMI Fallback, 175.50, 2050, 5000, 55, 85, 60, 12288, 49152'\n"
+	if err := os.WriteFile(fakeSMI, []byte(smiScript), 0o755); err != nil {
+		t.Fatalf("write fake nvidia-smi: %v", err)
+	}
+
+	t.Setenv("GPUMODE_NVML_LIB", soPath)
+	t.Setenv("MOCK_FAIL_SAMPLE", "")
+	mon := NewMonitorWithBackend(fakeSMI, 0, 10*time.Millisecond, 32, BackendAuto)
+	defer mon.Close()
+
+	if mon.Backend() != "NVML" {
+		t.Fatalf("expected Backend() == NVML with mocked libnvidia-ml.so.1, got %q", mon.Backend())
+	}
+	s, err := mon.PollOnce(context.Background())
+	if err != nil {
+		t.Fatalf("PollOnce with mocked NVML failed: %v", err)
+	}
+	if s.GPUName != "NVIDIA L40S Mock" || s.PowerWatts != 180.0 || s.Source != "NVML" {
+		t.Fatalf("unexpected mocked NVML sample: %+v", s)
+	}
+	pids := mon.ActiveComputePIDs()
+	if len(pids) != 1 || pids[0] != 77777 {
+		t.Fatalf("expected ActiveComputePIDs=[77777], got %v", pids)
+	}
+
+	// Simulate NVML runtime device failure -> BackendAuto must fall back to fake nvidia-smi seamlessly
+	t.Setenv("MOCK_FAIL_SAMPLE", "1")
+	fbSample, err := mon.PollOnce(context.Background())
+	if err != nil {
+		t.Fatalf("expected BackendAuto fallback to fake nvidia-smi on NVML error, got: %v", err)
+	}
+	if fbSample.GPUName != "NVIDIA L40S SMI Fallback" || fbSample.Source != "NVIDIA_SMI" {
+		t.Fatalf("unexpected fallback sample: %+v", fbSample)
+	}
+
+	// Simulate missing nvidia-smi binary when NVML is closed
+	_ = mon.Close()
+	badMon := NewMonitorWithBackend("/nonexistent/nvidia-smi-missing", 0, 20*time.Millisecond, 16, BackendSMI)
+	defer badMon.Close()
+	if _, err := badMon.PollOnce(context.Background()); err == nil {
+		t.Fatal("expected error when polling nonexistent nvidia-smi binary")
+	}
+}

@@ -1,0 +1,76 @@
+name: CUDA Kernel Compilation & Hardware Runner CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_self_hosted_gpu:
+        description: "Run live GPU execution benchmark on self-hosted CUDA runner"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: auto
+  CGO_ENABLED: "1"
+
+jobs:
+  cuda-nvcc-compilation-and-ptxas-verify:
+    name: Compile All 8 CUDA Kernels (nvcc -O3 -Xptxas -v)
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Go bootstrap, gcc, and Python 3 in CUDA container
+        run: |
+          apt-get update
+          apt-get install -y curl git gcc python3 ca-certificates
+          curl -fsSL https://go.dev/dl/go1.24.1.linux-amd64.tar.gz | tar -C /usr/local -xz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: Verify nvcc compiler version
+        run: /usr/local/cuda/bin/nvcc --version
+
+      - name: Compile all 8 CUDA operations & assert zero PTXAS register spills
+        env:
+          GPUMODE_NVCC: /usr/local/cuda/bin/nvcc
+        run: |
+          export PATH="/usr/local/go/bin:/usr/local/cuda/bin:$PATH"
+          go test -v -run TestCompileAllCatalogKernelsWithNVCC ./internal/optimizer/...
+          go test -v -run 'TestParsePTXASOutput|TestFailurePaths' ./internal/harness/...
+
+  self-hosted-live-gpu-benchmark:
+    name: Live NVIDIA GPU Hardware Gate (Self-Hosted Runner)
+    if: github.event.inputs.run_self_hosted_gpu == 'true' || vars.ENABLE_SELF_HOSTED_GPU_CI == 'true'
+    runs-on: [self-hosted, linux, cuda]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build gpumode & verify GPU telemetry
+        run: |
+          go build -o ./gpumode ./cmd/gpumode
+          ./gpumode monitor
+
+      - name: Run CI Hardware Regression Gate (rmsnorm_residual & rope_qkv)
+        run: |
+          ./gpumode check -op rmsnorm_residual -batch 256 -hidden 4096 -iters 30 -min-speedup 1.15
+          ./gpumode check -op rope_qkv -batch 256 -hidden 4096 -iters 30 -min-speedup 1.15
+
+      - name: Run full live CUDA test suite
+        run: go test -v ./...

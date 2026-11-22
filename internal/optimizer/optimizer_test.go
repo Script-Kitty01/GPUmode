@@ -2,6 +2,10 @@ package optimizer
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,5 +125,50 @@ func TestSelfHealingRepairLoopOnBrokenKernel(t *testing.T) {
 	}
 	if !repaired.CompiledOK || !repaired.ParityPassed || !repaired.EdgeCasePassed {
 		t.Fatalf("expected self-healed kernel to compile and pass parity, got: %+v", repaired)
+	}
+}
+
+// TestCompileAllCatalogKernelsWithNVCC verifies that every baseline and optimized CUDA C++ kernel
+// across all 8 operations in SupportedOperations() compiles cleanly with nvcc -O3 -Xptxas -v and
+// produces zero local-memory register spills. This test requires only nvcc (no physical GPU device),
+// allowing full CUDA compilation and PTXAS verification inside standard CI containers.
+func TestCompileAllCatalogKernelsWithNVCC(t *testing.T) {
+	nvccPath := config.ResolveNVCCPath()
+	if _, err := exec.LookPath(nvccPath); err != nil {
+		t.Skipf("nvcc not found (%v); skipping CUDA compilation check", err)
+	}
+
+	proposer := NewDeterministicProposer()
+	tmpDir := t.TempDir()
+
+	for _, op := range SupportedOperations() {
+		t.Run(op, func(t *testing.T) {
+			base, cands := proposer.ProposeCandidates(op, 64, 1024, 10)
+			toCheck := []harness.KernelSpec{base}
+			if len(cands) > 0 {
+				toCheck = append(toCheck, cands[0], cands[len(cands)-1])
+			}
+			for _, spec := range toCheck {
+				cuFile := filepath.Join(tmpDir, spec.ID+".cu")
+				binFile := filepath.Join(tmpDir, spec.ID+".bin")
+				if err := os.WriteFile(cuFile, []byte(spec.CUDASource), 0o600); err != nil {
+					t.Fatalf("write %s: %v", cuFile, err)
+				}
+				cmd := exec.Command(nvccPath, "-O3", "-arch=sm_89", "-Xptxas", "-v", cuFile, "-o", binFile)
+				out, err := cmd.CombinedOutput()
+				logStr := strings.TrimSpace(string(out))
+				if err != nil {
+					t.Fatalf("nvcc compilation failed for %s (%s): %v\n%s", op, spec.ID, err, logStr)
+				}
+				ptxas := harness.ParsePTXASOutput(logStr)
+				if ptxas.RegistersPerThread <= 0 {
+					t.Errorf("expected >0 registers parsed from ptxas for %s, got %d", spec.ID, ptxas.RegistersPerThread)
+				}
+				if ptxas.SpillStoresBytes > 0 || ptxas.SpillLoadsBytes > 0 {
+					t.Errorf("unexpected register spills in %s: stores=%dB loads=%dB",
+						spec.ID, ptxas.SpillStoresBytes, ptxas.SpillLoadsBytes)
+				}
+			}
+		})
 	}
 }

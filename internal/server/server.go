@@ -24,20 +24,20 @@ import (
 
 // Server is the real-time Go daemon serving REST endpoints, live SSE telemetry streams, and the Web Dashboard.
 type Server struct {
-	mu                sync.RWMutex
-	cfg               config.DaemonConfig
-	hardware          physics.GPUHardwareSpec
-	monitor           *telemetry.Monitor
-	pipeline          *profiler.Pipeline
-	store             *store.Store
-	ebpfStatus        ebpftrace.Summary
-	runningOp         bool
-	customModelDir    string
-	directModelPath   string
-	baselineByModel   map[string]workload.WorkloadBenchmarkReport
-	optimizedByModel  map[string]workload.WorkloadBenchmarkReport
-	lastBaseline      *workload.WorkloadBenchmarkReport
-	lastOptimized     *workload.WorkloadBenchmarkReport
+	mu               sync.RWMutex
+	cfg              config.DaemonConfig
+	hardware         physics.GPUHardwareSpec
+	monitor          *telemetry.Monitor
+	pipeline         *profiler.Pipeline
+	store            *store.Store
+	ebpfStatus       ebpftrace.Summary
+	runningOp        bool
+	customModelDir   string
+	directModelPath  string
+	baselineByModel  map[string]workload.WorkloadBenchmarkReport
+	optimizedByModel map[string]workload.WorkloadBenchmarkReport
+	lastBaseline     *workload.WorkloadBenchmarkReport
+	lastOptimized    *workload.WorkloadBenchmarkReport
 }
 
 func NewServer(
@@ -368,11 +368,11 @@ func (s *Server) handleTelemetrySSE(w http.ResponseWriter, r *http.Request) {
 }
 
 type optimizeRequest struct {
-	OpCategory string          `json:"opCategory"`
-	BatchSize  int             `json:"batchSize"`
-	HiddenDim  int             `json:"hiddenDim"`
-	Iterations int             `json:"iterations"`
-	Strategy   string          `json:"strategy"`
+	OpCategory string                  `json:"opCategory"`
+	BatchSize  int                     `json:"batchSize"`
+	HiddenDim  int                     `json:"hiddenDim"`
+	Iterations int                     `json:"iterations"`
+	Strategy   string                  `json:"strategy"`
 	Economics  *config.EconomicsConfig `json:"economics,omitempty"`
 }
 

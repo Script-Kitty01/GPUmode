@@ -173,4 +173,3 @@ func TestRunInferenceBenchmarkWithMockStreamingServer(t *testing.T) {
 		t.Errorf("expected 6 completed requests at concurrency=3, got reqs=%d conc=%d", repConc.CompletedRequests, repConc.Concurrency)
 	}
 }
-

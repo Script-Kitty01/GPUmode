@@ -2,6 +2,11 @@ package nvml
 
 import (
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -188,4 +193,236 @@ func TestLiveNVMLSampleAndProcesses(t *testing.T) {
 	if _, err := client.SampleDevice(0); err == nil {
 		t.Fatal("expected SampleDevice(0) to fail after Close()")
 	}
+}
+
+func buildMockNVMLLib(t *testing.T, cSource string) string {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("dlopen mock NVML shared library test requires Linux")
+	}
+	gccPath, err := exec.LookPath("gcc")
+	if err != nil {
+		t.Skip("gcc not installed; skipping mock NVML .so compilation")
+	}
+	dir := t.TempDir()
+	cPath := filepath.Join(dir, "mock_nvml.c")
+	soPath := filepath.Join(dir, "libnvidia-ml.so.1")
+	if err := os.WriteFile(cPath, []byte(cSource), 0o600); err != nil {
+		t.Fatalf("write mock_nvml.c: %v", err)
+	}
+	cmd := exec.Command(gccPath, "-shared", "-fPIC", "-O2", cPath, "-o", soPath)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("gcc compile mock_nvml.so failed: %v (%s)", err, string(out))
+	}
+	return soPath
+}
+
+const mockNVMLFullCSource = `
+#include <stdlib.h>
+#include <string.h>
+
+typedef int nvmlReturn_t;
+typedef void* nvmlDevice_t;
+
+typedef struct { unsigned int gpu; unsigned int memory; } nvmlUtilization_t;
+typedef struct { unsigned long long total; unsigned long long free; unsigned long long used; } nvmlMemory_t;
+typedef struct {
+    unsigned int pid;
+    unsigned long long usedGpuMemory;
+    unsigned int gpuInstanceId;
+    unsigned int computeInstanceId;
+} nvmlProcessInfo_v2_t;
+
+static int get_mode(void) {
+    const char* m = getenv("MOCK_NVML_MODE");
+    if (!m) return 0;
+    if (strcmp(m, "unsupported_metrics") == 0) return 1;
+    if (strcmp(m, "init_fail") == 0) return 2;
+    if (strcmp(m, "mem_fail") == 0) return 3;
+    return 0;
+}
+
+nvmlReturn_t nvmlInit_v2(void) {
+    if (get_mode() == 2) return 9; /* NVML_ERROR_DRIVER_NOT_LOADED */
+    return 0;
+}
+nvmlReturn_t nvmlShutdown(void) { return 0; }
+const char* nvmlErrorString(nvmlReturn_t r) {
+    if (r == 3) return "Not Supported";
+    if (r == 7) return "Insufficient Size";
+    if (r == 9) return "Driver Not Loaded";
+    return "Mock NVML Error";
+}
+nvmlReturn_t nvmlDeviceGetCount_v2(unsigned int* cnt) {
+    *cnt = 1;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int idx, nvmlDevice_t* dev) {
+    if (idx != 0) return 2;
+    *dev = (void*)0x1234;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetName(nvmlDevice_t dev, char* name, unsigned int cap) {
+    strncpy(name, "NVIDIA H100 Mock 80GB", cap - 1);
+    name[cap - 1] = '\0';
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t dev, unsigned int* mw) {
+    if (get_mode() == 1) return 3; /* NVML_ERROR_NOT_SUPPORTED */
+    *mw = 245500;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetPowerManagementLimit(nvmlDevice_t dev, unsigned int* mw) {
+    if (get_mode() == 1) return 3;
+    *mw = 700000;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t dev, int typ, unsigned int* mhz) {
+    if (get_mode() == 1) return 3;
+    *mhz = (typ == 1) ? 1980 : 2619;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetMaxClockInfo(nvmlDevice_t dev, int typ, unsigned int* mhz) {
+    if (get_mode() == 1) return 3;
+    *mhz = (typ == 1) ? 1980 : 2619;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t dev, int sensor, unsigned int* temp) {
+    if (get_mode() == 1) return 3;
+    *temp = 62;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t dev, nvmlUtilization_t* u) {
+    if (get_mode() == 1) return 3;
+    u->gpu = 94;
+    u->memory = 78;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetMemoryInfo(nvmlDevice_t dev, nvmlMemory_t* m) {
+    if (get_mode() == 3) return 99;
+    m->total = 80ULL * 1024ULL * 1024ULL * 1024ULL;
+    m->used  = 40ULL * 1024ULL * 1024ULL * 1024ULL;
+    m->free  = 40ULL * 1024ULL * 1024ULL * 1024ULL;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetCurrentClocksEventReasons(nvmlDevice_t dev, unsigned long long* mask) {
+    if (get_mode() == 1) return 3;
+    *mask = 0x0000000000000004ULL; /* SwPowerCap */
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetPcieThroughput(nvmlDevice_t dev, int counter, unsigned int* kbps) {
+    if (get_mode() == 1) return 3;
+    *kbps = (counter == 0) ? 102400 : 204800;
+    return 0;
+}
+nvmlReturn_t nvmlDeviceGetComputeRunningProcesses_v2(nvmlDevice_t dev, unsigned int* count, nvmlProcessInfo_v2_t* infos) {
+    if (infos == NULL || *count < 2) {
+        *count = 2;
+        return 7; /* NVML_ERROR_INSUFFICIENT_SIZE */
+    }
+    infos[0].pid = 424242;
+    infos[0].usedGpuMemory = 8192ULL * 1024ULL * 1024ULL;
+    infos[1].pid = 999999;
+    infos[1].usedGpuMemory = ~0ULL; /* NVML_VALUE_NOT_AVAILABLE */
+    *count = 2;
+    return 0;
+}
+`
+
+func TestMockedNVMLSharedLibraryIntegrationAndFailurePaths(t *testing.T) {
+	soPath := buildMockNVMLLib(t, mockNVMLFullCSource)
+
+	t.Run("normal mocked NVML sampling and insufficient-size process list retry", func(t *testing.T) {
+		t.Setenv("MOCK_NVML_MODE", "normal")
+		client, err := OpenWithLibPath(soPath)
+		if err != nil {
+			t.Fatalf("OpenWithLibPath(mock_nvml.so) failed: %v", err)
+		}
+		defer client.Close()
+
+		cnt, err := client.DeviceCount()
+		if err != nil || cnt != 1 {
+			t.Fatalf("DeviceCount() = %d, err = %v; want 1, nil", cnt, err)
+		}
+
+		s, err := client.SampleDevice(0)
+		if err != nil {
+			t.Fatalf("SampleDevice(0) failed: %v", err)
+		}
+		if s.GPUName != "NVIDIA H100 Mock 80GB" {
+			t.Errorf("GPUName = %q, want NVIDIA H100 Mock 80GB", s.GPUName)
+		}
+		if s.PowerWatts != 245.5 || s.TDPWatts != 700.0 {
+			t.Errorf("Power=%.1fW TDP=%.1fW, want 245.5W / 700.0W", s.PowerWatts, s.TDPWatts)
+		}
+		if s.SMClockMHz != 1980 || s.MemClockMHz != 2619 || s.TemperatureC != 62 {
+			t.Errorf("unexpected clocks/temp: %+v", s)
+		}
+		if s.GPUUtilPct != 94 || s.MemUtilPct != 78 || s.VRAMUsedMiB != 40960 || s.VRAMTotalMiB != 81920 {
+			t.Errorf("unexpected util/vram: %+v", s)
+		}
+		if len(s.ThrottleReasons) != 1 || s.ThrottleReasons[0] != "SwPowerCap" {
+			t.Errorf("ThrottleReasons = %v, want [SwPowerCap]", s.ThrottleReasons)
+		}
+		if s.PCIeTxKBps != 102400 || s.PCIeRxKBps != 204800 {
+			t.Errorf("PCIe Tx/Rx = %d/%d, want 102400/204800", s.PCIeTxKBps, s.PCIeRxKBps)
+		}
+
+		procs, err := client.ListComputeProcesses(0)
+		if err != nil {
+			t.Fatalf("ListComputeProcesses(0) failed: %v", err)
+		}
+		if len(procs) != 2 || procs[0].PID != 424242 || procs[0].UsedVRAMMiB != 8192 || procs[1].PID != 999999 || procs[1].UsedVRAMMiB != 0 {
+			t.Fatalf("unexpected compute processes: %+v", procs)
+		}
+	})
+
+	t.Run("unsupported metrics degrade gracefully without failing SampleDevice", func(t *testing.T) {
+		t.Setenv("MOCK_NVML_MODE", "unsupported_metrics")
+		client, err := OpenWithLibPath(soPath)
+		if err != nil {
+			t.Fatalf("OpenWithLibPath failed: %v", err)
+		}
+		defer client.Close()
+
+		s, err := client.SampleDevice(0)
+		if err != nil {
+			t.Fatalf("SampleDevice(0) with unsupported metrics should succeed, got: %v", err)
+		}
+		if s.PowerWatts != 0 || s.SMClockMHz != 0 || s.TemperatureC != 0 || s.GPUUtilPct != 0 || len(s.ThrottleReasons) != 0 {
+			t.Errorf("expected unsupported metrics to degrade to 0, got: %+v", s)
+		}
+		if s.VRAMTotalMiB != 81920 {
+			t.Errorf("expected VRAMTotalMiB=81920 even when power/clock sensors are unsupported, got %.0f", s.VRAMTotalMiB)
+		}
+	})
+
+	t.Run("missing driver / nvmlInit failure returns ErrUnavailable", func(t *testing.T) {
+		t.Setenv("MOCK_NVML_MODE", "init_fail")
+		client, err := OpenWithLibPath(soPath)
+		if err == nil {
+			_ = client.Close()
+			t.Fatal("expected error when nvmlInit_v2 returns Driver Not Loaded")
+		}
+		if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "Driver Not Loaded") {
+			t.Fatalf("expected ErrUnavailable with 'Driver Not Loaded', got: %v", err)
+		}
+	})
+
+	t.Run("incomplete library missing required symbol fails load cleanly", func(t *testing.T) {
+		incompleteC := `
+int nvmlInit_v2(void) { return 0; }
+int nvmlShutdown(void) { return 0; }
+int nvmlDeviceGetCount_v2(unsigned int* c) { *c = 1; return 0; }
+`
+		badSO := buildMockNVMLLib(t, incompleteC)
+		client, err := OpenWithLibPath(badSO)
+		if err == nil {
+			_ = client.Close()
+			t.Fatal("expected error for incomplete NVML shared library")
+		}
+		if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "missing symbol") {
+			t.Fatalf("expected ErrUnavailable missing symbol error, got: %v", err)
+		}
+	})
 }

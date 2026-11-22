@@ -103,4 +103,3 @@ func TestDiagnoseMeasuredEBPFHostStarvation(t *testing.T) {
 		t.Fatalf("expected eBPF launch gap and sync stall in memory-bound reason, got: %s", memDiag.UnderutilizationReason)
 	}
 }
-

@@ -19,6 +19,7 @@ import (
 type OfflineDeepSeekFixtureProposer struct {
 	fallback *DeterministicProposer
 }
+
 func NewOfflineDeepSeekFixtureProposer(hw physics.GPUHardwareSpec) *OfflineDeepSeekFixtureProposer {
 	return &OfflineDeepSeekFixtureProposer{
 		fallback: NewDeterministicProposerForHardware(hw),
