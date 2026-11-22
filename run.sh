@@ -119,7 +119,11 @@ case "$MODE" in
   dashboard|serve|*)
     ensure_ebpf_caps
     echo "[gpuMode] Running initial PyTorch/CUDA trace & starting Web Dashboard at http://${ADDR} ..."
-    python3 ./scripts/profile_pytorch.py
+    PY_BIN="python3"
+    if [[ -x ./.venv/bin/python3 ]]; then
+      PY_BIN="./.venv/bin/python3"
+    fi
+    "$PY_BIN" ./scripts/profile_pytorch.py --verify-extension
     echo ""
     if ss -ltn 2>/dev/null | grep -q ":${ADDR##*:} "; then
       echo "[gpuMode] Dashboard is already running at http://${ADDR}"

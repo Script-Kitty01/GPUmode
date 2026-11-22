@@ -97,10 +97,17 @@ func ResolveNvidiaSMIPath() string {
 	return ResolveExecutable("GPUMODE_NVIDIA_SMI", "nvidia-smi")
 }
 
-// ResolvePythonPath locates Python 3 dynamically.
+// ResolvePythonPath locates Python 3 dynamically, preferring a project .venv with PyTorch when present.
 func ResolvePythonPath() string {
 	if v := strings.TrimSpace(os.Getenv("GPUMODE_PYTHON")); v != "" {
 		return v
+	}
+	for _, rel := range []string{".venv/bin/python3", ".venv/bin/python", "../../.venv/bin/python3"} {
+		if abs, err := filepath.Abs(rel); err == nil {
+			if info, statErr := os.Stat(abs); statErr == nil && !info.IsDir() {
+				return abs
+			}
+		}
 	}
 	if p, err := exec.LookPath("python3"); err == nil {
 		return p

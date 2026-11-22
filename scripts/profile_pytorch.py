@@ -24,30 +24,42 @@ def verify_inline_extension(op: str, batch: int, hidden: int, block_size: int, v
     import os
     import time
     import torch
-    import torch.nn.functional as F
 
     if not torch.cuda.is_available():
         return None
+
+    if "CUDA_HOME" not in os.environ and os.path.isdir("/opt/cuda"):
+        os.environ["CUDA_HOME"] = "/opt/cuda"
+        os.environ["PATH"] = "/opt/cuda/bin:" + os.environ.get("PATH", "")
 
     device = "cuda"
     x = torch.randn(batch, hidden, device=device, dtype=torch.float32)
     res = torch.randn(batch, hidden, device=device, dtype=torch.float32)
     w = torch.ones(hidden, device=device, dtype=torch.float32)
 
-    # Reference baseline (unfused PyTorch eager ops)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    mem_base_start = torch.cuda.memory_allocated()
-    t0 = time.perf_counter()
-    for _ in range(iters):
+    # Warmup reference baseline (unfused PyTorch eager ops)
+    for _ in range(10):
         h = x + res
         var = h.pow(2).mean(-1, keepdim=True)
         ref_out = h * torch.rsqrt(var + 1e-5) * w
     torch.cuda.synchronize()
-    before_ms = ((time.perf_counter() - t0) * 1000.0) / max(1, iters)
+
+    torch.cuda.reset_peak_memory_stats()
+    mem_base_start = torch.cuda.memory_allocated()
+    ev_start = torch.cuda.Event(enable_timing=True)
+    ev_end = torch.cuda.Event(enable_timing=True)
+    timed_runs = max(40, iters * 2)
+    ev_start.record()
+    for _ in range(timed_runs):
+        h = x + res
+        var = h.pow(2).mean(-1, keepdim=True)
+        ref_out = h * torch.rsqrt(var + 1e-5) * w
+    ev_end.record()
+    torch.cuda.synchronize()
+    before_ms = ev_start.elapsed_time(ev_end) / float(timed_runs)
     before_mem = max(int(torch.cuda.max_memory_allocated() - mem_base_start), batch * hidden * 4 * 4)
 
-    # Try compiling custom CUDA C++ kernel via torch.utils.cpp_extension.load_inline
+    # Compile custom float4 vectorized CUDA C++ kernel via torch.utils.cpp_extension.load_inline
     provenance = "MEASURED_PYTORCH_EXTENSION"
     ext_fn = None
     try:
@@ -60,33 +72,68 @@ def verify_inline_extension(op: str, batch: int, hidden: int, block_size: int, v
         #include <torch/extension.h>
         #include <cuda_runtime.h>
 
+        #define BLOCK_SIZE {block_size}
+
         __inline__ __device__ float warp_sum(float v) {{
+            #pragma unroll
             for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffff, v, off);
             return v;
         }}
 
-        __global__ void gpumode_rmsnorm_res_kern(const float* __restrict__ x, const float* __restrict__ r, const float* __restrict__ w, float* __restrict__ o, int cols, float eps) {{
+        __global__ void gpumode_rmsnorm_res_vec4_kern(
+            const float* __restrict__ x,
+            const float* __restrict__ r,
+            const float* __restrict__ w,
+            float* __restrict__ o,
+            int cols,
+            float eps
+        ) {{
             __shared__ float ws[32];
             int row = blockIdx.x, tid = threadIdx.x;
             const float* rx = x + row * cols;
             const float* rr = r + row * cols;
             float* ro = o + row * cols;
             float ss = 0.0f;
-            for (int i = tid; i < cols; i += {block_size}) {{
+
+            int vec_cols = ((cols & 3) == 0) ? (cols >> 2) : 0;
+            const float4* rx4 = reinterpret_cast<const float4*>(rx);
+            const float4* rr4 = reinterpret_cast<const float4*>(rr);
+            for (int i = tid; i < vec_cols; i += BLOCK_SIZE) {{
+                float4 vx = rx4[i];
+                float4 vr = rr4[i];
+                vx.x += vr.x; vx.y += vr.y; vx.z += vr.z; vx.w += vr.w;
+                ss += vx.x * vx.x + vx.y * vx.y + vx.z * vx.z + vx.w * vx.w;
+            }}
+            for (int i = (vec_cols << 2) + tid; i < cols; i += BLOCK_SIZE) {{
                 float v = rx[i] + rr[i];
                 ss += v * v;
             }}
+
             ss = warp_sum(ss);
             if ((tid & 31) == 0) ws[tid >> 5] = ss;
             __syncthreads();
             if (tid < 32) {{
-                float b = (tid < ({block_size} >> 5)) ? ws[tid] : 0.0f;
+                float b = (tid < (BLOCK_SIZE >> 5)) ? ws[tid] : 0.0f;
                 b = warp_sum(b);
                 if (tid == 0) ws[0] = rsqrtf(b / (float)cols + eps);
             }}
             __syncthreads();
             float inv = ws[0];
-            for (int i = tid; i < cols; i += {block_size}) {{
+
+            const float4* rw4 = reinterpret_cast<const float4*>(w);
+            float4* ro4 = reinterpret_cast<float4*>(ro);
+            for (int i = tid; i < vec_cols; i += BLOCK_SIZE) {{
+                float4 vx = rx4[i];
+                float4 vr = rr4[i];
+                float4 vw = rw4[i];
+                float4 vo;
+                vo.x = (vx.x + vr.x) * inv * vw.x;
+                vo.y = (vx.y + vr.y) * inv * vw.y;
+                vo.z = (vx.z + vr.z) * inv * vw.z;
+                vo.w = (vx.w + vr.w) * inv * vw.w;
+                ro4[i] = vo;
+            }}
+            for (int i = (vec_cols << 2) + tid; i < cols; i += BLOCK_SIZE) {{
                 ro[i] = (rx[i] + rr[i]) * inv * w[i];
             }}
         }}
@@ -95,24 +142,23 @@ def verify_inline_extension(op: str, batch: int, hidden: int, block_size: int, v
             auto out = torch::empty_like(x);
             int rows = x.size(0);
             int cols = x.size(-1);
-            gpumode_rmsnorm_res_kern<<<rows, {block_size}>>>(
+            gpumode_rmsnorm_res_vec4_kern<<<rows, BLOCK_SIZE>>>(
                 x.data_ptr<float>(), res.data_ptr<float>(), w.data_ptr<float>(), out.data_ptr<float>(), cols, (float)eps
             );
             return out;
         }}
         """
         mod = load_inline(
-            name=f"gpumode_inline_b{block_size}",
+            name=f"gpumode_inline_vec4_b{block_size}",
             cpp_sources=[cpp_src],
             cuda_sources=[cuda_src],
             functions=["gpumode_rmsnorm_res"],
             build_directory=build_dir,
-            extra_cuda_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
             verbose=False,
         )
         ext_fn = lambda a, b, weight: mod.gpumode_rmsnorm_res(a, b, weight, 1e-5)
     except Exception:
-        # Fallback to torch.compile fused kernel if ninja/cpp_extension headers are absent
         provenance = "MEASURED_TORCH_COMPILE"
         try:
             @torch.compile
@@ -124,18 +170,19 @@ def verify_inline_extension(op: str, batch: int, hidden: int, block_size: int, v
             return None
 
     # Warmup fused extension
-    for _ in range(3):
+    for _ in range(10):
         opt_out = ext_fn(x, res, w)
     torch.cuda.synchronize()
     max_err = float((opt_out - ref_out).abs().max().item())
 
     torch.cuda.reset_peak_memory_stats()
     mem_opt_start = torch.cuda.memory_allocated()
-    t1 = time.perf_counter()
-    for _ in range(iters):
+    ev_start.record()
+    for _ in range(timed_runs):
         opt_out = ext_fn(x, res, w)
+    ev_end.record()
     torch.cuda.synchronize()
-    after_ms = ((time.perf_counter() - t1) * 1000.0) / max(1, iters)
+    after_ms = ev_start.elapsed_time(ev_end) / float(timed_runs)
     after_mem = max(int(torch.cuda.max_memory_allocated() - mem_opt_start), batch * hidden * 4 * 2)
 
     vram_ratio = round(min(0.95, max(0.35, float(after_mem) / float(max(1, before_mem)))), 4)
@@ -187,11 +234,62 @@ def profile_with_torch(batch: int, hidden: int, iters: int, verify_ext: bool = F
         torch.cuda.synchronize()
 
     op_specs = [
-        ("gpumode::rmsnorm_residual", "RMSNorm + Residual Add (Unfused)", "rmsnorm_residual"),
-        ("gpumode::swiglu", "SwiGLU FFN Activation (SiLU * Gate)", "swiglu"),
-        ("gpumode::softmax", "Attention Softmax", "softmax"),
-        ("gpumode::layernorm", "Post-Attention LayerNorm", "layernorm"),
+        (
+            "gpumode::rmsnorm_residual",
+            "RMSNorm + Residual Add (Unfused)",
+            "rmsnorm_residual",
+            lambda: (x + res) * torch.rsqrt((x + res).pow(2).mean(-1, keepdim=True) + 1e-5) * w,
+            [list(x.shape), list(res.shape), list(w.shape)],
+        ),
+        (
+            "gpumode::swiglu",
+            "SwiGLU FFN Activation (SiLU * Gate)",
+            "swiglu",
+            lambda: F.silu(gate) * up,
+            [list(gate.shape), list(up.shape)],
+        ),
+        (
+            "gpumode::softmax",
+            "Attention Softmax",
+            "softmax",
+            lambda: torch.softmax(attn_scores, dim=-1),
+            [list(attn_scores.shape)],
+        ),
+        (
+            "gpumode::layernorm",
+            "Post-Attention LayerNorm",
+            "layernorm",
+            lambda: F.layer_norm(h, (hidden,), w, b, 1e-5),
+            [list(h.shape), list(w.shape), list(b.shape)],
+        ),
     ]
+
+    # Measure exact peak CUDA memory allocation and CUDA kernel launches per operator on the GPU
+    op_measured_mem = {}
+    op_measured_kernels = {}
+    for rec_key, _, _, fn, _ in op_specs:
+        if has_cuda:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            base_alloc = torch.cuda.memory_allocated()
+            out_tensor = fn()
+            torch.cuda.synchronize()
+            peak_delta = int(torch.cuda.max_memory_allocated() - base_alloc)
+            del out_tensor
+            op_measured_mem[rec_key] = max(0, peak_delta)
+        else:
+            op_measured_mem[rec_key] = 0
+
+        with profile(activities=activities) as single_prof:
+            _ = fn()
+            if has_cuda:
+                torch.cuda.synchronize()
+        cuda_kern_cnt = 0
+        for e in single_prof.events():
+            dev_time = float(_extract_attr(e, "device_time_total", "cuda_time_total", "self_device_time_total", default=0.0))
+            if dev_time > 0 and not str(getattr(e, "name", "")).startswith("aten::"):
+                cuda_kern_cnt += 1
+        op_measured_kernels[rec_key] = max(1, cuda_kern_cnt)
 
     with profile(
         activities=activities,
@@ -199,16 +297,9 @@ def profile_with_torch(batch: int, hidden: int, iters: int, verify_ext: bool = F
         profile_memory=True,
     ) as prof:
         for _ in range(iters):
-            with record_function("gpumode::rmsnorm_residual"):
-                h = x + res
-                var = h.pow(2).mean(-1, keepdim=True)
-                _ = h * torch.rsqrt(var + 1e-5) * w
-            with record_function("gpumode::swiglu"):
-                _ = F.silu(gate) * up
-            with record_function("gpumode::softmax"):
-                _ = torch.softmax(attn_scores, dim=-1)
-            with record_function("gpumode::layernorm"):
-                _ = F.layer_norm(h, (hidden,), w, b, 1e-5)
+            for rec_key, _, _, fn, _ in op_specs:
+                with record_function(rec_key):
+                    _ = fn()
         if has_cuda:
             torch.cuda.synchronize()
 
@@ -217,7 +308,7 @@ def profile_with_torch(batch: int, hidden: int, iters: int, verify_ext: bool = F
 
     raw_ops = []
     total_time_us = 0.0
-    for rec_key, label, category in op_specs:
+    for rec_key, label, category, _, live_shapes in op_specs:
         evt = by_key.get(rec_key)
         if evt is None:
             continue
@@ -226,13 +317,17 @@ def profile_with_torch(batch: int, hidden: int, iters: int, verify_ext: bool = F
         effective_us = cuda_us if (has_cuda and cuda_us > 0) else cpu_us
         total_time_us += effective_us
 
-        shapes = []
+        shapes = live_shapes
         raw_shapes = _extract_attr(evt, "input_shapes", default=[])
         if raw_shapes:
-            shapes = [list(s) for s in raw_shapes[:3] if s]
+            parsed = [list(s) for s in raw_shapes[:3] if s]
+            if parsed:
+                shapes = parsed
 
-        mem_bytes = int(_extract_attr(evt, "device_memory_usage", "cuda_memory_usage", "cpu_memory_usage", default=0))
-        launches = int(_extract_attr(evt, "count", default=iters))
+        mem_bytes = op_measured_mem.get(rec_key, 0)
+        if mem_bytes <= 0:
+            mem_bytes = int(_extract_attr(evt, "device_memory_usage", "cuda_memory_usage", "cpu_memory_usage", default=0))
+        launches = op_measured_kernels.get(rec_key, 1) * max(1, iters)
 
         raw_ops.append({
             "name": label,

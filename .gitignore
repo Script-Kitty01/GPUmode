@@ -5,6 +5,7 @@
 *.test
 
 # Runtime data store & temporary CUDA build artifacts
+/.venv/
 /.gpumode_data/
 **/.gpumode_cache/
 /harness/kernel_bench*

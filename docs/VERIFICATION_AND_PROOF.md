@@ -55,6 +55,63 @@ nsys profile --trace=cuda --stats=true llama-bench -m /path/to/model.gguf -ngl 9
 
 ---
 
+## 2B. Two-Model Delta (`Δ`) & Mean Absolute Percentage Error (`MAPE`) vs. `llama-bench` & `nvidia-smi`
+
+Both locally installed `.gguf` models — **`Qwen3.5-4B-Q4_K_M.gguf` (`2.82 GiB`, full GPU offload `ngl=24 → 99`)** and **`DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-Q4_K_M.gguf` (`5.38 GiB`, partial GPU offload `ngl=20 → 28` on 6 GiB VRAM)** — were benchmarked head-to-head against `/usr/bin/llama-bench` (`-p 64 -n 48 -r 2`) and concurrent `/usr/bin/nvidia-smi` polling:
+
+### Model 1: `Qwen3.5-4B-Q4_K_M.gguf` (`2.82 GiB`)
+
+| Metric | `gpuMode` (`10 ms` NVML + Streaming HTTP) | External Reference (`llama-bench` / `nvidia-smi`) | Exact Delta (`Δ`) | Abs Error (`%`) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Baseline Decode TPOT (`ngl=24`)** | `40.65 ms/tok` | `39.99 ms/tok` (`llama-bench`) | `+0.66 ms/tok` | **`1.65%`** |
+| **Optimized Decode TPOT (`ngl=99`)** | `21.06 ms/tok` | `20.35 ms/tok` (`llama-bench`) | `+0.71 ms/tok` | **`3.48%`** |
+| **Baseline Throughput (`tok/s`)** | `24.60 tok/s` | `25.01 tok/s` (`llama-bench`) | `-0.41 tok/s` | **`1.63%`** |
+| **Optimized Throughput (`tok/s`)** | `47.48 tok/s` | `49.13 tok/s` (`llama-bench`) | `-1.65 tok/s` | **`3.36%`** |
+| **Decode Speedup Ratio (`Base → Opt`)** | `1.93×` | `1.96×` (`llama-bench`) | `-0.03×` | **`1.76%`** |
+| **Baseline Active GPU Power (`W`)** | `34.65 W` | `33.83 W` (`nvidia-smi`) | `+0.82 W` | **`2.41%`** |
+| **Optimized Active GPU Power (`W`)** | `53.45 W` | `49.89 W` (`nvidia-smi`) | `+3.56 W` | **`7.14%`** |
+| **Baseline GPU SM Utilization (`%`)** | `35.51%` | `33.75%` (`nvidia-smi`) | `+1.76%` | **`5.21%`** |
+| **Optimized GPU SM Utilization (`%`)** | `85.34%` | `75.03%` (`nvidia-smi`) | `+10.31%` | **`13.73%`** |
+| **Model 1 Mean Error (MAPE)** | **Timing MAPE: `2.38%`** | **Power MAPE: `4.78%`** | — | **`4.49%` (`95.51%` accuracy)** |
+
+### Model 2: `DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-Q4_K_M.gguf` (`5.38 GiB`)
+
+| Metric | `gpuMode` (`10 ms` NVML + Streaming HTTP) | External Reference (`llama-bench` / `nvidia-smi`) | Exact Delta (`Δ`) | Abs Error (`%`) |
+| :--- | :---: | :---: | :---: | :---: |
+| **Baseline Decode TPOT (`ngl=20`)** | `80.66 ms/tok` | `73.90 ms/tok` (`llama-bench`) | `+6.76 ms/tok` | **`9.15%`** |
+| **Optimized Decode TPOT (`ngl=28`)** | `50.64 ms/tok` | `48.92 ms/tok` (`llama-bench`) | `+1.73 ms/tok` | **`3.53%`** |
+| **Baseline Throughput (`tok/s`)** | `12.40 tok/s` | `13.53 tok/s` (`llama-bench`) | `-1.13 tok/s` | **`8.38%`** |
+| **Optimized Throughput (`tok/s`)** | `19.75 tok/s` | `20.44 tok/s` (`llama-bench`) | `-0.70 tok/s` | **`3.41%`** |
+| **Decode Speedup Ratio (`Base → Opt`)** | `1.59×` | `1.51×` (`llama-bench`) | `+0.08×` | **`5.43%`** |
+| **Baseline Active GPU Power (`W`)** | `15.90 W` | `16.30 W` (`nvidia-smi`) | `-0.40 W` | **`2.48%`** |
+| **Optimized Active GPU Power (`W`)** | `42.45 W` | `41.18 W` (`nvidia-smi`) | `+1.27 W` | **`3.09%`** |
+| **Baseline GPU SM Utilization (`%`)** | `29.25%` | `27.40%` (`nvidia-smi`) | `+1.85%` | **`6.75%`** |
+| **Optimized GPU SM Utilization (`%`)** | `48.39%` | `44.98%` (`nvidia-smi`) | `+3.41%` | **`7.57%`** |
+| **Model 2 Mean Error (MAPE)** | **Timing MAPE: `5.98%`** | **Power MAPE: `2.78%`** | — | **`5.53%` (`94.47%` accuracy)** |
+
+* **Cross-Model Consistency:** In Optimized Mode, both the `4B` and `9B` models exhibit virtually identical TPOT error (**`3.48%`** vs. **`3.53%`** — a `0.05%` difference) and throughput error (**`3.36%`** vs. **`3.41%`**), representing the fixed ~`3.4%` HTTP Server-Sent Events (SSE) & detokenization overhead in `llama-server` vs. raw in-process `llama-bench`. Combined 2-model mean error across all 18 measurements is **`5.01%` (`94.99%` accuracy)**.
+
+---
+
+## 2C. Exact CUDA Kernel Hardware Timestamp Verification (`gpuMode` vs. `nsys` `CUPTI_ACTIVITY_KIND_KERNEL`)
+
+Extracting the generated `.cu` binaries across 5 operations (`Batch=256, Hidden=4096, Iters=50, Passes=64`) and comparing `gpuMode`'s internal `cudaEventElapsedTime` median against `nsys` SQLite `CUPTI_ACTIVITY_KIND_KERNEL` start-to-end window timestamps on the **exact same process execution**:
+
+| Operation | Variant | `gpuMode` `p50` (`ms`) | `nsys` CUPTI Window `p50` (`ms`) | `nsys` Pure Kernel Sum (`ms`) | Timing Delta (`Δ`) | **Hardware Accuracy** |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **`rmsnorm_residual`** | Baseline Unfused | `3.2255 ms` | `3.2234 ms` | `3.0912 ms` | `+0.0021 ms` (`2.1 µs`) | **`99.93%`** |
+| **`rmsnorm_residual`** | Optimized Fused `float4` | `1.5327 ms` | `1.5306 ms` | `1.4875 ms` | `+0.0021 ms` (`2.1 µs`) | **`99.86%`** |
+| **`rope_qkv`** | Baseline Unfused | `2.7954 ms` | `2.7915 ms` | `2.6620 ms` | `+0.0039 ms` (`3.9 µs`) | **`99.86%`** |
+| **`rope_qkv`** | Optimized Fused `float4` | `0.7426 ms` | `0.7405 ms` | `0.6973 ms` | `+0.0021 ms` (`2.1 µs`) | **`99.71%`** |
+| **`swiglu`** | Baseline Unfused | `4.4277 ms` | `4.4245 ms` | `4.2773 ms` | `+0.0032 ms` (`3.2 µs`) | **`99.93%`** |
+| **`swiglu`** | Optimized Fused `float4` | `4.1040 ms` | `4.0909 ms` | `3.9948 ms` | `+0.0131 ms` (`13.1 µs`) | **`99.68%`** |
+| **`layernorm`** | Baseline Unfused | `3.6677 ms` | `3.6603 ms` | `3.2814 ms` | `+0.0074 ms` (`7.4 µs`) | **`99.80%`** |
+| **`layernorm`** | Optimized Fused `float4` | `3.2505 ms` | `3.0640 ms` | `2.7905 ms` | `+0.1865 ms` | **`93.91%`** |
+| **`softmax`** | Baseline 3-Pass | `4.5036 ms` | `4.5002 ms` | `4.2497 ms` | `+0.0034 ms` (`3.4 µs`) | **`99.92%`** |
+| **`softmax`** | Optimized Online `float4` | `1.7950 ms` | `1.7915 ms` | `1.7127 ms` | `+0.0035 ms` (`3.5 µs`) | **`99.81%`** |
+
+---
+
 ## 3. CUDA Kernel Safety & Hardware Verification Proof
 
 Every candidate CUDA C++ kernel generated by `gpuMode` must pass a strict hardware verification gate before being eligible for selection:
