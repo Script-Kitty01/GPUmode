@@ -58,20 +58,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Build gpumode & verify GPU telemetry
+      - name: Verify host Go & CUDA toolchain
         run: |
+          export PATH="/opt/cuda/bin:/usr/local/cuda/bin:/usr/bin:$PATH"
+          echo "/opt/cuda/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          go version
+          nvcc --version
+          nvidia-smi -L
+
+      - name: Build gpumode & verify live NVML GPU telemetry
+        run: |
+          export PATH="/opt/cuda/bin:/usr/local/cuda/bin:/usr/bin:$PATH"
           go build -o ./gpumode ./cmd/gpumode
           ./gpumode monitor
 
-      - name: Run CI Hardware Regression Gate (rmsnorm_residual & rope_qkv)
+      - name: Run CI Hardware Regression Gate on live silicon (rmsnorm_residual & rope_qkv)
         run: |
+          export PATH="/opt/cuda/bin:/usr/local/cuda/bin:/usr/bin:$PATH"
           ./gpumode check -op rmsnorm_residual -batch 256 -hidden 4096 -iters 30 -min-speedup 1.15
           ./gpumode check -op rope_qkv -batch 256 -hidden 4096 -iters 30 -min-speedup 1.15
 
-      - name: Run full live CUDA test suite
-        run: go test -v ./...
+      - name: Run live CUDA hardware & NVML test suite
+        run: |
+          export PATH="/opt/cuda/bin:/usr/local/cuda/bin:/usr/bin:$PATH"
+          go test -v ./internal/physics/... ./internal/nvml/... ./internal/telemetry/... ./internal/harness/... ./internal/roofline/... ./internal/pareto/... ./internal/scheduler/...
