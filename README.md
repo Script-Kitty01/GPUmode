@@ -42,3 +42,4 @@ Requires Linux, an NVIDIA GPU with drivers (`nvidia-smi`), CUDA Toolkit (`nvcc` 
 | **[Architecture & Internals](./docs/ARCHITECTURE.md)** | System diagram, NVML + eBPF internals, Roofline/Bayesian/Pareto pipeline, and repository directory map |
 | **[Dependencies & Libraries](./docs/DEPENDENCIES.md)** | Required & optional system packages, Go modules (`go.mod`), shared libraries (`libnvidia-ml.so.1`, `libcuda.so.1`), and Linux install commands |
 | **[Verification & Benchmark Proof](./docs/VERIFICATION_AND_PROOF.md)** | Live RTX 4050 (`sm_89`) benchmark results (`2.06×` tok/s, `-21.3%` J/tok) and independent cross-checks against `nsys`, `llama-bench`, `nvidia-smi`, and `nvtop` |
+| **[Engineering Roadmap & Next-Gen Specs](./docs/ROADMAP.md)** | Technical specifications for eBPF launch-geometry & Perfetto tracing, live PyTorch `load_inline` verification, empirical Roofline & SM occupancy, `FP16`/`RoPE`/`QGEMV` kernels, and Bayesian server autotuning |

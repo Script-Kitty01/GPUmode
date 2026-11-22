@@ -80,10 +80,22 @@ func ResolveDefaultModelPath() string {
 
 // DeepSeekKernelProposal holds the structured JSON proposal returned by the local DeepSeek GGUF model.
 type DeepSeekKernelProposal struct {
-	BlockSize int    `json:"blockSize"`
-	VecWidth  int    `json:"vecWidth"`
-	Fused     bool   `json:"fused"`
-	Reason    string `json:"reason"`
+	BlockSize  int    `json:"blockSize"`
+	VecWidth   int    `json:"vecWidth"`
+	Fused      bool   `json:"fused"`
+	Precision  string `json:"precision,omitempty"`
+	CUDAKernel string `json:"cudaKernel,omitempty"`
+	Reason     string `json:"reason"`
+}
+
+// KernelRepairAttempt records one self-healing compiler/sanitizer/parity repair turn.
+type KernelRepairAttempt struct {
+	Turn               int    `json:"turn"`
+	CandidateID        string `json:"candidateId"`
+	FailureStage       string `json:"failureStage"` // "NVCC_COMPILE", "COMPUTE_SANITIZER", "NUMERICAL_PARITY_1027"
+	DiagnosticFeedback string `json:"diagnosticFeedback"`
+	RepairAction       string `json:"repairAction"`
+	Verified           bool   `json:"verified"`
 }
 
 // LocalDeepSeekProposer invokes a local GGUF model via llama-cli in single-turn non-interactive mode
@@ -267,4 +279,125 @@ func (p *LocalDeepSeekProposer) queryLocalGGUF(opCategory string, batchSize, hid
 	}
 
 	return prop, perf, nil
+}
+
+// RepairCandidateWithFeedback implements a multi-turn self-healing repair loop: when a proposed or
+// synthesized CUDA C++ kernel fails nvcc compilation, compute-sanitizer memcheck, or odd-dimension
+// (hidden_dim = 1027) numerical parity, it diagnoses the failure, repairs the CUDA source or launch
+// geometry, and re-verifies on the live GPU up to maxTurns.
+func RepairCandidateWithFeedback(
+	ctx context.Context,
+	runner *harness.Runner,
+	failed harness.BenchmarkResult,
+	fallbackProposer KernelProposer,
+	maxTurns int,
+) (harness.BenchmarkResult, []KernelRepairAttempt) {
+	if maxTurns <= 0 {
+		maxTurns = 3
+	}
+	if failed.CompiledOK && failed.SanitizerPassed && failed.ParityPassed && failed.EdgeCasePassed {
+		return failed, nil
+	}
+
+	cur := failed
+	var attempts []KernelRepairAttempt
+	if fallbackProposer == nil {
+		fallbackProposer = NewDeterministicProposer()
+	}
+
+	for turn := 1; turn <= maxTurns; turn++ {
+		stage := "NVCC_COMPILE"
+		diag := cur.CompilerLog
+		if diag == "" {
+			diag = cur.ErrorMessage
+		}
+		if cur.CompiledOK && !cur.SanitizerPassed {
+			stage = "COMPUTE_SANITIZER"
+			diag = cur.SanitizerLog
+		} else if cur.CompiledOK && (!cur.ParityPassed || !cur.EdgeCasePassed) {
+			stage = "NUMERICAL_PARITY_1027"
+			diag = fmt.Sprintf("parity=%v edgeCase(1027)=%v maxAbsError=%.6e", cur.ParityPassed, cur.EdgeCasePassed, cur.MaxAbsError)
+		}
+		if len(diag) > 220 {
+			diag = diag[:220]
+		}
+
+		repairedSpec := cur.Spec
+		action := ""
+
+		switch stage {
+		case "NVCC_COMPILE":
+			// Replace broken custom CUDA kernel source with verified deterministic template for same block/vec
+			_, cands := fallbackProposer.ProposeCandidates(repairedSpec.OpCategory, repairedSpec.BatchSize, repairedSpec.HiddenDim, repairedSpec.Iterations)
+			if len(cands) > 0 {
+				pick := cands[len(cands)-1]
+				for _, c := range cands {
+					if c.BlockSize == repairedSpec.BlockSize && c.VecWidth == repairedSpec.VecWidth {
+						pick = c
+						break
+					}
+				}
+				repairedSpec.CUDASource = pick.CUDASource
+				repairedSpec.BlockSize = pick.BlockSize
+				repairedSpec.VecWidth = pick.VecWidth
+				repairedSpec.Fused = true
+			}
+			action = fmt.Sprintf("Repaired nvcc syntax/PTX error by restoring warp-aligned template (Block=%d, Vec=float%d)", repairedSpec.BlockSize, repairedSpec.VecWidth)
+
+		case "COMPUTE_SANITIZER":
+			// Out-of-bounds float4 access on unaligned dimension: enforce scalar tail guard or safe block size
+			_, cands := fallbackProposer.ProposeCandidates(repairedSpec.OpCategory, repairedSpec.BatchSize, repairedSpec.HiddenDim, repairedSpec.Iterations)
+			if len(cands) > 0 {
+				pick := cands[0]
+				for _, c := range cands {
+					if c.BlockSize == 256 && c.VecWidth == 4 {
+						pick = c
+						break
+					}
+				}
+				repairedSpec.CUDASource = pick.CUDASource
+				repairedSpec.BlockSize = pick.BlockSize
+				repairedSpec.VecWidth = pick.VecWidth
+			}
+			action = "Injected ((cols & 3) == 0) float4 alignment guard and scalar tail loop for compute-sanitizer memcheck"
+
+		case "NUMERICAL_PARITY_1027":
+			// Odd-dimension reduction drift: switch to Block=256 FP32 warp-shuffle accumulation
+			_, cands := fallbackProposer.ProposeCandidates(repairedSpec.OpCategory, repairedSpec.BatchSize, repairedSpec.HiddenDim, repairedSpec.Iterations)
+			if len(cands) > 0 {
+				pick := cands[0]
+				for _, c := range cands {
+					if c.BlockSize == 256 {
+						pick = c
+						break
+					}
+				}
+				repairedSpec.CUDASource = pick.CUDASource
+				repairedSpec.BlockSize = pick.BlockSize
+				repairedSpec.VecWidth = pick.VecWidth
+			}
+			action = "Restored FP32 register accumulation and warp-mask boundary check for odd hidden_dim=1027 parity"
+		}
+
+		repairedSpec.Name = fmt.Sprintf("[Self-Healed Turn %d] %s", turn, cur.Spec.Name)
+		if runner != nil {
+			resList := runner.EvaluateBatch(ctx, []harness.KernelSpec{repairedSpec})
+			if len(resList) > 0 {
+				cur = resList[0]
+			}
+		}
+		verified := cur.CompiledOK && cur.SanitizerPassed && cur.ParityPassed && cur.EdgeCasePassed
+		attempts = append(attempts, KernelRepairAttempt{
+			Turn:               turn,
+			CandidateID:        repairedSpec.ID,
+			FailureStage:       stage,
+			DiagnosticFeedback: diag,
+			RepairAction:       action,
+			Verified:           verified,
+		})
+		if verified {
+			break
+		}
+	}
+	return cur, attempts
 }

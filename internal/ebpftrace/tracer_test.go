@@ -272,3 +272,53 @@ func TestFilterAndAggregateSummary(t *testing.T) {
 		t.Fatalf("len(Processes) = %d, want 2", len(sum.Processes))
 	}
 }
+
+func TestLog2HistQuantileAndPerfettoExport(t *testing.T) {
+	var hist [16]uint64
+	// 50 samples in bucket 4 (16..32us), 45 samples in bucket 5 (32..64us), 5 samples in bucket 7 (128..256us)
+	hist[4] = 50
+	hist[5] = 45
+	hist[7] = 5
+
+	p50 := Log2HistQuantileUS(hist, 0.50, 35.0, 200.0)
+	p95 := Log2HistQuantileUS(hist, 0.95, 35.0, 200.0)
+	p99 := Log2HistQuantileUS(hist, 0.99, 35.0, 200.0)
+	if p50 < 16 || p50 > 33 {
+		t.Errorf("p50 = %v, expected in [16, 33]", p50)
+	}
+	if p95 < 60 || p95 > 130 {
+		t.Errorf("p95 = %v, expected in [60, 130]", p95)
+	}
+	if p99 <= p95 {
+		t.Errorf("expected p99 (%v) > p95 (%v)", p99, p95)
+	}
+
+	sum := Summary{
+		Enabled:          true,
+		Active:           true,
+		Mode:             ModeAuto,
+		Provenance:       ProvenanceMeasuredEBPF,
+		DurationMS:       50.0,
+		KernelLaunches:   100,
+		GraphLaunches:    4,
+		AvgBlockThreads:  256,
+		AvgGridBlocks:    64,
+		AvgLaunchGapUS:   35.0,
+		P50LaunchGapUS:   p50,
+		P95LaunchGapUS:   p95,
+		P99LaunchGapUS:   p99,
+		MaxLaunchGapUS:   200.0,
+		SyncCalls:        5,
+		SyncStallMS:      4.5,
+		OffCPUMS:         1.2,
+		SchedSwitches:    8,
+		LaunchGapHist:    hist,
+	}
+	traceJSON, err := BuildPerfettoTrace(sum)
+	if err != nil {
+		t.Fatalf("BuildPerfettoTrace failed: %v", err)
+	}
+	if len(traceJSON) == 0 {
+		t.Fatal("expected non-empty Perfetto trace JSON")
+	}
+}

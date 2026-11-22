@@ -16,10 +16,16 @@
 
 struct cuda_tgid_stats {
 	__u64 kernel_launches;
+	__u64 graph_launches;
 	__u64 last_launch_ns;
 	__u64 launch_gap_sum_ns;
 	__u64 launch_gap_count;
 	__u64 max_launch_gap_ns;
+	__u64 block_threads_sum;
+	__u64 grid_blocks_sum;
+	__u64 shared_mem_bytes_sum;
+	__u32 last_grid_x;
+	__u32 last_block_x;
 	__u64 memcpy_h2d_calls;
 	__u64 memcpy_h2d_bytes;
 	__u64 memcpy_d2h_calls;
@@ -31,8 +37,33 @@ struct cuda_tgid_stats {
 	__u64 max_sync_stall_ns;
 	__u64 sched_switches;
 	__u64 off_cpu_sum_ns;
+	__u64 launch_gap_hist[16];
+	__u64 sync_stall_hist[16];
 	char comm[16];
 };
+
+static __always_inline __u32 log2_bucket_16(__u64 us)
+{
+	__u32 b = 0;
+	if (us >= 256) {
+		us >>= 8;
+		b += 8;
+	}
+	if (us >= 16) {
+		us >>= 4;
+		b += 4;
+	}
+	if (us >= 4) {
+		us >>= 2;
+		b += 2;
+	}
+	if (us >= 2) {
+		b += 1;
+	}
+	if (b >= 15)
+		return 15;
+	return b;
+}
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -106,6 +137,32 @@ int handle_cuda_launch(struct pt_regs *ctx)
 	st->last_launch_ns = now;
 	__sync_fetch_and_add(&st->kernel_launches, 1);
 
+	/* Extract cuLaunchKernel grid (parm 2..4) and block (parm 5..6) geometry */
+	__u64 gx = (__u64)(__u32)PT_REGS_PARM2(ctx);
+	__u64 gy = (__u64)(__u32)PT_REGS_PARM3(ctx);
+	__u64 gz = (__u64)(__u32)PT_REGS_PARM4(ctx);
+	__u64 bx = (__u64)(__u32)PT_REGS_PARM5(ctx);
+	__u64 by = (__u64)(__u32)PT_REGS_PARM6(ctx);
+	if (gx > 0 && gx <= 65535 && bx > 0 && bx <= 1024) {
+		if (gy == 0 || gy > 65535)
+			gy = 1;
+		if (gz == 0 || gz > 65535)
+			gz = 1;
+		if (by == 0 || by > 1024)
+			by = 1;
+		__sync_fetch_and_add(&st->grid_blocks_sum, gx * gy * gz);
+		__sync_fetch_and_add(&st->block_threads_sum, bx * by);
+		st->last_grid_x = (__u32)gx;
+		st->last_block_x = (__u32)bx;
+	}
+
+	__u32 smem = 0;
+	void *sp = (void *)PT_REGS_SP(ctx);
+	if (sp && bpf_probe_read_user(&smem, sizeof(smem), (char *)sp + 16) == 0) {
+		if (smem > 0 && smem <= (256 * 1024))
+			__sync_fetch_and_add(&st->shared_mem_bytes_sum, (__u64)smem);
+	}
+
 	if (prev > 0 && now > prev) {
 		__u64 delta = now - prev;
 		if (delta <= MAX_INTRA_BURST_LAUNCH_GAP_NS) {
@@ -113,6 +170,42 @@ int handle_cuda_launch(struct pt_regs *ctx)
 			__sync_fetch_and_add(&st->launch_gap_count, 1);
 			if (delta > st->max_launch_gap_ns)
 				st->max_launch_gap_ns = delta;
+			__u32 b = log2_bucket_16(delta / 1000ULL);
+			if (b < 16)
+				__sync_fetch_and_add(&st->launch_gap_hist[b], 1);
+		}
+	}
+	return 0;
+}
+
+SEC("uprobe/cuGraphLaunch")
+int handle_graph_launch(struct pt_regs *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	if (tgid == 0)
+		return 0;
+
+	struct cuda_tgid_stats *st = get_or_init_current_stats(tgid);
+	if (!st)
+		return 0;
+
+	__u64 now = bpf_ktime_get_ns();
+	__u64 prev = st->last_launch_ns;
+	st->last_launch_ns = now;
+	__sync_fetch_and_add(&st->kernel_launches, 1);
+	__sync_fetch_and_add(&st->graph_launches, 1);
+
+	if (prev > 0 && now > prev) {
+		__u64 delta = now - prev;
+		if (delta <= MAX_INTRA_BURST_LAUNCH_GAP_NS) {
+			__sync_fetch_and_add(&st->launch_gap_sum_ns, delta);
+			__sync_fetch_and_add(&st->launch_gap_count, 1);
+			if (delta > st->max_launch_gap_ns)
+				st->max_launch_gap_ns = delta;
+			__u32 b = log2_bucket_16(delta / 1000ULL);
+			if (b < 16)
+				__sync_fetch_and_add(&st->launch_gap_hist[b], 1);
 		}
 	}
 	return 0;
@@ -237,6 +330,9 @@ int handle_sync_exit(struct pt_regs *ctx)
 		__sync_fetch_and_add(&st->sync_stall_sum_ns, delta);
 		if (delta > st->max_sync_stall_ns)
 			st->max_sync_stall_ns = delta;
+		__u32 b = log2_bucket_16(delta / 1000ULL);
+		if (b < 16)
+			__sync_fetch_and_add(&st->sync_stall_hist[b], 1);
 	}
 	return 0;
 }

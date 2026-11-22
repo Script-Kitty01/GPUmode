@@ -159,5 +159,18 @@ func TestRunInferenceBenchmarkWithMockStreamingServer(t *testing.T) {
 	if baseProf == optProf || fmt.Sprint(baseFlags) == fmt.Sprint(optFlags) {
 		t.Errorf("expected distinct baseline vs optimized llama-server flags")
 	}
+
+	// Verify concurrent multi-client workload execution (Concurrency = 3).
+	cfgConc := cfg
+	cfgConc.NumRequests = 6
+	cfgConc.Concurrency = 3
+	cfgConc.EBPFMode = ebpftrace.ModeOff
+	repConc, err := RunInferenceBenchmark(ctx, cfgConc, mon, config.DefaultEconomicsConfig())
+	if err != nil {
+		t.Fatalf("RunInferenceBenchmark(Concurrency=3) failed: %v", err)
+	}
+	if repConc.CompletedRequests != 6 || repConc.Concurrency != 3 {
+		t.Errorf("expected 6 completed requests at concurrency=3, got reqs=%d conc=%d", repConc.CompletedRequests, repConc.Concurrency)
+	}
 }
 

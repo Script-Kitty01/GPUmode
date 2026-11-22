@@ -39,6 +39,7 @@ type BenchmarkConfig struct {
 	GPULayers       int            `json:"gpuLayers"`                 // -ngl for llama-server
 	CtxSize         int            `json:"ctxSize"`                   // -c for llama-server
 	NumRequests     int            `json:"numRequests"`               // Number of real streaming inference requests
+	Concurrency     int            `json:"concurrency,omitempty"`     // Concurrent client workers (1..32)
 	MaxTokens       int            `json:"maxTokens"`                 // max_tokens per request
 	Prompts         []string       `json:"prompts,omitempty"`
 	EBPFMode        ebpftrace.Mode `json:"ebpfMode,omitempty"`
@@ -63,6 +64,7 @@ type WorkloadBenchmarkReport struct {
 	RunMode                string                      `json:"runMode"` // "baseline" or "optimized"
 	RuntimeProfile         string                      `json:"runtimeProfile"`
 	AppliedFlags           []string                    `json:"appliedFlags,omitempty"`
+	Concurrency            int                         `json:"concurrency,omitempty"`
 	Adapter                string                      `json:"adapter"`
 	ServerURL              string                      `json:"serverUrl"`
 	ModelName              string                      `json:"modelName"`
@@ -128,6 +130,15 @@ func RunInferenceBenchmark(
 	cfg.ServerURL = strings.TrimRight(cfg.ServerURL, "/")
 	if cfg.NumRequests <= 0 {
 		cfg.NumRequests = 4
+	}
+	if cfg.Concurrency <= 0 {
+		cfg.Concurrency = 1
+	}
+	if cfg.Concurrency > cfg.NumRequests {
+		cfg.Concurrency = cfg.NumRequests
+	}
+	if cfg.Concurrency > 32 {
+		cfg.Concurrency = 32
 	}
 	if cfg.MaxTokens <= 0 {
 		cfg.MaxTokens = 48
@@ -244,32 +255,72 @@ func RunInferenceBenchmark(
 	}
 
 	winStart := time.Now()
-	results := make([]RequestMeasurement, 0, cfg.NumRequests)
+	results := make([]RequestMeasurement, cfg.NumRequests)
 	var ttfts, tpots, totals []float64
 	totalTokens := 0
 
-	for i := 0; i < cfg.NumRequests; i++ {
-		prompt := cfg.Prompts[i%len(cfg.Prompts)]
-		rm, err := executeStreamingChat(ctx, cfg.ServerURL, cfg.ModelName, prompt, cfg.MaxTokens)
-		rm.RequestIndex = i + 1
-		if err != nil {
-			rm.Success = false
-			rm.Error = err.Error()
-		} else {
-			rm.Success = true
-			ttfts = append(ttfts, rm.TTFTMS)
-			if rm.TPOTMS > 0 {
-				tpots = append(tpots, rm.TPOTMS)
+	if cfg.Concurrency <= 1 {
+		for i := 0; i < cfg.NumRequests; i++ {
+			prompt := cfg.Prompts[i%len(cfg.Prompts)]
+			rm, err := executeStreamingChat(ctx, cfg.ServerURL, cfg.ModelName, prompt, cfg.MaxTokens)
+			rm.RequestIndex = i + 1
+			if err != nil {
+				rm.Success = false
+				rm.Error = err.Error()
+			} else {
+				rm.Success = true
+				ttfts = append(ttfts, rm.TTFTMS)
+				if rm.TPOTMS > 0 {
+					tpots = append(tpots, rm.TPOTMS)
+				}
+				totals = append(totals, rm.TotalLatencyMS)
+				totalTokens += rm.OutputTokens
 			}
-			totals = append(totals, rm.TotalLatencyMS)
-			totalTokens += rm.OutputTokens
+			if i == 0 && mon != nil {
+				for _, pid := range mon.ActiveComputePIDs() {
+					sess.AddTargetPID(pid)
+				}
+			}
+			results[i] = rm
 		}
-		if i == 0 && mon != nil {
-			for _, pid := range mon.ActiveComputePIDs() {
-				sess.AddTargetPID(pid)
+	} else {
+		jobs := make(chan int, cfg.NumRequests)
+		for i := 0; i < cfg.NumRequests; i++ {
+			jobs <- i
+		}
+		close(jobs)
+
+		var reqWG sync.WaitGroup
+		for w := 0; w < cfg.Concurrency; w++ {
+			reqWG.Add(1)
+			go func() {
+				defer reqWG.Done()
+				for idx := range jobs {
+					prompt := cfg.Prompts[idx%len(cfg.Prompts)]
+					rm, err := executeStreamingChat(ctx, cfg.ServerURL, cfg.ModelName, prompt, cfg.MaxTokens)
+					rm.RequestIndex = idx + 1
+					if err != nil {
+						rm.Success = false
+						rm.Error = err.Error()
+					} else {
+						rm.Success = true
+					}
+					results[idx] = rm
+				}
+			}()
+		}
+		reqWG.Wait()
+
+		for _, rm := range results {
+			if rm.Success {
+				ttfts = append(ttfts, rm.TTFTMS)
+				if rm.TPOTMS > 0 {
+					tpots = append(tpots, rm.TPOTMS)
+				}
+				totals = append(totals, rm.TotalLatencyMS)
+				totalTokens += rm.OutputTokens
 			}
 		}
-		results = append(results, rm)
 	}
 	winEnd := time.Now()
 	if mon != nil {
@@ -341,6 +392,7 @@ func RunInferenceBenchmark(
 		RunMode:                runMode,
 		RuntimeProfile:         runtimeProfile,
 		AppliedFlags:           appliedFlags,
+		Concurrency:            cfg.Concurrency,
 		Adapter:                "OpenAI-Compatible Local Inference Adapter (llama-server / Ollama)",
 		ServerURL:              cfg.ServerURL,
 		ModelName:              cfg.ModelName,

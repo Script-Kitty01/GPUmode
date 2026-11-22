@@ -49,17 +49,21 @@ const (
 
 // Sample represents a point-in-time GPU telemetry snapshot from NVML or nvidia-smi.
 type Sample struct {
-	Timestamp    time.Time `json:"timestamp"`
-	GPUName      string    `json:"gpuName"`
-	PowerWatts   float64   `json:"powerWatts"`
-	SMClockMHz   float64   `json:"smClockMhz"`
-	MemClockMHz  float64   `json:"memClockMhz"`
-	TemperatureC float64   `json:"temperatureC"`
-	GPUUtilPct   float64   `json:"gpuUtilPct"`
-	MemUtilPct   float64   `json:"memUtilPct"`
-	VRAMUsedMiB  float64   `json:"vramUsedMib"`
-	VRAMTotalMiB float64   `json:"vramTotalMib"`
-	Source       string    `json:"source,omitempty"`
+	Timestamp              time.Time `json:"timestamp"`
+	GPUName                string    `json:"gpuName"`
+	PowerWatts             float64   `json:"powerWatts"`
+	SMClockMHz             float64   `json:"smClockMhz"`
+	MemClockMHz            float64   `json:"memClockMhz"`
+	TemperatureC           float64   `json:"temperatureC"`
+	GPUUtilPct             float64   `json:"gpuUtilPct"`
+	MemUtilPct             float64   `json:"memUtilPct"`
+	VRAMUsedMiB            float64   `json:"vramUsedMib"`
+	VRAMTotalMiB           float64   `json:"vramTotalMib"`
+	ThrottleReasonsBitmask uint64    `json:"throttleReasonsBitmask,omitempty"`
+	ThrottleReasons        []string  `json:"throttleReasons,omitempty"`
+	PCIeTxKBps             uint32    `json:"pcieTxKbps,omitempty"`
+	PCIeRxKBps             uint32    `json:"pcieRxKbps,omitempty"`
+	Source                 string    `json:"source,omitempty"`
 }
 
 // EnergyMeasurement captures integrated energy, idle-baseline subtraction, uncertainty, and provenance over execution windows.
@@ -430,17 +434,21 @@ func (m *Monitor) queryNVML(ctx context.Context) (Sample, error) {
 	}
 
 	return Sample{
-		Timestamp:    time.Now(),
-		GPUName:      ds.GPUName,
-		PowerWatts:   ds.PowerWatts,
-		SMClockMHz:   ds.SMClockMHz,
-		MemClockMHz:  ds.MemClockMHz,
-		TemperatureC: ds.TemperatureC,
-		GPUUtilPct:   ds.GPUUtilPct,
-		MemUtilPct:   ds.MemUtilPct,
-		VRAMUsedMiB:  ds.VRAMUsedMiB,
-		VRAMTotalMiB: ds.VRAMTotalMiB,
-		Source:       "NVML",
+		Timestamp:              time.Now(),
+		GPUName:                ds.GPUName,
+		PowerWatts:             ds.PowerWatts,
+		SMClockMHz:             ds.SMClockMHz,
+		MemClockMHz:            ds.MemClockMHz,
+		TemperatureC:           ds.TemperatureC,
+		GPUUtilPct:             ds.GPUUtilPct,
+		MemUtilPct:             ds.MemUtilPct,
+		VRAMUsedMiB:            ds.VRAMUsedMiB,
+		VRAMTotalMiB:           ds.VRAMTotalMiB,
+		ThrottleReasonsBitmask: ds.ThrottleReasonsBitmask,
+		ThrottleReasons:        ds.ThrottleReasons,
+		PCIeTxKBps:             ds.PCIeTxKBps,
+		PCIeRxKBps:             ds.PCIeRxKBps,
+		Source:                 "NVML",
 	}, nil
 }
 

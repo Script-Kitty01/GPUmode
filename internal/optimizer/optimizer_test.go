@@ -64,7 +64,7 @@ func TestAllSupportedCUDAKernelOperations(t *testing.T) {
 	runner.RunSanitizer = false
 	proposer := NewDeterministicProposerForHardware(hw)
 
-	for _, op := range []string{"layernorm", "softmax", "swiglu"} {
+	for _, op := range []string{"layernorm", "softmax", "swiglu", "rope_qkv", "qgemv_decode", "gqa_attention"} {
 		t.Run(op, func(t *testing.T) {
 			base, cands := proposer.ProposeCandidates(op, 64, 1024, 15)
 			res := runner.EvaluateBatch(ctx, []harness.KernelSpec{base, cands[len(cands)-1]})
@@ -76,7 +76,50 @@ func TestAllSupportedCUDAKernelOperations(t *testing.T) {
 					t.Fatalf("%s kernel %s failed verification: compiled=%v parity=%v edge=%v err=%s",
 						op, r.Spec.ID, r.CompiledOK, r.ParityPassed, r.EdgeCasePassed, r.ErrorMessage)
 				}
+				if r.TheoreticalOccupancyPct <= 0 || r.ActiveWarpsPerSM <= 0 {
+					t.Errorf("%s kernel %s missing occupancy stats: occ=%.1f%% activeWarps=%d",
+						op, r.Spec.ID, r.TheoreticalOccupancyPct, r.ActiveWarpsPerSM)
+				}
 			}
 		})
+	}
+}
+
+func TestSelfHealingRepairLoopOnBrokenKernel(t *testing.T) {
+	ctx := context.Background()
+	nvccPath := config.ResolveNVCCPath()
+	smiPath := config.ResolveNvidiaSMIPath()
+	hw, err := physics.DetectHardwareForDevice(ctx, config.DefaultGPUIndex(), nvccPath, smiPath)
+	if err != nil {
+		t.Skipf("live CUDA GPU unavailable (%v); skipping repair test", err)
+	}
+
+	runner := harness.NewRunner(nvccPath, config.ResolveSanitizerPath(), hw.ArchFlag, 2, 25*time.Second, nil)
+	runner.GPUIndex = hw.GPUIndex
+	runner.RunSanitizer = false
+
+	brokenSpec := harness.KernelSpec{
+		ID:         "broken_rmsnorm",
+		Name:       "Broken Synthesized Kernel",
+		OpCategory: "rmsnorm_residual",
+		BlockSize:  256,
+		VecWidth:   4,
+		Fused:      true,
+		BatchSize:  64,
+		HiddenDim:  1024,
+		Iterations: 10,
+		CUDASource: "__global__ void bad_kernel() { syntax_error_here }",
+	}
+	failedList := runner.EvaluateBatch(ctx, []harness.KernelSpec{brokenSpec})
+	if len(failedList) != 1 || failedList[0].CompiledOK {
+		t.Fatalf("expected broken kernel to fail initial compilation")
+	}
+
+	repaired, attempts := RepairCandidateWithFeedback(ctx, runner, failedList[0], NewDeterministicProposerForHardware(hw), 2)
+	if len(attempts) == 0 {
+		t.Fatalf("expected at least 1 repair attempt")
+	}
+	if !repaired.CompiledOK || !repaired.ParityPassed || !repaired.EdgeCasePassed {
+		t.Fatalf("expected self-healed kernel to compile and pass parity, got: %+v", repaired)
 	}
 }

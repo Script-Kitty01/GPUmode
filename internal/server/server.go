@@ -62,14 +62,102 @@ func NewServer(
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
+	mux.HandleFunc("/metrics", s.handlePrometheusMetrics)
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/models", s.handleModels)
 	mux.HandleFunc("/api/telemetry/history", s.handleTelemetryHistory)
 	mux.HandleFunc("/api/stream/telemetry", s.handleTelemetrySSE)
+	mux.HandleFunc("/api/trace/perfetto", s.handlePerfettoTrace)
 	mux.HandleFunc("/api/optimize", s.handleOptimize)
 	mux.HandleFunc("/api/recompute", s.handleRecompute)
 	mux.HandleFunc("/api/workload", s.handleWorkload)
 	return mux
+}
+
+func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	hw := s.hardware
+	ebpfSum := s.ebpfStatus
+	s.mu.RUnlock()
+
+	if latest, ok := s.store.Latest(); ok && latest.HostCUDATrace.Active {
+		ebpfSum = latest.HostCUDATrace
+	}
+
+	var sample telemetry.Sample
+	backend := "NVIDIA_SMI"
+	if s.monitor != nil {
+		backend = s.monitor.Backend()
+		sample = s.monitor.Latest()
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# HELP gpumode_nvml_power_watts Current GPU board power draw in Watts.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_nvml_power_watts gauge\n")
+	fmt.Fprintf(w, "gpumode_nvml_power_watts{gpu=%q,arch=%q,backend=%q} %.2f\n", hw.Name, hw.ArchFlag, backend, sample.PowerWatts)
+	fmt.Fprintf(w, "# HELP gpumode_nvml_sm_clock_mhz Current SM clock frequency in MHz.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_nvml_sm_clock_mhz gauge\n")
+	fmt.Fprintf(w, "gpumode_nvml_sm_clock_mhz{gpu=%q} %.0f\n", hw.Name, sample.SMClockMHz)
+	fmt.Fprintf(w, "# HELP gpumode_nvml_mem_clock_mhz Current memory clock frequency in MHz.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_nvml_mem_clock_mhz gauge\n")
+	fmt.Fprintf(w, "gpumode_nvml_mem_clock_mhz{gpu=%q} %.0f\n", hw.Name, sample.MemClockMHz)
+	fmt.Fprintf(w, "# HELP gpumode_nvml_temperature_celsius Current GPU core temperature in Celsius.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_nvml_temperature_celsius gauge\n")
+	fmt.Fprintf(w, "gpumode_nvml_temperature_celsius{gpu=%q} %.1f\n", hw.Name, sample.TemperatureC)
+	fmt.Fprintf(w, "# HELP gpumode_nvml_vram_used_mib Current used GPU VRAM in MiB.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_nvml_vram_used_mib gauge\n")
+	fmt.Fprintf(w, "gpumode_nvml_vram_used_mib{gpu=%q} %.1f\n", hw.Name, sample.VRAMUsedMiB)
+	fmt.Fprintf(w, "# HELP gpumode_nvml_throttle_reasons_bitmask Active NVML clock throttle reason bitmask.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_nvml_throttle_reasons_bitmask gauge\n")
+	fmt.Fprintf(w, "gpumode_nvml_throttle_reasons_bitmask{gpu=%q} %d\n", hw.Name, sample.ThrottleReasonsBitmask)
+	fmt.Fprintf(w, "# HELP gpumode_hardware_empirical_dram_gbps Empirical sustained DRAM STREAM Triad bandwidth in GB/s.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_hardware_empirical_dram_gbps gauge\n")
+	fmt.Fprintf(w, "gpumode_hardware_empirical_dram_gbps{gpu=%q} %.2f\n", hw.Name, hw.EmpiricalDRAMBandwidthGBps)
+	fmt.Fprintf(w, "# HELP gpumode_hardware_empirical_l2_gbps Empirical sustained L2 cache bandwidth in GB/s.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_hardware_empirical_l2_gbps gauge\n")
+	fmt.Fprintf(w, "gpumode_hardware_empirical_l2_gbps{gpu=%q} %.2f\n", hw.Name, hw.EmpiricalL2BandwidthGBps)
+	fmt.Fprintf(w, "# HELP gpumode_ebpf_kernel_launches_total Total CUDA kernel launches captured in latest eBPF window.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_ebpf_kernel_launches_total gauge\n")
+	fmt.Fprintf(w, "gpumode_ebpf_kernel_launches_total{provenance=%q} %d\n", ebpfSum.Provenance, ebpfSum.KernelLaunches)
+	fmt.Fprintf(w, "# HELP gpumode_ebpf_launch_gap_avg_us Average inter-launch host dispatch gap in microseconds.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_ebpf_launch_gap_avg_us gauge\n")
+	fmt.Fprintf(w, "gpumode_ebpf_launch_gap_avg_us %.2f\n", ebpfSum.AvgLaunchGapUS)
+	fmt.Fprintf(w, "# HELP gpumode_ebpf_launch_gap_p95_us p95 inter-launch host dispatch gap in microseconds.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_ebpf_launch_gap_p95_us gauge\n")
+	fmt.Fprintf(w, "gpumode_ebpf_launch_gap_p95_us %.2f\n", ebpfSum.P95LaunchGapUS)
+	fmt.Fprintf(w, "# HELP gpumode_ebpf_sync_stall_ms_total Total host CUDA stream/ctx synchronize stall time in ms.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_ebpf_sync_stall_ms_total gauge\n")
+	fmt.Fprintf(w, "gpumode_ebpf_sync_stall_ms_total %.2f\n", ebpfSum.SyncStallMS)
+	fmt.Fprintf(w, "# HELP gpumode_ebpf_off_cpu_ms_total Total Linux scheduler off-CPU starvation time in ms.\n")
+	fmt.Fprintf(w, "# TYPE gpumode_ebpf_off_cpu_ms_total gauge\n")
+	fmt.Fprintf(w, "gpumode_ebpf_off_cpu_ms_total %.2f\n", ebpfSum.OffCPUMS)
+}
+
+func (s *Server) handlePerfettoTrace(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	ebpfSum := s.ebpfStatus
+	if s.lastOptimized != nil && s.lastOptimized.HostCUDATrace.Active {
+		ebpfSum = s.lastOptimized.HostCUDATrace
+	} else if s.lastBaseline != nil && s.lastBaseline.HostCUDATrace.Active {
+		ebpfSum = s.lastBaseline.HostCUDATrace
+	}
+	s.mu.RUnlock()
+
+	if !ebpfSum.Active || ebpfSum.KernelLaunches == 0 {
+		if latest, ok := s.store.Latest(); ok && latest.HostCUDATrace.KernelLaunches > 0 {
+			ebpfSum = latest.HostCUDATrace
+		}
+	}
+
+	traceBytes, err := ebpftrace.BuildPerfettoTrace(ebpfSum)
+	if err != nil {
+		http.Error(w, "failed to build Perfetto trace: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="gpumode_ebpf_trace.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(traceBytes)
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {

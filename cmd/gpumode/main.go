@@ -56,8 +56,10 @@ func main() {
 	llmURL := fs.String("llm-url", "http://127.0.0.1:8081", "OpenAI-compatible local inference server URL (llama-server or Ollama) for workload command")
 	llmModel := fs.String("llm-model", "", "Model name for workload benchmark requests (auto-discovered if empty)")
 	llmReqs := fs.Int("llm-reqs", 4, "Number of streaming inference requests for workload benchmark")
+	llmConcurrency := fs.Int("llm-concurrency", 1, "Concurrent client workers for workload benchmark (1..32)")
 	llmMaxTok := fs.Int("llm-tokens", 48, "Max tokens per request for workload benchmark")
 	autoServer := fs.Bool("auto-server", true, "Automatically launch temporary llama-server with -deepseek-model if -llm-url is not running")
+	minSpeedup := fs.Float64("min-speedup", 1.10, "Minimum required speedup factor for 'gpumode check' CI regression gate")
 	jsonOut := fs.Bool("json", false, "Emit full CausalChainReport as JSON")
 	_ = fs.Parse(os.Args[1:])
 
@@ -201,6 +203,7 @@ func main() {
 		wCfg.ModelPath = *deepseekModel
 		wCfg.AutoServer = *autoServer
 		wCfg.NumRequests = *llmReqs
+		wCfg.Concurrency = *llmConcurrency
 		wCfg.MaxTokens = *llmMaxTok
 		wCfg.EBPFMode = ebpfMode
 		wCfg.TracePID = cfg.TracePID
@@ -220,6 +223,61 @@ func main() {
 			return
 		}
 		printWorkloadReportCLI(wRep)
+
+	case "check":
+		strat := optimizer.StrategyBayesian
+		if *strategy == string(optimizer.StrategyGrid) {
+			strat = optimizer.StrategyGrid
+		}
+		rep := pipe.Execute(ctx, *op, *batch, *hidden, *iters, strat, cfg.Economics)
+		_ = st.Save(rep)
+		best := rep.Autotune.BestResult
+		speedup := rep.EconomicsComparison.SpeedupFactor
+		passed := best.CompiledOK &&
+			best.SanitizerPassed &&
+			best.ParityPassed &&
+			best.EdgeCasePassed &&
+			best.PTXAS.SpillStoresBytes == 0 &&
+			speedup >= *minSpeedup
+
+		if *jsonOut {
+			out := map[string]any{
+				"passed":              passed,
+				"opCategory":          rep.OpCategory,
+				"speedupFactor":       speedup,
+				"minSpeedupRequired":  *minSpeedup,
+				"sanitizerPassed":     best.SanitizerPassed,
+				"parityPassed":        best.ParityPassed,
+				"edgeCase1027Passed":  best.EdgeCasePassed,
+				"maxAbsError":         best.MaxAbsError,
+				"spillStoresBytes":    best.PTXAS.SpillStoresBytes,
+				"occupancyPct":        best.TheoreticalOccupancyPct,
+				"joulesPer1kRequests": best.Energy.JoulesPer1KRequests,
+			}
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(out)
+		} else {
+			statusStr := "PASS"
+			if !passed {
+				statusStr = "FAIL"
+			}
+			fmt.Printf("================================================================================\n")
+			fmt.Printf(" gpuMode CI Hardware Regression Gate [%s] — %s (%s)\n", statusStr, hw.Name, hw.ArchFlag)
+			fmt.Printf("================================================================================\n")
+			fmt.Printf("  • Operation / Winner  : %s -> %s\n", rep.OpCategory, best.Spec.Name)
+			fmt.Printf("  • Speedup Factor      : %.2fx (required >= %.2fx)\n", speedup, *minSpeedup)
+			fmt.Printf("  • Sanitizer & Parity  : sanitizer=%t | parity=%t | edge_1027=%t (maxErr=%.2e)\n",
+				best.SanitizerPassed, best.ParityPassed, best.EdgeCasePassed, best.MaxAbsError)
+			fmt.Printf("  • PTXAS & Occupancy   : %d regs | %d B spill stores | %.0f%% SM occupancy (%d/%d warps)\n",
+				best.PTXAS.RegistersPerThread, best.PTXAS.SpillStoresBytes,
+				best.TheoreticalOccupancyPct, best.ActiveWarpsPerSM, best.MaxWarpsPerSM)
+			fmt.Printf("================================================================================\n")
+		}
+		if !passed {
+			_ = mon.Close()
+			os.Exit(1)
+		}
 
 	case "dashboard", "serve":
 		// Pre-warm an initial verified causal report if none exists yet, or if eBPF is now
@@ -251,7 +309,7 @@ func main() {
 
 	default:
 		_ = mon.Close()
-		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|monitor|ebpf] [flags]\n")
+		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|monitor|ebpf|check] [flags]\n")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}

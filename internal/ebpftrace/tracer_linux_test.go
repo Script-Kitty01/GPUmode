@@ -40,6 +40,7 @@ func TestEmbeddedBPFCollectionSpecValid(t *testing.T) {
 
 	expectedProgs := []string{
 		"handle_cuda_launch",
+		"handle_graph_launch",
 		"handle_memcpy_h2d",
 		"handle_memcpy_d2h",
 		"handle_cudart_memcpy",

@@ -34,16 +34,17 @@ type AutotuneTrial struct {
 
 // AutotuneSummary compares Bayesian UCB optimization vs Exhaustive Grid Search efficiency.
 type AutotuneSummary struct {
-	Strategy                 TuningStrategy          `json:"strategy"`
-	BaselineResult           harness.BenchmarkResult `json:"baselineResult"`
-	BestResult               harness.BenchmarkResult `json:"bestResult"`
-	Trials                   []AutotuneTrial         `json:"trials"`
-	ParetoCandidates         []pareto.Candidate      `json:"paretoCandidates"`
-	ParetoRecommendations    pareto.ModeRecommendations `json:"paretoRecommendations"`
-	BayesianEvaluations      int                     `json:"bayesianEvaluations"`
-	GridTotalConfigurations  int                     `json:"gridTotalConfigurations"`
-	TuningTimeSavedPct       float64                 `json:"tuningTimeSavedPct"`
-	QualityPerTuningSec      float64                 `json:"qualityPerTuningSec"`
+	Strategy                TuningStrategy             `json:"strategy"`
+	BaselineResult          harness.BenchmarkResult    `json:"baselineResult"`
+	BestResult              harness.BenchmarkResult    `json:"bestResult"`
+	Trials                  []AutotuneTrial            `json:"trials"`
+	RepairAttempts          []KernelRepairAttempt      `json:"repairAttempts,omitempty"`
+	ParetoCandidates        []pareto.Candidate         `json:"paretoCandidates"`
+	ParetoRecommendations   pareto.ModeRecommendations `json:"paretoRecommendations"`
+	BayesianEvaluations     int                        `json:"bayesianEvaluations"`
+	GridTotalConfigurations int                        `json:"gridTotalConfigurations"`
+	TuningTimeSavedPct      float64                    `json:"tuningTimeSavedPct"`
+	QualityPerTuningSec     float64                    `json:"qualityPerTuningSec"`
 }
 
 // Autotuner runs hardware-verified kernel optimization using either Bayesian UCB or Grid Search.
@@ -82,6 +83,7 @@ func (a *Autotuner) Run(
 
 	var evaluated []harness.BenchmarkResult
 	var trials []AutotuneTrial
+	var repairAttempts []KernelRepairAttempt
 
 	gridTotal := len(candSpecs)
 	if strategy == StrategyBayesian && len(candSpecs) > 3 {
@@ -96,6 +98,13 @@ func (a *Autotuner) Run(
 		}
 		seedRes := a.Runner.EvaluateBatch(ctx, seedSpecs)
 		for i, r := range seedRes {
+			if !r.CompiledOK || !r.SanitizerPassed || !r.ParityPassed || !r.EdgeCasePassed {
+				repaired, att := RepairCandidateWithFeedback(ctx, a.Runner, r, a.Proposer, 2)
+				if len(att) > 0 {
+					repairAttempts = append(repairAttempts, att...)
+					r = repaired
+				}
+			}
 			obj := computeObjectiveJ(r, baseRes, econ)
 			evaluated = append(evaluated, r)
 			trials = append(trials, AutotuneTrial{
@@ -134,6 +143,13 @@ func (a *Autotuner) Run(
 			nextResList := a.Runner.EvaluateBatch(ctx, []harness.KernelSpec{candSpecs[bestNextIdx]})
 			if len(nextResList) > 0 {
 				r := nextResList[0]
+				if !r.CompiledOK || !r.SanitizerPassed || !r.ParityPassed || !r.EdgeCasePassed {
+					repaired, att := RepairCandidateWithFeedback(ctx, a.Runner, r, a.Proposer, 2)
+					if len(att) > 0 {
+						repairAttempts = append(repairAttempts, att...)
+						r = repaired
+					}
+				}
 				obj := computeObjectiveJ(r, baseRes, econ)
 				evaluated = append(evaluated, r)
 				trials = append(trials, AutotuneTrial{
@@ -204,6 +220,7 @@ func (a *Autotuner) Run(
 		BaselineResult:          baseRes,
 		BestResult:              bestRes,
 		Trials:                  trials,
+		RepairAttempts:          repairAttempts,
 		ParetoCandidates:        paretoList,
 		ParetoRecommendations:   paretoRecs,
 		BayesianEvaluations:     len(trials),

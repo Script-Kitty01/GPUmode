@@ -33,6 +33,7 @@ type KernelSpec struct {
 	Name          string `json:"name"`
 	OpCategory    string `json:"opCategory"`
 	Variant       string `json:"variant"`
+	Precision     string `json:"precision,omitempty"` // "fp32", "fp16", "bf16", "q8_0"
 	BlockSize     int    `json:"blockSize"`
 	VecWidth      int    `json:"vecWidth"`
 	Fused         bool   `json:"fused"`
@@ -45,36 +46,45 @@ type KernelSpec struct {
 
 // HarnessOutput matches the JSON line printed by the compiled CUDA C++ benchmark binary.
 type HarnessOutput struct {
-	ParityPassed      bool    `json:"parityPassed"`
-	MaxAbsError       float64 `json:"maxAbsError"`
-	EdgeCasePassed    bool    `json:"edgeCasePassed"`
-	MedianLatencyMS   float64 `json:"medianLatencyMs"`
-	P95LatencyMS      float64 `json:"p95LatencyMs"`
-	MinLatencyMS      float64 `json:"minLatencyMs"`
-	EffectiveBWGBps   float64 `json:"effectiveBwGbps"`
-	CompletedRequests int     `json:"completedRequests"`
-	PeakVRAMMiB       float64 `json:"peakVramMib"`
+	ParityPassed            bool    `json:"parityPassed"`
+	MaxAbsError             float64 `json:"maxAbsError"`
+	EdgeCasePassed          bool    `json:"edgeCasePassed"`
+	MedianLatencyMS         float64 `json:"medianLatencyMs"`
+	P95LatencyMS            float64 `json:"p95LatencyMs"`
+	MinLatencyMS            float64 `json:"minLatencyMs"`
+	EffectiveBWGBps         float64 `json:"effectiveBwGbps"`
+	CompletedRequests       int     `json:"completedRequests"`
+	PeakVRAMMiB             float64 `json:"peakVramMib"`
+	ActiveBlocksPerSM       int     `json:"activeBlocksPerSm,omitempty"`
+	ActiveWarpsPerSM        int     `json:"activeWarpsPerSm,omitempty"`
+	MaxWarpsPerSM           int     `json:"maxWarpsPerSm,omitempty"`
+	TheoreticalOccupancyPct float64 `json:"theoreticalOccupancyPct,omitempty"`
 }
 
 // BenchmarkResult combines compiler stats, sanitizer/numerical verification, timing, and live energy integration.
 type BenchmarkResult struct {
-	Spec            KernelSpec                  `json:"spec"`
-	CompiledOK      bool                        `json:"compiledOk"`
-	CompileTimeMS   float64                     `json:"compileTimeMs"`
-	CompilerLog     string                      `json:"compilerLog,omitempty"`
-	PTXAS           PTXASStats                  `json:"ptxas"`
-	SanitizerPassed bool                        `json:"sanitizerPassed"`
-	SanitizerLog    string                      `json:"sanitizerLog,omitempty"`
-	ParityPassed    bool                        `json:"parityPassed"`
-	EdgeCasePassed  bool                        `json:"edgeCasePassed"`
-	MaxAbsError     float64                     `json:"maxAbsError"`
-	MedianLatencyMS float64                     `json:"medianLatencyMs"`
-	P95LatencyMS    float64                     `json:"p95LatencyMs"`
-	ThroughputRPS   float64                     `json:"throughputRps"`
-	EffectiveBWGBps float64                     `json:"effectiveBwGbps"`
-	PeakVRAMMiB     float64                     `json:"peakVramMib"`
-	Energy          telemetry.EnergyMeasurement `json:"energy"`
-	ErrorMessage    string                      `json:"errorMessage,omitempty"`
+	Spec                    KernelSpec                  `json:"spec"`
+	CompiledOK              bool                        `json:"compiledOk"`
+	CompileTimeMS           float64                     `json:"compileTimeMs"`
+	CompilerLog             string                      `json:"compilerLog,omitempty"`
+	PTXAS                   PTXASStats                  `json:"ptxas"`
+	ActiveBlocksPerSM       int                         `json:"activeBlocksPerSm,omitempty"`
+	ActiveWarpsPerSM        int                         `json:"activeWarpsPerSm,omitempty"`
+	MaxWarpsPerSM           int                         `json:"maxWarpsPerSm,omitempty"`
+	TheoreticalOccupancyPct float64                     `json:"theoreticalOccupancyPct,omitempty"`
+	OccupancyLimiter        string                      `json:"occupancyLimiter,omitempty"`
+	SanitizerPassed         bool                        `json:"sanitizerPassed"`
+	SanitizerLog            string                      `json:"sanitizerLog,omitempty"`
+	ParityPassed            bool                        `json:"parityPassed"`
+	EdgeCasePassed          bool                        `json:"edgeCasePassed"`
+	MaxAbsError             float64                     `json:"maxAbsError"`
+	MedianLatencyMS         float64                     `json:"medianLatencyMs"`
+	P95LatencyMS            float64                     `json:"p95LatencyMs"`
+	ThroughputRPS           float64                     `json:"throughputRps"`
+	EffectiveBWGBps         float64                     `json:"effectiveBwGbps"`
+	PeakVRAMMiB             float64                     `json:"peakVramMib"`
+	Energy                  telemetry.EnergyMeasurement `json:"energy"`
+	ErrorMessage            string                      `json:"errorMessage,omitempty"`
 }
 
 // Runner manages parallel nvcc compilation workers and a serialized GPU verification & benchmark mutex.
@@ -462,6 +472,13 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 		res.ThroughputRPS = 1000.0 / res.MedianLatencyMS
 	}
 
+	actBlocks, actWarps, maxWarps, occPct, limiter := ComputeTheoreticalOccupancy(art.spec.BlockSize, res.PTXAS, lastOut.ActiveBlocksPerSM, lastOut.MaxWarpsPerSM)
+	res.ActiveBlocksPerSM = actBlocks
+	res.ActiveWarpsPerSM = actWarps
+	res.MaxWarpsPerSM = maxWarps
+	res.TheoreticalOccupancyPct = occPct
+	res.OccupancyLimiter = limiter
+
 	if r.Monitor != nil && len(windowMeasurements) > 0 {
 		res.Energy = telemetry.AggregateWindowMeasurements(windowMeasurements, idlePowerW, totalKernelMS, burstInterval)
 	} else {
@@ -494,6 +511,75 @@ func (r *Runner) executeAndMeasure(ctx context.Context, art compiledArtifact) Be
 	}
 
 	return res
+}
+
+// ComputeTheoreticalOccupancy combines CUDA Occupancy API active-block counts (when emitted by the
+// C++ harness) with PTXAS register and shared-memory footprints to report SM warp occupancy and limiter.
+func ComputeTheoreticalOccupancy(blockSize int, ptxas PTXASStats, apiActiveBlocks, apiMaxWarps int) (activeBlocks, activeWarps, maxWarps int, occPct float64, limiter string) {
+	if blockSize <= 0 {
+		blockSize = 256
+	}
+	warpsPerBlock := (blockSize + 31) / 32
+	if warpsPerBlock <= 0 {
+		warpsPerBlock = 8
+	}
+
+	maxWarps = apiMaxWarps
+	if maxWarps <= 0 {
+		maxWarps = 48 // Standard Ada/Ampere/Hopper 1536 threads / 32
+	}
+	const maxRegsPerSM = 65536
+	const maxSharedMemPerSM = 102400
+	const maxBlocksPerSM = 24
+
+	blocksByWarps := maxWarps / warpsPerBlock
+	blocksByRegs := maxBlocksPerSM
+	if ptxas.RegistersPerThread > 0 {
+		regsPerBlock := ptxas.RegistersPerThread * warpsPerBlock * 32
+		if regsPerBlock > 0 {
+			blocksByRegs = maxRegsPerSM / regsPerBlock
+		}
+	}
+	blocksBySmem := maxBlocksPerSM
+	if ptxas.SharedMemBytes > 0 {
+		blocksBySmem = maxSharedMemPerSM / ptxas.SharedMemBytes
+	}
+
+	activeBlocks = apiActiveBlocks
+	if activeBlocks <= 0 {
+		activeBlocks = blocksByWarps
+		if blocksByRegs < activeBlocks {
+			activeBlocks = blocksByRegs
+		}
+		if blocksBySmem < activeBlocks {
+			activeBlocks = blocksBySmem
+		}
+		if maxBlocksPerSM < activeBlocks {
+			activeBlocks = maxBlocksPerSM
+		}
+		if activeBlocks < 1 {
+			activeBlocks = 1
+		}
+	}
+
+	activeWarps = activeBlocks * warpsPerBlock
+	if activeWarps > maxWarps {
+		activeWarps = maxWarps
+	}
+	occPct = float64(activeWarps) * 100.0 / float64(maxWarps)
+	if occPct > 100.0 {
+		occPct = 100.0
+	}
+
+	limiter = "BLOCK_SIZE_WARPS"
+	if blocksByRegs <= blocksByWarps && blocksByRegs <= blocksBySmem && ptxas.RegistersPerThread >= 40 {
+		limiter = "REGISTERS"
+	} else if blocksBySmem < blocksByWarps && blocksBySmem <= blocksByRegs {
+		limiter = "SHARED_MEMORY"
+	} else if activeBlocks >= maxBlocksPerSM {
+		limiter = "MAX_BLOCKS_PER_SM"
+	}
+	return activeBlocks, activeWarps, maxWarps, occPct, limiter
 }
 
 func (r *Runner) cudaExecEnv() []string {

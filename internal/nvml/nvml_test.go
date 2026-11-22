@@ -29,6 +29,17 @@ func TestUsedVRAMBytesToMiB(t *testing.T) {
 	}
 }
 
+func TestDecodeThrottleReasons(t *testing.T) {
+	if got := DecodeThrottleReasons(0); len(got) != 0 {
+		t.Fatalf("expected nil for mask 0, got %v", got)
+	}
+	mask := ThrottleReasonSwPowerCap | ThrottleReasonHwThermalSlowdown
+	reasons := DecodeThrottleReasons(mask)
+	if len(reasons) != 2 || reasons[0] != "SwPowerCap" || reasons[1] != "HwThermalSlowdown" {
+		t.Fatalf("unexpected decoded throttle reasons: %v", reasons)
+	}
+}
+
 func TestOpenEnvVarSearchOrder(t *testing.T) {
 	t.Setenv("GPUMODE_NVML_LIB", "/nonexistent/custom-nvml.so.1")
 	client, err := Open()

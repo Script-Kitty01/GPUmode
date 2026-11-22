@@ -29,6 +29,11 @@ enum {
 	GPUMODE_NVML_TEMPERATURE_GPU = 0
 };
 
+enum {
+	GPUMODE_NVML_PCIE_UTIL_TX_BYTES = 0,
+	GPUMODE_NVML_PCIE_UTIL_RX_BYTES = 1
+};
+
 typedef struct {
 	unsigned int gpu;
 	unsigned int memory;
@@ -65,6 +70,8 @@ typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetMaxClockInfo_t)(gpumode_nvmlDevic
 typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetTemperature_t)(gpumode_nvmlDevice_t, int, unsigned int*);
 typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetUtilizationRates_t)(gpumode_nvmlDevice_t, gpumode_nvmlUtilization_t*);
 typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetMemoryInfo_t)(gpumode_nvmlDevice_t, gpumode_nvmlMemory_t*);
+typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetCurrentClocksEventReasons_t)(gpumode_nvmlDevice_t, unsigned long long*);
+typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetPcieThroughput_t)(gpumode_nvmlDevice_t, int, unsigned int*);
 typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetComputeRunningProcesses_v2_t)(gpumode_nvmlDevice_t, unsigned int*, gpumode_nvmlProcessInfo_v2_t*);
 typedef gpumode_nvmlReturn_t (*fn_nvmlDeviceGetComputeRunningProcesses_v1_t)(gpumode_nvmlDevice_t, unsigned int*, gpumode_nvmlProcessInfo_v1_t*);
 
@@ -84,6 +91,8 @@ typedef struct {
 	fn_nvmlDeviceGetTemperature_t                getTemperature;
 	fn_nvmlDeviceGetUtilizationRates_t           getUtilizationRates;
 	fn_nvmlDeviceGetMemoryInfo_t                 getMemoryInfo;
+	fn_nvmlDeviceGetCurrentClocksEventReasons_t  getCurrentClocksEventReasons;
+	fn_nvmlDeviceGetPcieThroughput_t             getPcieThroughput;
 	fn_nvmlDeviceGetComputeRunningProcesses_v2_t getComputeRunningProcessesV2;
 	fn_nvmlDeviceGetComputeRunningProcesses_v1_t getComputeRunningProcessesV1;
 } gpumode_nvml_syms_t;
@@ -101,6 +110,9 @@ typedef struct {
 	unsigned int       memUtil;
 	unsigned long long vramUsedBytes;
 	unsigned long long vramTotalBytes;
+	unsigned long long throttleReasons;
+	unsigned int       pcieTxKBps;
+	unsigned int       pcieRxKBps;
 } gpumode_nvml_raw_sample_t;
 
 typedef struct {
@@ -195,6 +207,12 @@ static int gpumode_load_syms(void* handle, gpumode_nvml_syms_t* syms, const char
 	s = gpumode_resolve_sym(handle, "nvmlDeviceGetMemoryInfo", NULL);
 	if (!s) { *missingOut = "nvmlDeviceGetMemoryInfo"; return -1; }
 	memcpy(&syms->getMemoryInfo, &s, sizeof(s));
+
+	s = gpumode_resolve_sym(handle, "nvmlDeviceGetCurrentClocksEventReasons", "nvmlDeviceGetCurrentClocksThrottleReasons");
+	if (s) { memcpy(&syms->getCurrentClocksEventReasons, &s, sizeof(s)); }
+
+	s = gpumode_resolve_sym(handle, "nvmlDeviceGetPcieThroughput", NULL);
+	if (s) { memcpy(&syms->getPcieThroughput, &s, sizeof(s)); }
 
 	s = gpumode_resolve_sym(handle, "nvmlDeviceGetComputeRunningProcesses_v2", NULL);
 	if (s) { memcpy(&syms->getComputeRunningProcessesV2, &s, sizeof(s)); }
@@ -327,6 +345,22 @@ static gpumode_nvmlReturn_t gpumode_sample_device(
 	}
 	out->vramUsedBytes = mem.used;
 	out->vramTotalBytes = mem.total;
+
+	if (syms->getCurrentClocksEventReasons != NULL) {
+		unsigned long long mask = 0;
+		if (syms->getCurrentClocksEventReasons(dev, &mask) == GPUMODE_NVML_SUCCESS) {
+			out->throttleReasons = mask;
+		}
+	}
+	if (syms->getPcieThroughput != NULL) {
+		unsigned int tx = 0, rx = 0;
+		if (syms->getPcieThroughput(dev, GPUMODE_NVML_PCIE_UTIL_TX_BYTES, &tx) == GPUMODE_NVML_SUCCESS) {
+			out->pcieTxKBps = tx;
+		}
+		if (syms->getPcieThroughput(dev, GPUMODE_NVML_PCIE_UTIL_RX_BYTES, &rx) == GPUMODE_NVML_SUCCESS) {
+			out->pcieRxKBps = rx;
+		}
+	}
 
 	return GPUMODE_NVML_SUCCESS;
 }
@@ -593,19 +627,24 @@ func (c *Client) SampleDevice(gpuIndex int) (DeviceSample, error) {
 		)
 	}
 
+	mask := uint64(raw.throttleReasons)
 	return DeviceSample{
-		GPUName:        C.GoString(&raw.name[0]),
-		PowerWatts:     float64(raw.powerMW) / 1000.0,
-		SMClockMHz:     float64(raw.smClockMHz),
-		MemClockMHz:    float64(raw.memClockMHz),
-		TemperatureC:   float64(raw.tempC),
-		GPUUtilPct:     float64(raw.gpuUtil),
-		MemUtilPct:     float64(raw.memUtil),
-		VRAMUsedMiB:    float64(raw.vramUsedBytes) / bytesPerMiB,
-		VRAMTotalMiB:   float64(raw.vramTotalBytes) / bytesPerMiB,
-		MaxSMClockMHz:  float64(raw.maxSmClockMHz),
-		MaxMemClockMHz: float64(raw.maxMemClockMHz),
-		TDPWatts:       float64(raw.tdpMW) / 1000.0,
+		GPUName:                C.GoString(&raw.name[0]),
+		PowerWatts:             float64(raw.powerMW) / 1000.0,
+		SMClockMHz:             float64(raw.smClockMHz),
+		MemClockMHz:            float64(raw.memClockMHz),
+		TemperatureC:           float64(raw.tempC),
+		GPUUtilPct:             float64(raw.gpuUtil),
+		MemUtilPct:             float64(raw.memUtil),
+		VRAMUsedMiB:            float64(raw.vramUsedBytes) / bytesPerMiB,
+		VRAMTotalMiB:           float64(raw.vramTotalBytes) / bytesPerMiB,
+		MaxSMClockMHz:          float64(raw.maxSmClockMHz),
+		MaxMemClockMHz:         float64(raw.maxMemClockMHz),
+		TDPWatts:               float64(raw.tdpMW) / 1000.0,
+		ThrottleReasonsBitmask: mask,
+		ThrottleReasons:        DecodeThrottleReasons(mask),
+		PCIeTxKBps:             uint32(raw.pcieTxKBps),
+		PCIeRxKBps:             uint32(raw.pcieRxKBps),
 	}, nil
 }
 

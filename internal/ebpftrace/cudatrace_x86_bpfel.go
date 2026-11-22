@@ -14,24 +14,32 @@ import (
 )
 
 type cudaTraceCudaTgidStats struct {
-	_              structs.HostLayout
-	KernelLaunches uint64
-	LastLaunchNs   uint64
-	LaunchGapSumNs uint64
-	LaunchGapCount uint64
-	MaxLaunchGapNs uint64
-	MemcpyH2dCalls uint64
-	MemcpyH2dBytes uint64
-	MemcpyD2hCalls uint64
-	MemcpyD2hBytes uint64
-	MemAllocCalls  uint64
-	MemAllocBytes  uint64
-	SyncCalls      uint64
-	SyncStallSumNs uint64
-	MaxSyncStallNs uint64
-	SchedSwitches  uint64
-	OffCpuSumNs    uint64
-	Comm           [16]int8
+	_                 structs.HostLayout
+	KernelLaunches    uint64
+	GraphLaunches     uint64
+	LastLaunchNs      uint64
+	LaunchGapSumNs    uint64
+	LaunchGapCount    uint64
+	MaxLaunchGapNs    uint64
+	BlockThreadsSum   uint64
+	GridBlocksSum     uint64
+	SharedMemBytesSum uint64
+	LastGridX         uint32
+	LastBlockX        uint32
+	MemcpyH2dCalls    uint64
+	MemcpyH2dBytes    uint64
+	MemcpyD2hCalls    uint64
+	MemcpyD2hBytes    uint64
+	MemAllocCalls     uint64
+	MemAllocBytes     uint64
+	SyncCalls         uint64
+	SyncStallSumNs    uint64
+	MaxSyncStallNs    uint64
+	SchedSwitches     uint64
+	OffCpuSumNs       uint64
+	LaunchGapHist     [16]uint64
+	SyncStallHist     [16]uint64
+	Comm              [16]int8
 }
 
 // Names of all BPF objects in the ELF.
@@ -44,6 +52,7 @@ const (
 	cudaTraceMapTidSyncEnter        = "tid_sync_enter"
 	cudaTraceProgHandleCudaLaunch   = "handle_cuda_launch"
 	cudaTraceProgHandleCudartMemcpy = "handle_cudart_memcpy"
+	cudaTraceProgHandleGraphLaunch  = "handle_graph_launch"
 	cudaTraceProgHandleMemAlloc     = "handle_mem_alloc"
 	cudaTraceProgHandleMemcpyD2h    = "handle_memcpy_d2h"
 	cudaTraceProgHandleMemcpyH2d    = "handle_memcpy_h2d"
@@ -96,6 +105,7 @@ type cudaTraceSpecs struct {
 type cudaTraceProgramSpecs struct {
 	HandleCudaLaunch   *ebpf.ProgramSpec `ebpf:"handle_cuda_launch"`
 	HandleCudartMemcpy *ebpf.ProgramSpec `ebpf:"handle_cudart_memcpy"`
+	HandleGraphLaunch  *ebpf.ProgramSpec `ebpf:"handle_graph_launch"`
 	HandleMemAlloc     *ebpf.ProgramSpec `ebpf:"handle_mem_alloc"`
 	HandleMemcpyD2h    *ebpf.ProgramSpec `ebpf:"handle_memcpy_d2h"`
 	HandleMemcpyH2d    *ebpf.ProgramSpec `ebpf:"handle_memcpy_h2d"`
@@ -167,6 +177,7 @@ type cudaTraceVariables struct {
 type cudaTracePrograms struct {
 	HandleCudaLaunch   *ebpf.Program `ebpf:"handle_cuda_launch"`
 	HandleCudartMemcpy *ebpf.Program `ebpf:"handle_cudart_memcpy"`
+	HandleGraphLaunch  *ebpf.Program `ebpf:"handle_graph_launch"`
 	HandleMemAlloc     *ebpf.Program `ebpf:"handle_mem_alloc"`
 	HandleMemcpyD2h    *ebpf.Program `ebpf:"handle_memcpy_d2h"`
 	HandleMemcpyH2d    *ebpf.Program `ebpf:"handle_memcpy_h2d"`
@@ -179,6 +190,7 @@ func (p *cudaTracePrograms) Close() error {
 	return _CudaTraceClose(
 		p.HandleCudaLaunch,
 		p.HandleCudartMemcpy,
+		p.HandleGraphLaunch,
 		p.HandleMemAlloc,
 		p.HandleMemcpyD2h,
 		p.HandleMemcpyH2d,

@@ -300,6 +300,8 @@ const dashboardHTML = `<!DOCTYPE html>
     <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
       <strong>Host &harr; CUDA Boundary (eBPF + Scheduler)</strong>
       <span class="badge badge-blue" id="ebpfProvBadge">PROBING</span>
+      <a href="/api/trace/perfetto" target="_blank" class="badge badge-green" style="text-decoration:none;">Export Perfetto JSON</a>
+      <a href="/metrics" target="_blank" class="badge badge-blue" style="text-decoration:none;">Prometheus /metrics</a>
     </div>
     <span class="ebpf-hint" id="ebpfHint">Checking Linux eBPF uprobe &amp; scheduler capabilities...</span>
   </div>
@@ -340,6 +342,9 @@ const dashboardHTML = `<!DOCTYPE html>
           <option value="layernorm">LayerNorm (Welford Warp-Shuffle)</option>
           <option value="softmax">Attention Softmax (3-Pass vs Online)</option>
           <option value="swiglu">SwiGLU Activation (SiLU * Gate)</option>
+          <option value="rope_qkv">Rotary Positional Embedding (Fused RoPE + QKV Bias)</option>
+          <option value="qgemv_decode">Quantized Decode GEMV (Q8_0 Register Dequant + Dot)</option>
+          <option value="gqa_attention">Grouped-Query Attention (FlashDecoding Split-K)</option>
         </select>
       </div>
       <div>

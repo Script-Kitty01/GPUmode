@@ -108,6 +108,11 @@ case "$MODE" in
     shift || true
     ./gpumode monitor "$@"
     ;;
+  check)
+    ensure_ebpf_caps
+    shift || true
+    ./gpumode check "$@"
+    ;;
   test)
     go test -v ./...
     ;;

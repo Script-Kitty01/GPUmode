@@ -32,16 +32,35 @@ type HotspotOp struct {
 	Provenance        string  `json:"provenance"` // "MEASURED" or "ESTIMATED"
 }
 
+// PyTorchExtensionVerification captures measured before/after metrics when a winning CUDA kernel is
+// JIT-compiled and verified via torch.utils.cpp_extension.load_inline.
+type PyTorchExtensionVerification struct {
+	Verified          bool    `json:"verified"`
+	OpCategory        string  `json:"opCategory"`
+	BeforeLatencyMS   float64 `json:"beforeLatencyMs"`
+	AfterLatencyMS    float64 `json:"afterLatencyMs"`
+	SpeedupFactor     float64 `json:"speedupFactor"`
+	BeforeLaunches    int     `json:"beforeLaunches"`
+	AfterLaunches     int     `json:"afterLaunches"`
+	BeforeMemoryBytes int64   `json:"beforeMemoryBytes"`
+	AfterMemoryBytes  int64   `json:"afterMemoryBytes"`
+	TrafficRatio      float64 `json:"trafficRatio"`
+	VRAMRatio         float64 `json:"vramRatio"`
+	MaxAbsError       float64 `json:"maxAbsError"`
+	Provenance        string  `json:"provenance"`
+}
+
 // PyTorchTrace holds the operator breakdown from scripts/profile_pytorch.py.
 type PyTorchTrace struct {
-	TorchAvailable bool        `json:"torchAvailable"`
-	TorchVersion   string      `json:"torchVersion,omitempty"`
-	Device         string      `json:"device"`
-	BatchSize      int         `json:"batchSize"`
-	HiddenDim      int         `json:"hiddenDim"`
-	Provenance     string      `json:"provenance"` // "MEASURED" (torch.profiler) or "ESTIMATED"
-	SourceNote     string      `json:"sourceNote,omitempty"`
-	Hotspots       []HotspotOp `json:"hotspots"`
+	TorchAvailable        bool                          `json:"torchAvailable"`
+	TorchVersion          string                        `json:"torchVersion,omitempty"`
+	Device                string                        `json:"device"`
+	BatchSize             int                           `json:"batchSize"`
+	HiddenDim             int                           `json:"hiddenDim"`
+	Provenance            string                        `json:"provenance"` // "MEASURED" (torch.profiler) or "ESTIMATED"
+	SourceNote            string                        `json:"sourceNote,omitempty"`
+	Hotspots              []HotspotOp                   `json:"hotspots"`
+	ExtensionVerification *PyTorchExtensionVerification `json:"extensionVerification,omitempty"`
 }
 
 // SevenQuestionAnswers explicitly answers the linked CUDA hardware and energy verification questions.
@@ -184,10 +203,23 @@ func (p *Pipeline) Execute(
 	optProfile := roofline.EstimateOpProfile(opCategory, batchSize, hiddenDim, bestRes.MedianLatencyMS)
 	optProfile.Name = bestRes.Spec.Name
 	optProfile.LaunchCount = 1
-	// Fused kernel cuts global memory traffic by eliminating intermediate tensor read/write
+	// Fused kernel cuts global memory traffic by eliminating intermediate tensor read/write.
+	// Prefer measured PyTorch load_inline or CUDA harness VRAM/traffic ratio over static constants.
 	if bestRes.Spec.Fused {
-		optProfile.BytesTransferred = baseProfile.BytesTransferred * 0.54
-		optProfile.ActivationVRAMMiB = baseProfile.ActivationVRAMMiB * 0.55
+		trafficRatio := 0.54
+		vramRatio := 0.55
+		if trace.ExtensionVerification != nil && trace.ExtensionVerification.TrafficRatio > 0 && trace.ExtensionVerification.VRAMRatio > 0 {
+			trafficRatio = trace.ExtensionVerification.TrafficRatio
+			vramRatio = trace.ExtensionVerification.VRAMRatio
+		} else if baseRes.PeakVRAMMiB > 0 && bestRes.PeakVRAMMiB > 0 && bestRes.PeakVRAMMiB < baseRes.PeakVRAMMiB {
+			measuredVRAMRatio := bestRes.PeakVRAMMiB / baseRes.PeakVRAMMiB
+			if measuredVRAMRatio >= 0.35 && measuredVRAMRatio <= 0.90 {
+				vramRatio = measuredVRAMRatio
+				trafficRatio = math.Max(0.40, measuredVRAMRatio*0.92)
+			}
+		}
+		optProfile.BytesTransferred = baseProfile.BytesTransferred * trafficRatio
+		optProfile.ActivationVRAMMiB = baseProfile.ActivationVRAMMiB * vramRatio
 	}
 	optDiag := roofline.Diagnose(optProfile, p.Hardware)
 
@@ -389,10 +421,15 @@ func buildSevenAnswers(
 		)
 	}
 
+	occDetail := ""
+	if bestRes.TheoreticalOccupancyPct > 0 {
+		occDetail = fmt.Sprintf(", %.0f%% SM occupancy [%d/%d warps]", bestRes.TheoreticalOccupancyPct, bestRes.ActiveWarpsPerSM, bestRes.MaxWarpsPerSM)
+	}
 	q3 := fmt.Sprintf(
-		"Selected %s (Block=%d, VecWidth=float%d, %d registers/thread, %d B shared mem), fusing intermediate memory round-trips into registers and using __shfl_xor_sync warp reductions to achieve a %.2f× measured speedup (%.3f ms → %.3f ms).",
+		"Selected %s (Block=%d, VecWidth=float%d, %d registers/thread, %d B shared mem%s), fusing intermediate memory round-trips into registers and using __shfl_xor_sync warp reductions to achieve a %.2f× measured speedup (%.3f ms → %.3f ms).",
 		bestRes.Spec.Name, bestRes.Spec.BlockSize, bestRes.Spec.VecWidth,
 		bestRes.PTXAS.RegistersPerThread, bestRes.PTXAS.SharedMemBytes,
+		occDetail,
 		econComp.SpeedupFactor, baseRes.MedianLatencyMS, bestRes.MedianLatencyMS,
 	)
 
@@ -440,9 +477,19 @@ func buildSevenAnswers(
 
 // GeneratePyTorchExtension creates a ready-to-build PyTorch C++/CUDA extension wrapping the winning kernel.
 func GeneratePyTorchExtension(spec harness.KernelSpec) string {
+	block := spec.BlockSize
+	if block <= 0 {
+		block = 256
+	}
+	vec := spec.VecWidth
+	if vec <= 0 {
+		vec = 4
+	}
 	return fmt.Sprintf(`// Auto-generated by gpuMode — Verified Drop-In PyTorch CUDA Extension
 // Winning Kernel: %s (Op: %s, BlockSize: %d, VecWidth: float%d)
-// Build with: python3 -c "from torch.utils.cpp_extension import load; mod = load(name='gpumode_ext', sources=['gpumode_kernel.cu'], extra_cuda_cflags=['-O3', '--use_fast_math'])"
+// Build & load inline with:
+//   from torch.utils.cpp_extension import load
+//   mod = load(name="gpumode_ext", sources=["gpumode_kernel.cu"], extra_cuda_cflags=["-O3", "--use_fast_math"])
 
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -451,15 +498,25 @@ func GeneratePyTorchExtension(spec harness.KernelSpec) string {
 
 torch::Tensor gpumode_forward(torch::Tensor x, torch::Tensor res, torch::Tensor weight, double eps) {
     TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
     auto out = torch::empty_like(x);
     int rows = x.size(0);
     int cols = x.size(-1);
+    const int threads = %d;
     // Launch hardware-verified Pareto-optimal configuration (Block=%d, float%d)
+    rmsnorm_fused_opt<<<rows, threads>>>(
+        x.data_ptr<float>(),
+        res.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        out.data_ptr<float>(),
+        cols,
+        static_cast<float>(eps)
+    );
     return out;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &gpumode_forward, "gpuMode Hardware-Verified Fused CUDA Forward");
 }
-`, spec.Name, spec.OpCategory, spec.BlockSize, spec.VecWidth, spec.DisplayKernel, spec.BlockSize, spec.VecWidth)
+`, spec.Name, spec.OpCategory, block, vec, spec.DisplayKernel, block, block, vec)
 }

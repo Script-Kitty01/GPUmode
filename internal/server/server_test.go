@@ -224,4 +224,25 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 	if optResp["mode"] != "optimized" || optResp["baseline"] == nil || optResp["optimized"] == nil || optResp["causalReport"] == nil {
 		t.Fatalf("expected mode=optimized, baseline, optimized, and causalReport in response, got keys=%v", optResp)
 	}
+
+	// 5. GET /metrics (Prometheus exporter) and GET /api/trace/perfetto (Perfetto timeline)
+	promRes, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	promBody, _ := io.ReadAll(promRes.Body)
+	promRes.Body.Close()
+	if promRes.StatusCode != http.StatusOK || !strings.Contains(string(promBody), "gpumode_nvml_power_watts") {
+		t.Fatalf("unexpected GET /metrics response (%d): %s", promRes.StatusCode, string(promBody))
+	}
+
+	perfRes, err := http.Get(ts.URL + "/api/trace/perfetto")
+	if err != nil {
+		t.Fatalf("GET /api/trace/perfetto failed: %v", err)
+	}
+	perfBody, _ := io.ReadAll(perfRes.Body)
+	perfRes.Body.Close()
+	if perfRes.StatusCode != http.StatusOK || !strings.Contains(string(perfBody), "traceEvents") {
+		t.Fatalf("unexpected GET /api/trace/perfetto response (%d): %s", perfRes.StatusCode, string(perfBody))
+	}
 }

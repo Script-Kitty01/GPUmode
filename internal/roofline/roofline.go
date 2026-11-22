@@ -38,25 +38,29 @@ type OpProfile struct {
 
 // Diagnosis explains why the GPU is underutilized on a given operation and prescribes targeted CUDA optimizations.
 type Diagnosis struct {
-	OpName                  string          `json:"opName"`
-	Category                string          `json:"category"`
-	Classification          BottleneckClass `json:"classification"`
-	ArithmeticIntensity     float64         `json:"arithmeticIntensity"`     // FLOPs / Byte
-	HardwareRidgePoint      float64         `json:"hardwareRidgePoint"`      // Peak FLOPs / Peak Bandwidth
-	RooflineCeilingTFLOPS   float64         `json:"rooflineCeilingTflops"`   // Min(PeakFP32, AI * PeakBW)
-	AchievedTFLOPS          float64         `json:"achievedTflops"`          // FLOPs / (LatencySec * 1e12)
-	AchievedBandwidthGBps   float64         `json:"achievedBandwidthGbps"`   // Bytes / (LatencySec * 1e9)
-	ComputeUtilizationPct   float64         `json:"computeUtilizationPct"`   // AchievedTFLOPS / PeakFP32TFLOPS * 100
-	BandwidthUtilizationPct float64         `json:"bandwidthUtilizationPct"` // AchievedBW / PeakBW * 100
-	RooflineEfficiencyPct   float64         `json:"rooflineEfficiencyPct"`   // AchievedTFLOPS / RooflineCeilingTFLOPS * 100
-	LaunchCount             int             `json:"launchCount,omitempty"`
-	HostLaunchGapUS         float64         `json:"hostLaunchGapUs,omitempty"`
-	HostSyncStallPct        float64         `json:"hostSyncStallPct,omitempty"`
-	HostStarvationPct       float64         `json:"hostStarvationPct,omitempty"`
-	HostBoundaryProvenance  string          `json:"hostBoundaryProvenance,omitempty"`
-	UnderutilizationReason  string          `json:"underutilizationReason"`
-	RecommendedStrategies   []string        `json:"recommendedStrategies"`
-	ExpectedVRAMSaveMiB     float64         `json:"expectedVramSaveMib"`
+	OpName                      string          `json:"opName"`
+	Category                    string          `json:"category"`
+	Classification              BottleneckClass `json:"classification"`
+	ArithmeticIntensity         float64         `json:"arithmeticIntensity"`         // FLOPs / Byte
+	HardwareRidgePoint          float64         `json:"hardwareRidgePoint"`          // Peak FLOPs / Peak Bandwidth
+	RooflineCeilingTFLOPS       float64         `json:"rooflineCeilingTflops"`       // Min(PeakFP32, AI * PeakBW)
+	TensorCoreFP16CeilingTFLOPS float64         `json:"tensorCoreFp16CeilingTflops,omitempty"`
+	EmpiricalDRAMCeilingGBps    float64         `json:"empiricalDramCeilingGbps,omitempty"`
+	EmpiricalL2CeilingGBps      float64         `json:"empiricalL2CeilingGbps,omitempty"`
+	AchievedTFLOPS              float64         `json:"achievedTflops"`              // FLOPs / (LatencySec * 1e12)
+	AchievedBandwidthGBps       float64         `json:"achievedBandwidthGbps"`       // Bytes / (LatencySec * 1e9)
+	ComputeUtilizationPct       float64         `json:"computeUtilizationPct"`       // AchievedTFLOPS / PeakFP32TFLOPS * 100
+	BandwidthUtilizationPct     float64         `json:"bandwidthUtilizationPct"`     // AchievedBW / PeakBW * 100
+	L2BandwidthUtilizationPct   float64         `json:"l2BandwidthUtilizationPct,omitempty"`
+	RooflineEfficiencyPct       float64         `json:"rooflineEfficiencyPct"`       // AchievedTFLOPS / RooflineCeilingTFLOPS * 100
+	LaunchCount                 int             `json:"launchCount,omitempty"`
+	HostLaunchGapUS             float64         `json:"hostLaunchGapUs,omitempty"`
+	HostSyncStallPct            float64         `json:"hostSyncStallPct,omitempty"`
+	HostStarvationPct           float64         `json:"hostStarvationPct,omitempty"`
+	HostBoundaryProvenance      string          `json:"hostBoundaryProvenance,omitempty"`
+	UnderutilizationReason      string          `json:"underutilizationReason"`
+	RecommendedStrategies       []string        `json:"recommendedStrategies"`
+	ExpectedVRAMSaveMiB         float64         `json:"expectedVramSaveMib"`
 }
 
 // RooflinePoint is used by the Web Dashboard Canvas chart to plot operations against the Roofline curve.
@@ -126,6 +130,30 @@ func EstimateOpProfile(category string, batchSize, hiddenDim int, latencyMS floa
 		bytes = float64(n) * 20.0
 		launches = 2
 		vramMiB = float64(n*4*4) / (1024.0 * 1024.0)
+	case "rope_qkv":
+		name = "Rotary Positional Embedding (RoPE + QKV Bias)"
+		// complex rotation (4 mul + 2 add) + bias add: ~7 FLOPs/elem
+		// Unfused: bias pass (read+write 8B) + sin/cos table + RoPE read/write (16B) = 24 bytes/elem
+		flops = float64(n) * 7.0
+		bytes = float64(n) * 24.0
+		launches = 3
+		vramMiB = float64(n*4*3) / (1024.0 * 1024.0)
+	case "qgemv_decode":
+		name = "Quantized Decode GEMV (Q8_0 Weight Dequant + Dot)"
+		// scale mul + FMA per weight element: ~3 FLOPs/elem
+		// Unfused: read Q8_0 (1.125B) + write FP32 dequant buffer (4B) + read FP32 + vec (8B) = 13.125 bytes/elem
+		flops = float64(n) * 3.0
+		bytes = float64(n) * 13.125
+		launches = 2
+		vramMiB = float64(n*4*2) / (1024.0 * 1024.0)
+	case "gqa_attention":
+		name = "Grouped-Query Attention Decode (FlashDecoding Split-K)"
+		// Q*K dot + online softmax + V accumulate: ~8 FLOPs/elem
+		// Unfused: QK score writeback + softmax + V weighted sum = 24 bytes/elem
+		flops = float64(n) * 8.0
+		bytes = float64(n) * 24.0
+		launches = 3
+		vramMiB = float64(n*4*3) / (1024.0 * 1024.0)
 	default:
 		name = category
 		flops = float64(n) * 5.0
@@ -186,6 +214,22 @@ func Diagnose(op OpProfile, hw physics.GPUHardwareSpec) Diagnosis {
 	bwUtil := 0.0
 	if hw.PeakMemBandwidthGBps > 0 {
 		bwUtil = math.Min(100.0, (achievedBWGBps/hw.PeakMemBandwidthGBps)*100.0)
+	}
+	empDRAM := hw.EmpiricalDRAMBandwidthGBps
+	if empDRAM <= 0 && hw.PeakMemBandwidthGBps > 0 {
+		empDRAM = hw.PeakMemBandwidthGBps * 0.84
+	}
+	empL2 := hw.EmpiricalL2BandwidthGBps
+	if empL2 <= 0 && hw.PeakMemBandwidthGBps > 0 {
+		empL2 = hw.PeakMemBandwidthGBps * 3.10
+	}
+	l2Util := 0.0
+	if empL2 > 0 {
+		l2Util = math.Min(100.0, (achievedBWGBps/empL2)*100.0)
+	}
+	tensorCeiling := hw.PeakTensorFP16TFLOPS
+	if tensorCeiling <= 0 && hw.PeakFP32TFLOPS > 0 {
+		tensorCeiling = hw.PeakFP32TFLOPS * 2.0
 	}
 	rooflineEff := 0.0
 	if ceilingTFLOPS > 0 {
@@ -298,24 +342,28 @@ func Diagnose(op OpProfile, hw physics.GPUHardwareSpec) Diagnosis {
 	}
 
 	return Diagnosis{
-		OpName:                  op.Name,
-		Category:                op.Category,
-		Classification:          class,
-		ArithmeticIntensity:     ai,
-		HardwareRidgePoint:      ridge,
-		RooflineCeilingTFLOPS:   ceilingTFLOPS,
-		AchievedTFLOPS:          achievedTFLOPS,
-		AchievedBandwidthGBps:   achievedBWGBps,
-		ComputeUtilizationPct:   computeUtil,
-		BandwidthUtilizationPct: bwUtil,
-		RooflineEfficiencyPct:   rooflineEff,
-		LaunchCount:             op.LaunchCount,
-		HostLaunchGapUS:         op.HostLaunchGapUS,
-		HostSyncStallPct:        op.HostSyncStallPct,
-		HostStarvationPct:       op.HostStarvationPct,
-		HostBoundaryProvenance:  hostProv,
-		UnderutilizationReason:  reason,
-		RecommendedStrategies:   strategies,
-		ExpectedVRAMSaveMiB:     vramSave,
+		OpName:                      op.Name,
+		Category:                    op.Category,
+		Classification:              class,
+		ArithmeticIntensity:         ai,
+		HardwareRidgePoint:          ridge,
+		RooflineCeilingTFLOPS:       ceilingTFLOPS,
+		TensorCoreFP16CeilingTFLOPS: tensorCeiling,
+		EmpiricalDRAMCeilingGBps:    empDRAM,
+		EmpiricalL2CeilingGBps:      empL2,
+		AchievedTFLOPS:              achievedTFLOPS,
+		AchievedBandwidthGBps:       achievedBWGBps,
+		ComputeUtilizationPct:       computeUtil,
+		BandwidthUtilizationPct:     bwUtil,
+		L2BandwidthUtilizationPct:   l2Util,
+		RooflineEfficiencyPct:       rooflineEff,
+		LaunchCount:                 op.LaunchCount,
+		HostLaunchGapUS:             op.HostLaunchGapUS,
+		HostSyncStallPct:            op.HostSyncStallPct,
+		HostStarvationPct:           op.HostStarvationPct,
+		HostBoundaryProvenance:      hostProv,
+		UnderutilizationReason:      reason,
+		RecommendedStrategies:       strategies,
+		ExpectedVRAMSaveMiB:         vramSave,
 	}
 }
