@@ -2,7 +2,7 @@
 
 `./run.sh` is the single-entrypoint build, capability, and launch wrapper for **gpuMode**. It always executes from the repository root (`cd "${0:A:h}"`), manages incremental Go builds, preserves rootless Linux eBPF capabilities (`setcap`), and dispatches all daemon and CLI modes.
 
-For general architecture and setup instructions, see [README.md](./README.md).
+For the project overview, see [README.md](../README.md). For step-by-step setup and Web Dashboard usage, see [STARTUP_GUIDE.md](./STARTUP_GUIDE.md).
 
 ---
 
