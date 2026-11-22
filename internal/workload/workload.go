@@ -90,6 +90,9 @@ type WorkloadBenchmarkReport struct {
 	PeakMemUtilPct         float64                     `json:"peakMemUtilPct"`
 	Energy                 telemetry.EnergyMeasurement `json:"energy"`
 	JoulesPer1KTokens      float64                     `json:"joulesPer1kTokens"`
+	CostPer1MTokensUSD     float64                     `json:"costPer1mTokensUsd"`
+	SpotCostPer1MTokensUSD float64                     `json:"spotCostPer1mTokensUsd"`
+	CostPer1KRequestsUSD   float64                     `json:"costPer1kRequestsUsd"`
 	Economics              physics.BusinessKPIs        `json:"economics"`
 	Requests               []RequestMeasurement        `json:"requests"`
 }
@@ -367,6 +370,27 @@ func RunInferenceBenchmark(
 		joulesPer1KTokens = (em.TotalEnergyJoules / float64(totalTokens)) * 1000.0
 	}
 
+	gpuHourlyUSD := econ.GPUHourlyCostUSD
+	if gpuHourlyUSD <= 0 {
+		gpuHourlyUSD = 0.75
+	}
+	spotDisc := econ.SpotDiscountPct
+	if spotDisc <= 0 || spotDisc >= 95 {
+		spotDisc = 65.0
+	}
+	kwhUSD := econ.ElectricityKWhUSD
+	if kwhUSD <= 0 {
+		kwhUSD = 0.14
+	}
+	var costPer1MTokensUSD, spotCostPer1MTokensUSD float64
+	if tokPerSec > 0 {
+		tokensPerGPUHour := tokPerSec * 3600.0
+		computePer1M := (gpuHourlyUSD / tokensPerGPUHour) * 1e6
+		energyPer1M := ((joulesPer1KTokens * 1000.0) / 3600000.0) * kwhUSD
+		costPer1MTokensUSD = math.Round((computePer1M+energyPer1M)*1e4) / 1e4
+		spotCostPer1MTokensUSD = math.Round((computePer1M*(1.0-spotDisc/100.0)+energyPer1M)*1e4) / 1e4
+	}
+
 	telemetryBackend := ""
 	if mon != nil {
 		telemetryBackend = mon.Backend()
@@ -418,6 +442,9 @@ func RunInferenceBenchmark(
 		PeakMemUtilPct:         em.PeakMemUtilPct,
 		Energy:                 em,
 		JoulesPer1KTokens:      joulesPer1KTokens,
+		CostPer1MTokensUSD:     costPer1MTokensUSD,
+		SpotCostPer1MTokensUSD: spotCostPer1MTokensUSD,
+		CostPer1KRequestsUSD:   kpi.CostPer1KRequestsUSD,
 		Economics:              kpi,
 		Requests:               results,
 	}, nil

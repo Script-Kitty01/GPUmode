@@ -19,6 +19,7 @@ import (
 	"gpumode/internal/optimizer"
 	"gpumode/internal/physics"
 	"gpumode/internal/profiler"
+	"gpumode/internal/scheduler"
 	"gpumode/internal/server"
 	"gpumode/internal/store"
 	"gpumode/internal/telemetry"
@@ -163,6 +164,28 @@ func main() {
 		s, _ := mon.PollOnce(ctx)
 		fmt.Printf("GPU: %s (%s) | Telemetry: %s | Power: %.2f W | Clocks: %.0f / %.0f MHz | Temp: %.1f C | Util: %.0f%% SM / %.0f%% Mem | VRAM: %.0f / %.0f MiB\n",
 			hw.Name, hw.ArchFlag, mon.Backend(), s.PowerWatts, s.SMClockMHz, s.MemClockMHz, s.TemperatureC, s.GPUUtilPct, s.MemUtilPct, s.VRAMUsedMiB, s.VRAMTotalMiB)
+
+	case "schedule":
+		var prof scheduler.ModelDeploymentProfile
+		if *llmModel != "" {
+			prof.ModelName = *llmModel
+		}
+		if *deepseekModel != "" {
+			if info, statErr := os.Stat(*deepseekModel); statErr == nil && info.Size() > 0 {
+				prof.ModelSizeMiB = float64(info.Size()) / (1024.0 * 1024.0)
+				if prof.ModelName == "" {
+					prof.ModelName = info.Name()
+				}
+			}
+		}
+		sRep := scheduler.BuildFleetScheduleReport(hw, prof, cfg.Economics)
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(sRep)
+			return
+		}
+		printScheduleReportCLI(sRep)
 
 	case "ebpf", "probe":
 		sample, _ := mon.PollOnce(ctx)
@@ -309,7 +332,7 @@ func main() {
 
 	default:
 		_ = mon.Close()
-		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|monitor|ebpf|check] [flags]\n")
+		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|schedule|monitor|ebpf|check] [flags]\n")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -393,6 +416,40 @@ func printWorkloadReportCLI(rep workload.WorkloadBenchmarkReport) {
 	fmt.Printf("  • Power & Energy      : %.1f W total (%.1f W active above %.1f W idle) | %.2f J/1K tokens [%s, %s conf, ±%.1f%%]\n",
 		rep.Energy.AvgPowerWatts, rep.Energy.ActivePowerWatts, rep.Energy.IdlePowerWatts,
 		rep.JoulesPer1KTokens, rep.Energy.Provenance, rep.Energy.MeasurementConfidence, rep.Energy.EnergyUncertaintyPct)
+	fmt.Printf("  • Production Unit Cost: $%.4f / 1M tokens (On-Demand) | $%.4f / 1M tokens (Spot) | $%.4f / 1K requests\n",
+		rep.CostPer1MTokensUSD, rep.SpotCostPer1MTokensUSD, rep.CostPer1KRequestsUSD)
+	fmt.Printf("================================================================================\n")
+}
+
+func printScheduleReportCLI(rep scheduler.FleetScheduleReport) {
+	fmt.Printf("================================================================================\n")
+	fmt.Printf(" gpuMode — Production GPU Fleet Cost, Placement & Admission Control Optimizer\n")
+	fmt.Printf("================================================================================\n")
+	fmt.Printf("  • Local GPU Anchor    : %s (%s, %.0f MiB VRAM, %.1f GB/s DRAM BW)\n",
+		rep.LocalHardware.Name, rep.LocalHardware.ArchFlag, rep.LocalHardware.TotalVRAMMiB, rep.LocalHardware.EmpiricalDRAMBandwidthGBps)
+	fmt.Printf("  • Target Model        : %s (%.0f MiB weights | %.2f ms/tok | %.2f tok/s | %.1f J/1K tok)\n",
+		rep.ModelProfile.ModelName, rep.ModelProfile.ModelSizeMiB, rep.ModelProfile.MeasuredTPOTMS, rep.ModelProfile.MeasuredTokensPerSec, rep.ModelProfile.JoulesPer1KTokens)
+	fmt.Printf("  • Best On-Demand Pool : %s [%s] | Fits VRAM: %t (%.1f%%) | $%.4f / 1M tok | %d GPU(s) for %.0f QPS\n",
+		rep.RecommendedOnDemandPool.PoolName, rep.RecommendedOnDemandPool.PoolID,
+		rep.RecommendedOnDemandPool.FitsFullVRAM, rep.RecommendedOnDemandPool.VRAMUtilizationPct,
+		rep.RecommendedOnDemandPool.CostPer1MTokensUSD, rep.RecommendedOnDemandPool.GPUsRequiredForQPS, rep.Economics.TargetQPS)
+	fmt.Printf("  • Best Spot Pool      : %s [%s] | $%.4f / 1M tok (-%.0f%% Spot discount)\n",
+		rep.RecommendedSpotPool.PoolName, rep.RecommendedSpotPool.PoolID,
+		rep.RecommendedSpotPool.CostPer1MTokensUSD, rep.Economics.SpotDiscountPct)
+	fmt.Printf("  • Tuning Recommendation: %s | %s\n",
+		rep.RecommendedOnDemandPool.RecommendedQuantization, rep.RecommendedOnDemandPool.RecommendedBatchFlags)
+	fmt.Printf("\n  [Priority Admission Control & Backpressure Gate]\n")
+	for _, adm := range rep.AdmissionPolicies {
+		fmt.Printf("    - %-26s : %-22s -> %s (queue=%d/%d, est_p95=%.1fms <= %.1fms SLO, ubatch=%d)\n",
+			adm.Priority, adm.Action, adm.AssignedPoolID, adm.CurrentQueueDepth, adm.MaxAllowedQueueDepth,
+			adm.EstimatedTotalP95MS, adm.LatencySLOMS, adm.DynamicMicroBatchSize)
+	}
+	fmt.Printf("\n  [Scheduling Strategy Simulator (1,000-Request Multi-Priority Trace)]\n")
+	for _, sim := range rep.StrategyComparison {
+		fmt.Printf("    - %-26s : SLO=%5.1f%% | p50/p95=%5.1f/%5.1f ms | Spot=%4.1f%% | Shed(429)=%2d | $%.4f/1M tok (-%.1f%% cost)\n",
+			sim.Strategy, sim.SLOCompliancePct, sim.P50EndToEndLatencyMS, sim.P95EndToEndLatencyMS,
+			sim.SpotTrafficSharePct, sim.BackpressureShed429, sim.CostPer1MTokensUSD, sim.CostSavedVsNaivePct)
+	}
 	fmt.Printf("================================================================================\n")
 }
 

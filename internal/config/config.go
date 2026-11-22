@@ -10,13 +10,16 @@ import (
 	"time"
 )
 
-// EconomicsConfig holds workload SLA and multi-objective optimization weights.
+// EconomicsConfig holds workload SLA, cloud/power rates, and multi-objective optimization weights.
 type EconomicsConfig struct {
-	TargetQPS         float64 `json:"targetQps"`         // Required workload requests/sec
-	LatencySLAMS      float64 `json:"latencySlaMs"`      // Maximum acceptable p95 latency in ms
-	AlphaCostWeight   float64 `json:"alphaCostWeight"`   // Multi-objective weight for Latency/Time
-	BetaEnergyWeight  float64 `json:"betaEnergyWeight"`  // Multi-objective weight for Energy
-	GammaMemoryWeight float64 `json:"gammaMemoryWeight"` // Multi-objective weight for VRAM
+	TargetQPS         float64 `json:"targetQps"`                   // Required workload requests/sec
+	LatencySLAMS      float64 `json:"latencySlaMs"`                // Maximum acceptable p95 latency in ms
+	AlphaCostWeight   float64 `json:"alphaCostWeight"`             // Multi-objective weight for Latency/Time
+	BetaEnergyWeight  float64 `json:"betaEnergyWeight"`            // Multi-objective weight for Energy
+	GammaMemoryWeight float64 `json:"gammaMemoryWeight"`           // Multi-objective weight for VRAM
+	GPUHourlyCostUSD  float64 `json:"gpuHourlyCostUsd,omitempty"`  // On-demand GPU instance cost ($/GPU-hr)
+	SpotDiscountPct   float64 `json:"spotDiscountPct,omitempty"`   // Spot/preemptible instance discount (%)
+	ElectricityKWhUSD float64 `json:"electricityKwhUsd,omitempty"` // Datacenter electricity cost ($/kWh)
 }
 
 // DefaultEconomicsConfig returns sensible defaults for workload SLA and multi-objective weights.
@@ -27,6 +30,9 @@ func DefaultEconomicsConfig() EconomicsConfig {
 		AlphaCostWeight:   0.45,
 		BetaEnergyWeight:  0.35,
 		GammaMemoryWeight: 0.20,
+		GPUHourlyCostUSD:  0.75,
+		SpotDiscountPct:   65.0,
+		ElectricityKWhUSD: 0.14,
 	}
 }
 

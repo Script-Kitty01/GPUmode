@@ -108,6 +108,10 @@ case "$MODE" in
     shift || true
     ./gpumode monitor "$@"
     ;;
+  schedule)
+    shift || true
+    ./gpumode schedule "$@"
+    ;;
   check)
     ensure_ebpf_caps
     shift || true

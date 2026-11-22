@@ -16,6 +16,7 @@ import (
 	"gpumode/internal/optimizer"
 	"gpumode/internal/physics"
 	"gpumode/internal/profiler"
+	"gpumode/internal/scheduler"
 	"gpumode/internal/store"
 	"gpumode/internal/telemetry"
 	"gpumode/internal/workload"
@@ -71,7 +72,43 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/optimize", s.handleOptimize)
 	mux.HandleFunc("/api/recompute", s.handleRecompute)
 	mux.HandleFunc("/api/workload", s.handleWorkload)
+	mux.HandleFunc("/api/schedule", s.handleSchedule)
 	return mux
+}
+
+func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	hw := s.hardware
+	econ := s.cfg.Economics
+	optWL := s.lastOptimized
+	baseWL := s.lastBaseline
+	s.mu.RUnlock()
+
+	var prof scheduler.ModelDeploymentProfile
+	if optWL != nil {
+		prof = scheduler.ModelDeploymentProfile{
+			ModelName:            optWL.ModelName,
+			MeasuredPeakVRAMMiB:  optWL.MeasuredPeakVRAMMiB,
+			MeasuredTPOTMS:       optWL.MedianTPOTMS,
+			MeasuredTokensPerSec: optWL.ThroughputTokensPerS,
+			MeasuredPowerWatts:   optWL.Energy.AvgPowerWatts,
+			JoulesPer1KTokens:    optWL.JoulesPer1KTokens,
+		}
+	} else if baseWL != nil {
+		prof = scheduler.ModelDeploymentProfile{
+			ModelName:            baseWL.ModelName,
+			MeasuredPeakVRAMMiB:  baseWL.MeasuredPeakVRAMMiB,
+			MeasuredTPOTMS:       baseWL.MedianTPOTMS,
+			MeasuredTokensPerSec: baseWL.ThroughputTokensPerS,
+			MeasuredPowerWatts:   baseWL.Energy.AvgPowerWatts,
+			JoulesPer1KTokens:    baseWL.JoulesPer1KTokens,
+		}
+	}
+	if r.Method == http.MethodPost && r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&prof)
+	}
+	rep := scheduler.BuildFleetScheduleReport(hw, prof, econ)
+	writeJSON(w, http.StatusOK, rep)
 }
 
 func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {

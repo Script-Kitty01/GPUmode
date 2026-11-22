@@ -245,4 +245,15 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 	if perfRes.StatusCode != http.StatusOK || !strings.Contains(string(perfBody), "traceEvents") {
 		t.Fatalf("unexpected GET /api/trace/perfetto response (%d): %s", perfRes.StatusCode, string(perfBody))
 	}
+
+	// 6. GET /api/schedule (VRAM-aware placement, priority admission control, and scheduling strategy simulator)
+	schedRes, err := http.Get(ts.URL + "/api/schedule")
+	if err != nil {
+		t.Fatalf("GET /api/schedule failed: %v", err)
+	}
+	schedBody, _ := io.ReadAll(schedRes.Body)
+	schedRes.Body.Close()
+	if schedRes.StatusCode != http.StatusOK || !strings.Contains(string(schedBody), "COST_SLO_WEIGHTED_PARETO") {
+		t.Fatalf("unexpected GET /api/schedule response (%d): %s", schedRes.StatusCode, string(schedBody))
+	}
 }
