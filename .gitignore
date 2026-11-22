@@ -9,4 +9,5 @@
 **/.gpumode_cache/
 /harness/kernel_bench*
 *.o
+!internal/ebpftrace/*.o
 *.so
