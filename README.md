@@ -1,5 +1,9 @@
 # gpuMode
 
+[![Go Tests, Static Analysis & eBPF CI](https://github.com/Script-Kitty01/GPUmode/actions/workflows/ci.yml/badge.svg)](https://github.com/Script-Kitty01/GPUmode/actions/workflows/ci.yml)
+[![CUDA Kernel Compilation & Hardware Runner CI](https://github.com/Script-Kitty01/GPUmode/actions/workflows/cuda-hardware.yml/badge.svg)](https://github.com/Script-Kitty01/GPUmode/actions/workflows/cuda-hardware.yml)
+[![Linux Distribution Installation & Compatibility Matrix](https://github.com/Script-Kitty01/GPUmode/actions/workflows/linux-compat.yml/badge.svg)](https://github.com/Script-Kitty01/GPUmode/actions/workflows/linux-compat.yml)
+
 > **Real-time CUDA hardware optimization, `10 ms` NVML + rootless eBPF observability, and local LLM efficiency platform for Linux & NVIDIA GPUs.**
 
 **gpuMode** closes the loop between **low-level CUDA physics** and **end-to-end AI workload efficiency** — diagnosing GPU bottlenecks, compiling and verifying fused CUDA C++ kernels on your live hardware, integrating real GPU board energy ($E = \int P(t)\,dt$), and benchmarking local `.gguf` / Ollama models **Before vs. After** side-by-side.
