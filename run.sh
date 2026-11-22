@@ -27,7 +27,7 @@ if [[ ! -x ./gpumode ]]; then
 elif [[ go.mod -nt ./gpumode || go.sum -nt ./gpumode ]]; then
   needs_build=1
 else
-  newer_files=( cmd/**/*.go(N) internal/**/*.go(N) internal/**/*.o(N) )
+  newer_files=( cmd/**/*.go(N) internal/**/*.go(N) internal/**/*.o(N) frontend/**/*(N) )
   for f in "${newer_files[@]}"; do
     if [[ "$f" -nt ./gpumode ]]; then
       needs_build=1

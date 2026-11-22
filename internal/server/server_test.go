@@ -59,9 +59,22 @@ func TestServerDashboardStateAndRecompute(t *testing.T) {
 		t.Fatalf("expected 200 on GET /, got %d", res.StatusCode)
 	}
 	html := string(htmlBytes)
-	for _, marker := range []string{"telemetrySourceBadge", "ebpfProvBadge", "CUDA Boundary (eBPF + Scheduler)", "directModelPathInput", "modelSelect", "runBaselineBtn", "runOptimizedBtn"} {
+	for _, marker := range []string{"telemetrySourceBadge", "ebpfProvBadge", "CUDA Boundary (eBPF + Scheduler)", "directModelPathInput", "modelSelect", "runBaselineBtn", "runOptimizedBtn", "/static/css/dashboard.css", "/static/js/app.js"} {
 		if !strings.Contains(html, marker) {
 			t.Fatalf("expected dashboard HTML to contain %q", marker)
+		}
+	}
+
+	// 1-static. Verify modular /static/ CSS and JS assets serve 200 OK
+	for _, assetPath := range []string{"/static/css/dashboard.css", "/static/js/utils.js", "/static/js/telemetry.js", "/static/js/optimizer.js", "/static/js/workload.js", "/static/js/scheduler.js", "/static/js/app.js"} {
+		aRes, aErr := http.Get(ts.URL + assetPath)
+		if aErr != nil {
+			t.Fatalf("GET %s failed: %v", assetPath, aErr)
+		}
+		aBody, _ := io.ReadAll(aRes.Body)
+		aRes.Body.Close()
+		if aRes.StatusCode != http.StatusOK || len(aBody) == 0 {
+			t.Fatalf("expected non-empty 200 OK on %s, got status=%d len=%d", assetPath, aRes.StatusCode, len(aBody))
 		}
 	}
 

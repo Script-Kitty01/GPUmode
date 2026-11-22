@@ -1,0 +1,28 @@
+<!-- Live SSE Telemetry Strip -->
+<section class="telemetry-strip">
+  <div class="t-item">
+    <span class="t-label">Live GPU Power <span class="badge badge-blue" id="telemetrySourceBadge">PROBING</span></span>
+    <span class="t-val" id="tPower">-- W</span>
+  </div>
+  <div class="t-item">
+    <span class="t-label">SM / Mem Clock</span>
+    <span class="t-val" id="tClock">-- / -- MHz</span>
+  </div>
+  <div class="t-item">
+    <span class="t-label">Temperature</span>
+    <span class="t-val" id="tTemp">-- &deg;C</span>
+  </div>
+  <div class="t-item">
+    <span class="t-label">SM / Mem Util</span>
+    <span class="t-val" id="tUtil">--% / --%</span>
+  </div>
+  <div class="t-item">
+    <span class="t-label">VRAM Used</span>
+    <span class="t-val" id="tVram">-- / -- MiB</span>
+  </div>
+  <div class="t-item">
+    <span class="t-label">Ridge / Throttle</span>
+    <span class="t-val" id="tRidge">-- FLOP/B</span>
+  </div>
+  <canvas id="sparkCanvas" width="210" height="42"></canvas>
+</section>

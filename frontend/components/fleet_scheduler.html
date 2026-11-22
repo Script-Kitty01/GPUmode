@@ -1,0 +1,31 @@
+<!-- Section 3: Production GPU Fleet Cost, Placement, Admission Control & Scheduling Optimizer -->
+<section class="card" style="margin-bottom:18px;">
+  <h2>
+    <span>3. Production GPU Fleet Cost, VRAM Placement &amp; Admission Control Optimizer</span>
+    <span class="badge badge-green" id="schedWinnerBadge">COST + SLO PARETO ROUTER</span>
+  </h2>
+  <div class="form-row">
+    <div>
+      <label for="schedQpsInput">Target Fleet Traffic (QPS)</label>
+      <input type="number" id="schedQpsInput" value="120" min="1" max="10000" step="10">
+    </div>
+    <div>
+      <label for="schedSloInput">Decode TPOT Latency SLO (ms/tok)</label>
+      <input type="number" id="schedSloInput" value="25" min="2" max="250" step="1">
+    </div>
+    <div>
+      <label for="schedHourlyUsdInput">Local / Base GPU Rate ($/GPU-hr)</label>
+      <input type="number" id="schedHourlyUsdInput" value="0.75" min="0.05" max="20" step="0.05">
+    </div>
+    <div>
+      <label for="schedSpotDiscInput">Spot / Preemptible Discount (%)</label>
+      <input type="number" id="schedSpotDiscInput" value="65" min="10" max="90" step="5">
+    </div>
+    <div style="display:flex;align-items:end;">
+      <button id="runSchedBtn" class="btn-secondary" style="width:100%;" onclick="loadFleetSchedule(true)">Recompute Fleet Placement &amp; Cost</button>
+    </div>
+  </div>
+  <div id="fleetScheduleBox" style="margin-top:10px;font-size:0.81rem;color:var(--muted);">
+    Loading VRAM-aware GPU pool placement, priority admission control, and scheduling strategy simulation...
+  </div>
+</section>

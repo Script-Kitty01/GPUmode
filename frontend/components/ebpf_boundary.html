@@ -1,0 +1,35 @@
+<!-- Host <-> CUDA Boundary (eBPF + Scheduler) Readout -->
+<section class="ebpf-strip" id="ebpfStrip">
+  <div class="ebpf-head">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <strong>Host &harr; CUDA Boundary (eBPF + Scheduler)</strong>
+      <span class="badge badge-blue" id="ebpfProvBadge">PROBING</span>
+      <a href="/api/trace/perfetto" target="_blank" class="badge badge-green" style="text-decoration:none;">Export Perfetto JSON</a>
+      <a href="/metrics" target="_blank" class="badge badge-blue" style="text-decoration:none;">Prometheus /metrics</a>
+      <a href="/api/schedule" target="_blank" class="badge badge-amber" style="text-decoration:none;">Scheduler JSON</a>
+    </div>
+    <span class="ebpf-hint" id="ebpfHint">Checking Linux eBPF uprobe &amp; scheduler capabilities...</span>
+  </div>
+  <div class="ebpf-metrics" id="ebpfMetrics" style="display:none;">
+    <div class="t-item">
+      <span class="t-label">Kernel / Graph Launches</span>
+      <span class="t-val" id="eLaunches">--</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">Launch Gap (Avg / p95)</span>
+      <span class="t-val" id="eLaunchGap">-- &micro;s</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">Avg Grid / Block</span>
+      <span class="t-val" id="eGeometry">--</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">PCIe H2D / D2H</span>
+      <span class="t-val" id="eMemcpy">-- / -- MiB</span>
+    </div>
+    <div class="t-item">
+      <span class="t-label">Sync Stall / Off-CPU</span>
+      <span class="t-val" id="eSyncStall">-- / -- ms</span>
+    </div>
+  </div>
+</section>

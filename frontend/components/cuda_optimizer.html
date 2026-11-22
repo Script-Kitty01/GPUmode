@@ -1,0 +1,50 @@
+<!-- Section 1: Live CUDA Hardware Optimization, Occupancy & PyTorch Verification -->
+<section class="controls-grid">
+  <div class="card">
+    <h2>
+      <span>1. Live CUDA Hardware Optimization, Occupancy &amp; PyTorch Verification</span>
+      <span class="badge badge-green" id="pytorchTraceBadge">PROBING PYTORCH</span>
+    </h2>
+    <div class="form-row">
+      <div>
+        <label for="opSelect">Target Hotspot Operation</label>
+        <select id="opSelect">
+          <option value="rmsnorm_residual">RMSNorm + Residual Add (LLM Block)</option>
+          <option value="rmsnorm">RMSNorm (Unfused vs float4)</option>
+          <option value="layernorm">LayerNorm (Welford Warp-Shuffle)</option>
+          <option value="softmax">Attention Softmax (3-Pass vs Online)</option>
+          <option value="swiglu">SwiGLU Activation (SiLU * Gate)</option>
+          <option value="rope_qkv">Rotary Positional Embedding (Fused RoPE + QKV Bias)</option>
+          <option value="qgemv_decode">Quantized Decode GEMV (Q8_0 Register Dequant + Dot)</option>
+          <option value="gqa_attention">Grouped-Query Attention (FlashDecoding Split-K)</option>
+        </select>
+      </div>
+      <div>
+        <label for="strategySelect">Autotuning Strategy</label>
+        <select id="strategySelect">
+          <option value="BAYESIAN_UCB">Bayesian Optimization (GP-LCB)</option>
+          <option value="GRID_SEARCH">Exhaustive Grid Search</option>
+        </select>
+      </div>
+      <div>
+        <label for="batchInput">Batch &times; Tokens</label>
+        <input type="number" id="batchInput" value="256" min="16" max="2048" step="16">
+      </div>
+      <div>
+        <label for="hiddenInput">Hidden Dim</label>
+        <input type="number" id="hiddenInput" value="4096" min="512" max="8192" step="256">
+      </div>
+      <div>
+        <label for="iterInput">Timed Runs</label>
+        <input type="number" id="iterInput" value="50" min="20" max="300" step="10">
+      </div>
+    </div>
+    <div class="btn-row">
+      <button id="runOptBtn" onclick="triggerOptimize()">Compile, Verify &amp; Benchmark on GPU</button>
+      <span class="status-msg" id="jobStatus"></span>
+    </div>
+    <div id="pytorchInlineSummary" style="margin-top:10px;font-size:0.8rem;color:var(--muted);"></div>
+    <div class="causal-grid" id="causalAnswersGrid" style="margin-top:12px;"></div>
+    <div id="autotuneTrialsBox" style="margin-top:12px;overflow-x:auto;"></div>
+  </div>
+</section>

@@ -1,0 +1,50 @@
+<!-- Section 2: Local AI Model Selector & Without-Project vs With-Project Benchmark -->
+<section class="card" style="margin-bottom:18px;">
+  <h2>2. Local AI Model Runner &amp; Before/After GPU Usage Comparison <span class="badge badge-blue" id="workloadProvBadge">MEASURED END-TO-END</span></h2>
+  <div class="form-row" style="grid-template-columns: 1.2fr 1fr auto; align-items: end;">
+    <div>
+      <label for="directModelPathInput">Direct Model Path (.gguf file or folder — runs directly without /models)</label>
+      <input type="text" id="directModelPathInput" placeholder="e.g. ~/Downloads/model.gguf or /abs/path/to/model.gguf" oninput="onDirectPathInput()">
+    </div>
+    <div>
+      <label for="modelDirInput">Optional Scan Folder / Repo Path (for auto-discovery)</label>
+      <input type="text" id="modelDirInput" placeholder="Optional folder to scan (e.g. ~/AI/Models or /path/to/repo)">
+    </div>
+    <div>
+      <button id="scanModelsBtn" class="btn-secondary" onclick="scanLocalModels()">Scan Models</button>
+    </div>
+  </div>
+  <div class="form-row">
+    <div style="grid-column: span 2;">
+      <label for="modelSelect">Model Source / Detected Local AI Model</label>
+      <select id="modelSelect" onchange="onModelSelectionChanged()"></select>
+    </div>
+    <div>
+      <label for="llmUrl">Inference Server URL (when using external server)</label>
+      <input type="text" id="llmUrl" value="http://127.0.0.1:8081">
+    </div>
+    <div>
+      <label for="llmReqs">Streaming Requests</label>
+      <input type="number" id="llmReqs" value="3" min="1" max="32">
+    </div>
+    <div>
+      <label for="llmConcurrency">Concurrent Clients</label>
+      <input type="number" id="llmConcurrency" value="1" min="1" max="32">
+    </div>
+    <div>
+      <label for="llmTokens">Max Output Tokens / Req</label>
+      <input type="number" id="llmTokens" value="48" min="16" max="256">
+    </div>
+  </div>
+  <div id="modelScanMeta" style="margin-bottom:8px;font-size:0.78rem;color:var(--muted);">
+    Scanning local AI models...
+  </div>
+  <div class="btn-row">
+    <button id="runBaselineBtn" class="btn-secondary" onclick="triggerWorkload('baseline')">Run Without Project (Baseline)</button>
+    <button id="runOptimizedBtn" class="btn-green" onclick="triggerWorkload('optimized')">Run With Project (gpuMode)</button>
+    <span class="status-msg" id="workloadStatus"></span>
+  </div>
+  <div id="workloadResultBox" style="margin-top:12px;font-size:0.82rem;color:var(--muted);">
+    Select a detected local AI model above, run it <strong>Without Project</strong> to record baseline GPU usage, then run it <strong>With Project</strong> to apply gpuMode runtime &amp; CUDA kernel optimizations and compare results side-by-side.
+  </div>
+</section>

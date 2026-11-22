@@ -63,6 +63,7 @@ func NewServer(
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
+	mux.Handle("/static/", dashboardStaticHandler())
 	mux.HandleFunc("/metrics", s.handlePrometheusMetrics)
 	mux.HandleFunc("/api/state", s.handleState)
 	mux.HandleFunc("/api/models", s.handleModels)
@@ -203,7 +204,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(dashboardHTML))
+	_, _ = w.Write([]byte(renderDashboardHTML()))
 }
 
 func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
