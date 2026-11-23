@@ -201,6 +201,48 @@ func DetectHardware(ctx context.Context, nvccPath, nvidiaSMIPath string) (GPUHar
 	return DetectHardwareForDevice(ctx, 0, nvccPath, nvidiaSMIPath)
 }
 
+// DetectHardwareLightweight probes GPU metadata via nvidia-smi without allocating a CUDA context or
+// running the 192 MiB STREAM Triad micro-benchmark. Ideal for read-only CLI observer commands
+// (top, watch, stats, monitor) that run alongside an active LLM consuming GPU VRAM.
+func DetectHardwareLightweight(ctx context.Context, gpuIndex int, nvidiaSMIPath string) (GPUHardwareSpec, error) {
+	if gpuIndex < 0 {
+		gpuIndex = 0
+	}
+	smiData, smiErr := queryNvidiaSMIForDevice(ctx, gpuIndex, nvidiaSMIPath)
+	if smiErr != nil || smiData == nil || smiData.Name == "" {
+		return GPUHardwareSpec{GPUIndex: gpuIndex}, fmt.Errorf("lightweight GPU probe failed for device %d: %v", gpuIndex, smiErr)
+	}
+	archClean := strings.ReplaceAll(smiData.ComputeCap, ".", "")
+	archFlag := "sm_89"
+	if archClean != "" {
+		archFlag = "sm_" + archClean
+	}
+	spec := GPUHardwareSpec{
+		GPUIndex:           gpuIndex,
+		Name:               smiData.Name,
+		ComputeCapability:  smiData.ComputeCap,
+		ArchFlag:           archFlag,
+		TotalVRAMMiB:       smiData.TotalVRAMMiB,
+		MaxSMClockMHz:      smiData.MaxSMClockMHz,
+		MaxMemClockMHz:     smiData.MaxMemClockMHz,
+		IdlePowerWatts:     smiData.PowerDrawWatts,
+		TDPWatts:           smiData.TDPWatts,
+		SMCount:            20,
+		MemoryBusWidthBits: 96,
+	}
+	coresPerSM := fp32CoresPerSM(spec.ComputeCapability)
+	smClockGHz := spec.MaxSMClockMHz / 1000.0
+	memClockGHz := spec.MaxMemClockMHz / 1000.0
+	if smClockGHz > 0 {
+		spec.PeakFP32TFLOPS = roundTo2((float64(coresPerSM) * 2.0 * float64(spec.SMCount) * smClockGHz) / 1000.0)
+	}
+	if memClockGHz > 0 {
+		spec.PeakMemBandwidthGBps = roundTo2(2.0 * memClockGHz * (float64(spec.MemoryBusWidthBits) / 8.0))
+	}
+	spec.RidgePointFLOPsPerByte = computeRidgePoint(spec.PeakFP32TFLOPS, spec.PeakMemBandwidthGBps)
+	return spec, nil
+}
+
 // DetectHardwareForDevice probes the specified NVIDIA GPU index using nvidia-smi and a compiled CUDA
 // device property probe via nvcc. Both sources must provide a valid live GPU specification.
 func DetectHardwareForDevice(ctx context.Context, gpuIndex int, nvccPath, nvidiaSMIPath string) (GPUHardwareSpec, error) {

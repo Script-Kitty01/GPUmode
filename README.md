@@ -69,7 +69,14 @@ python3 -m venv .venv && ./.venv/bin/pip install torch
 ### Common CLI Commands
 
 ```zsh
-# Live GPU hardware, clock, VRAM, and 10ms NVML power snapshot
+# Install 'gpumode' globally to ~/.local/bin/gpumode so it works from any terminal directory
+./run.sh install
+
+# Live refreshing terminal GPU & Active AI Model TUI monitor (0 MiB CUDA VRAM overhead — works while models run!)
+gpumode top
+
+# Instant rich terminal GPU & Active Model stats card (or single-line snapshot)
+gpumode stats
 ./run.sh monitor
 
 # Closed-loop CUDA kernel autotuning (rmsnorm_residual, rmsnorm, layernorm, softmax, swiglu, rope_qkv, qgemv_decode, gqa_attention)

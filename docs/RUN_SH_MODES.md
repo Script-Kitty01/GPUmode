@@ -29,8 +29,11 @@ For the project overview, see [README.md](../README.md). For step-by-step setup 
 | **`deepseek`** | — | Use a local GGUF LLM (`llama-cli`) to propose CUDA kernel configs + verify on GPU | `./run.sh deepseek -deepseek-model /path/to/model.gguf` |
 | **`workload`** | — | Benchmark end-to-end streaming LLM inference (TTFT, TPOT, tok/s, VRAM, Watts, `$/1M tok`, eBPF) | `./run.sh workload -deepseek-model /path/to/model.gguf` |
 | **`schedule`** | — | Run VRAM-aware GPU pool placement, priority admission control (`HTTP 429`), and strategy simulator | `./run.sh schedule -deepseek-model /path/to/model.gguf` |
+| **`top`** | `watch`, `tui` | Launch live refreshing terminal TUI (`0 MiB` CUDA VRAM overhead; tracks active model PIDs & live Joules) | `./run.sh top` or `gpumode top` |
+| **`stats`** | — | Print an instant rich terminal GPU & active-model telemetry card (`-json` supported) | `./run.sh stats` or `gpumode stats` |
+| **`install`** | `install-cli` | Install `./gpumode` globally to `~/.local/bin/gpumode` for use from any terminal directory | `./run.sh install` |
 | **`check`** | — | CI/CD hardware regression gate (verifies speedup, `0` PTXAS spills, `compute-sanitizer`, and `1027` parity) | `./run.sh check -op rope_qkv -min-speedup 1.15` |
-| **`monitor`** | — | Print an instant GPU hardware, clock, VRAM, and live power snapshot | `./run.sh monitor` |
+| **`monitor`** | — | Print a compact single-line GPU hardware, clock, VRAM, and live power snapshot | `./run.sh monitor` |
 | **`ebpf`** | `probe` | Inspect NVML backend, `libcuda.so.1` / `libcudart.so` paths, active GPU PIDs, and eBPF uprobes | `./run.sh ebpf` |
 | **`setcap`** | — | Grant rootless Linux eBPF capabilities to `./gpumode` and verify probe attachment | `./run.sh setcap` |
 | **`bpf-gen`** | — | Regenerate eBPF C bytecode (`internal/ebpftrace`) via `go generate` and rebuild `./gpumode` | `./run.sh bpf-gen` |

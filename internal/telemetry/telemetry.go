@@ -277,6 +277,47 @@ func (m *Monitor) ActiveComputePIDs() []int {
 	return pids
 }
 
+// ActiveComputeProcesses returns all active GPU compute processes (excluding this process) along with
+// their per-process VRAM usage in MiB, or nil when NVML is unavailable.
+func (m *Monitor) ActiveComputeProcesses() []nvml.ComputeProcess {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	client := m.nvmlClient
+	gpuIdx := m.gpuIndex
+	m.mu.RUnlock()
+
+	if client == nil {
+		return nil
+	}
+	procs, err := client.ListComputeProcesses(gpuIdx)
+	if err != nil {
+		return nil
+	}
+
+	selfPID := uint32(os.Getpid())
+	seen := make(map[uint32]struct{}, len(procs))
+	out := make([]nvml.ComputeProcess, 0, len(procs))
+	for _, p := range procs {
+		if p.PID == 0 || p.PID == selfPID {
+			continue
+		}
+		if _, dup := seen[p.PID]; dup {
+			continue
+		}
+		seen[p.PID] = struct{}{}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UsedVRAMMiB != out[j].UsedVRAMMiB {
+			return out[i].UsedVRAMMiB > out[j].UsedVRAMMiB
+		}
+		return out[i].PID < out[j].PID
+	})
+	return out
+}
+
 // RecordSample appends a sample to the ring buffer and broadcasts it to all active SSE subscribers.
 func (m *Monitor) RecordSample(s Sample) {
 	if s.Timestamp.IsZero() {

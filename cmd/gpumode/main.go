@@ -23,6 +23,7 @@ import (
 	"gpumode/internal/server"
 	"gpumode/internal/store"
 	"gpumode/internal/telemetry"
+	"gpumode/internal/tui"
 	"gpumode/internal/workload"
 )
 
@@ -61,6 +62,9 @@ func main() {
 	llmMaxTok := fs.Int("llm-tokens", 48, "Max tokens per request for workload benchmark")
 	autoServer := fs.Bool("auto-server", true, "Automatically launch temporary llama-server with -deepseek-model if -llm-url is not running")
 	minSpeedup := fs.Float64("min-speedup", 1.10, "Minimum required speedup factor for 'gpumode check' CI regression gate")
+	tuiInterval := fs.Duration("interval", 200*time.Millisecond, "Refresh interval for 'gpumode top' live terminal monitor")
+	tuiFrames := fs.Int("frames", 0, "Number of refresh frames for 'gpumode top' (0 = run continuously until Ctrl+C)")
+	noColor := fs.Bool("no-color", false, "Disable ANSI color codes in terminal TUI output")
 	jsonOut := fs.Bool("json", false, "Emit full CausalChainReport as JSON")
 	_ = fs.Parse(os.Args[1:])
 
@@ -84,15 +88,30 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	hw, err := physics.DetectHardwareForDevice(ctx, cfg.GPUIndex, cfg.NVCCPath, cfg.NvidiaSMIPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[gpumode] CUDA hardware detection failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "[gpumode] An NVIDIA GPU, nvidia-smi, and the CUDA toolkit (nvcc) are required.\n")
-		os.Exit(1)
-	}
-	if _, nvccErr := exec.LookPath(cfg.NVCCPath); nvccErr != nil {
-		fmt.Fprintf(os.Stderr, "[gpumode] nvcc not executable at %q (%v); pass -nvcc or set GPUMODE_NVCC\n", cfg.NVCCPath, nvccErr)
-		os.Exit(1)
+	isObserverCLI := cmd == "top" || cmd == "watch" || cmd == "tui" || cmd == "stats" || cmd == "monitor"
+	var hw physics.GPUHardwareSpec
+	var err error
+	if isObserverCLI {
+		// Zero-VRAM lightweight probe so gpumode top / stats never contends with a running LLM
+		hw, err = physics.DetectHardwareLightweight(ctx, cfg.GPUIndex, cfg.NvidiaSMIPath)
+		if err != nil {
+			hw, err = physics.DetectHardwareForDevice(ctx, cfg.GPUIndex, cfg.NVCCPath, cfg.NvidiaSMIPath)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[gpumode] GPU hardware detection failed: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		hw, err = physics.DetectHardwareForDevice(ctx, cfg.GPUIndex, cfg.NVCCPath, cfg.NvidiaSMIPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[gpumode] CUDA hardware detection failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[gpumode] An NVIDIA GPU, nvidia-smi, and the CUDA toolkit (nvcc) are required.\n")
+			os.Exit(1)
+		}
+		if _, nvccErr := exec.LookPath(cfg.NVCCPath); nvccErr != nil {
+			fmt.Fprintf(os.Stderr, "[gpumode] nvcc not executable at %q (%v); pass -nvcc or set GPUMODE_NVCC\n", cfg.NVCCPath, nvccErr)
+			os.Exit(1)
+		}
 	}
 
 	ebpfMode := ebpftrace.ParseMode(cfg.EBPFMode)
@@ -164,6 +183,38 @@ func main() {
 		s, _ := mon.PollOnce(ctx)
 		fmt.Printf("GPU: %s (%s) | Telemetry: %s | Power: %.2f W | Clocks: %.0f / %.0f MHz | Temp: %.1f C | Util: %.0f%% SM / %.0f%% Mem | VRAM: %.0f / %.0f MiB\n",
 			hw.Name, hw.ArchFlag, mon.Backend(), s.PowerWatts, s.SMClockMHz, s.MemClockMHz, s.TemperatureC, s.GPUUtilPct, s.MemUtilPct, s.VRAMUsedMiB, s.VRAMTotalMiB)
+
+	case "stats":
+		s, _ := mon.PollOnce(ctx)
+		procs := tui.InspectComputeProcesses(mon.ActiveComputeProcesses())
+		state := tui.SnapshotState{
+			Hardware:             hw,
+			TelemetryBackend:     mon.Backend(),
+			Sample:               s,
+			PowerHistory:         []float64{s.PowerWatts},
+			PeakPowerWatts:       s.PowerWatts,
+			CumulativeJoules:     0,
+			ElapsedSec:           0,
+			ActiveProcesses:      procs,
+			InteractiveFrameMode: false,
+		}
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(state)
+			return
+		}
+		fmt.Print(tui.RenderSnapshotCard(state, !*noColor))
+
+	case "top", "watch", "tui":
+		_ = tui.RunLiveTUI(ctx, os.Stdout, tui.LiveConfig{
+			Hardware:  hw,
+			Monitor:   mon,
+			Interval:  *tuiInterval,
+			MaxFrames: *tuiFrames,
+			UseColor:  !*noColor,
+			EBPFMode:  ebpfMode,
+		})
 
 	case "schedule":
 		var prof scheduler.ModelDeploymentProfile
@@ -332,7 +383,7 @@ func main() {
 
 	default:
 		_ = mon.Close()
-		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|optimize|deepseek|workload|schedule|monitor|ebpf|check] [flags]\n")
+		fmt.Fprintf(os.Stderr, "Usage: gpumode [dashboard|top|stats|optimize|deepseek|workload|schedule|monitor|ebpf|check] [flags]\n")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}

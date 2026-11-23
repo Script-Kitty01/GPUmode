@@ -108,6 +108,21 @@ case "$MODE" in
     shift || true
     ./gpumode monitor "$@"
     ;;
+  top|watch|tui)
+    shift || true
+    ./gpumode top "$@"
+    ;;
+  stats)
+    shift || true
+    ./gpumode stats "$@"
+    ;;
+  install|install-cli)
+    mkdir -p "$HOME/.local/bin"
+    cp -f ./gpumode "$HOME/.local/bin/gpumode"
+    chmod +x "$HOME/.local/bin/gpumode"
+    echo "[gpuMode] Installed global CLI binary to $HOME/.local/bin/gpumode"
+    echo "[gpuMode] Run 'gpumode top' (live TUI) or 'gpumode stats' (snapshot card) from any terminal!"
+    ;;
   schedule)
     shift || true
     ./gpumode schedule "$@"
