@@ -9,8 +9,8 @@ For the project overview, see [README.md](../README.md). For step-by-step setup 
 ## How `./run.sh` Works Before Launching a Mode
 
 1. **Incremental Build Preservation:**
-   - `./run.sh` checks whether `./gpumode` exists and compares its timestamp against `go.mod`, `go.sum`, `cmd/**/*.go`, `internal/**/*.go`, and `internal/**/*.o`.
-   - It rebuilds `./gpumode` **only** when source or BPF object files have changed, preserving Linux file capabilities (`setcap`) across normal startups.
+   - `./run.sh` checks whether `./gpumode` exists and compares its timestamp against `go.mod`, `go.sum`, `cmd/**/*.go`, `internal/**/*.go`, `internal/**/*.o`, and `frontend/**/*`.
+   - It rebuilds `./gpumode` **only** when source, BPF object, or modular frontend files have changed, preserving Linux file capabilities (`setcap`) across normal startups.
 2. **Automatic Rootless eBPF Capability Check (`ensure_ebpf_caps`):**
    - Unless `GPUMODE_EBPF=off` is set, `./run.sh` checks `getcap ./gpumode` for `cap_bpf`, `cap_perfmon`, `cap_sys_resource`, and `cap_sys_admin`.
    - If capabilities are missing, it attempts `sudo setcap cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep ./gpumode` (using `sudo -A` when `SUDO_ASKPASS` is set). If unprivileged, non-`setcap` modes continue gracefully with `-ebpf=auto`.
@@ -170,7 +170,7 @@ Polls the GPU once and prints a single-line hardware and live telemetry summary 
 
 ---
 
-### 6. `ebpf` / `probe`
+### 8. `ebpf` / `probe`
 
 Runs a diagnostic check on direct NVML telemetry, active CUDA compute PIDs, discovered `libcuda.so.1` and `libcudart.so` shared libraries, and attached Linux eBPF uprobes/tracepoints.
 
@@ -184,7 +184,7 @@ Runs a diagnostic check on direct NVML telemetry, active CUDA compute PIDs, disc
 
 ---
 
-### 7. `setcap`
+### 9. `setcap`
 
 Explicitly grants rootless Linux capabilities (`cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep`) to `./gpumode` via `sudo setcap` and immediately runs `./gpumode ebpf` to verify live attachment.
 
@@ -196,7 +196,7 @@ Explicitly grants rootless Linux capabilities (`cap_bpf,cap_perfmon,cap_sys_reso
 
 ---
 
-### 8. `bpf-gen`
+### 10. `bpf-gen`
 
 Recompiles the C eBPF program (`internal/ebpftrace/bpf/cuda_trace.bpf.c`) into Go bindings via `bpf2go` (`go generate ./internal/ebpftrace/...`) and rebuilds `./gpumode`. Only needed when editing BPF C code.
 
@@ -206,9 +206,9 @@ Recompiles the C eBPF program (`internal/ebpftrace/bpf/cuda_trace.bpf.c`) into G
 
 ---
 
-### 9. `test`
+### 11. `test`
 
-Runs the full Go unit test and live GPU hardware verification suite across all packages.
+Runs the full Go unit test, mocked-NVML `.so` (`dlopen`), failure-path, and live GPU hardware verification suite across all packages.
 
 ```zsh
 ./run.sh test

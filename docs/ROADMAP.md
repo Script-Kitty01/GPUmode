@@ -242,10 +242,12 @@ Currently, `RunInferenceBenchmark` in [`internal/workload/workload.go`](../inter
 
 ## Phased Implementation Matrix
 
-| Phase | Track | Primary Deliverables | Verification Command |
-| :--- | :--- | :--- | :--- |
-| **Phase 1** | **Track 1 (eBPF & NVML)** | `cuLaunchKernel` grid/block extraction, log2 histograms, Perfetto JSON export, `cuLaunchKernelEx` hooks, NVML throttle bitmasks | `./run.sh bpf-gen && ./run.sh ebpf -json` |
-| **Phase 2** | **Track 2 (PyTorch Loop)** | Live `torch.utils.cpp_extension.load_inline` compilation and before/after `torch.profiler` verification in `scripts/profile_pytorch.py` | `python3 scripts/profile_pytorch.py --verify-extension` |
-| **Phase 3** | **Track 3 (Roofline & Occupancy)** | `<45 ms` empirical DRAM/L2/TFLOPS startup probe + `cudaOccupancyMaxActiveBlocksPerMultiprocessor` warp occupancy metrics | `./run.sh optimize -op rmsnorm_residual -json` |
-| **Phase 4** | **Track 4 (Kernels & Codegen)** | `FP16`/`BF16`, `rope_qkv`, `qgemv_decode`, `gqa_attention` kernels + multi-turn compiler/sanitizer LLM repair loop | `./run.sh deepseek -op rope_qkv -strategy BAYESIAN_UCB` |
-| **Phase 5** | **Track 5 (Workload & Platform)** | Bayesian `llama-server` flag autotuner, concurrent load tester (`-concurrency`), `/metrics` endpoint, `gpumode check` CLI | `./run.sh workload -llm-reqs 16 && go test ./...` |
+| Phase | Track | Status | Primary Deliverables | Verification Command |
+| :--- | :--- | :---: | :--- | :--- |
+| **Phase 1** | **Track 1 (eBPF & NVML)** | **Implemented & Verified** | `cuLaunchKernel` grid/block extraction, 16-bucket log2 histograms, Perfetto JSON export, `cuGraphLaunch` hooks, NVML throttle bitmasks & PCIe throughput | `./run.sh bpf-gen && ./run.sh ebpf -json` |
+| **Phase 2** | **Track 2 (PyTorch Loop)** | **Implemented & Verified** | Live `torch.utils.cpp_extension.load_inline` compilation (`float4` kernel) and before/after `torch.profiler` verification in `scripts/profile_pytorch.py` | `./.venv/bin/python3 scripts/profile_pytorch.py --verify-extension` |
+| **Phase 3** | **Track 3 (Roofline & Occupancy)** | **Implemented & Verified** | Empirical DRAM STREAM Triad/L2/TFLOPS startup probe + `cudaOccupancyMaxActiveBlocksPerMultiprocessor` warp occupancy metrics | `./run.sh optimize -op rmsnorm_residual -json` |
+| **Phase 4** | **Track 4 (Kernels & Codegen)** | **Implemented & Verified** | `FP16`/`BF16`, `rope_qkv`, `qgemv_decode`, `gqa_attention` catalog operations + multi-turn compiler/sanitizer self-healing repair loop | `./run.sh check -op rope_qkv -min-speedup 1.15` |
+| **Phase 5** | **Track 5 (Workload & Platform)** | **Implemented & Verified** | Concurrent load tester (`-llm-concurrency`), `$ / 1M tokens` unit economics, `/metrics` Prometheus exporter, `gpumode check` CLI | `./run.sh workload -llm-reqs 8 -llm-concurrency 2` |
+| **Phase 6** | **Track 6 (Scheduler, Modular UI & CI)** | **Implemented & Verified** | `internal/scheduler` (VRAM-aware pool placement, `HTTP 429` priority admission control, strategy simulator), modular `frontend/` (`components/`, `css/`, `js/`), mocked-NVML `.so` tests, and 3 GitHub Actions workflows | `./run.sh schedule && ./run.sh test` |
+

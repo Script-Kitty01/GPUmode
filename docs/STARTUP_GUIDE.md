@@ -6,6 +6,19 @@
 
 ## 1. Quick First-Time Setup
 
+### Step 1 — Verify Prerequisites
+Ensure your Linux host has an NVIDIA GPU with proprietary/open kernel drivers (`nvidia-smi`), the CUDA compiler (`nvcc`) and memory checker (`compute-sanitizer`), Go, Python 3, and Zsh:
+
+```zsh
+nvidia-smi -L
+nvcc --version
+compute-sanitizer --version
+go version
+python3 --version
+```
+
+### Step 2 — Clone & Optional One-Time Setup
+
 ```zsh
 # 1. Clone and enter the repository
 git clone https://github.com/Script-Kitty01/GPUmode.git
@@ -15,17 +28,23 @@ cd GPUmode
 #    Prompts once via sudo so the server never needs to run as root
 ./run.sh setcap
 
-# 3. Build (if needed) and launch the Web Dashboard
+# 3. (Optional) Set up a local .venv with PyTorch + CUDA for live torch.profiler
+#    and torch.utils.cpp_extension.load_inline verification (auto-detected by gpuMode)
+python3 -m venv .venv
+./.venv/bin/pip install --upgrade pip torch
+
+# 4. Build (if needed) and launch the Web Dashboard
 ./run.sh
 ```
 
 Open **`http://127.0.0.1:8080`** in your browser.
 
 ### What `./run.sh` Does on Launch
-1. Performs an incremental build check (`./gpumode` is rebuilt only when Go or eBPF files change, preserving `setcap` capabilities).
+1. Performs an incremental build check (`./gpumode` is rebuilt only when `cmd/**/*.go`, `internal/**/*.go`, `internal/**/*.o`, or `frontend/**/*` files change, preserving `setcap` capabilities).
 2. Verifies rootless eBPF capabilities (`cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep`), falling back gracefully to `-ebpf=auto` if unprivileged.
-3. Runs `scripts/profile_pytorch.py` and pre-warms an initial hardware-verified CUDA report if `.gpumode_data` is empty.
-4. Starts the HTTP + Server-Sent Events (SSE) Web Dashboard at `http://127.0.0.1:8080`.
+3. Auto-detects `./.venv/bin/python3` (when present) and runs `scripts/profile_pytorch.py --verify-extension` to capture live `torch.profiler` operator attribution and inline C++/CUDA extension verification.
+4. Pre-warms an initial hardware-verified CUDA report if `.gpumode_data` is empty.
+5. Starts the HTTP + Server-Sent Events (SSE) Web Dashboard at `http://127.0.0.1:8080`.
 
 ---
 
@@ -95,3 +114,44 @@ GPUMODE_EBPF=off ./run.sh
 | `GPUMODE_MODEL_NAME` | Auto-discovered | Default served model name/tag for `workload` benchmarks |
 | `GPUMODE_NGL` | Auto-sized | Explicit GPU layer offload override (`-ngl`) for `llama-server` / `llama-cli` |
 | `GPUMODE_PASSES_PER_REQ` | Default | Layer passes per inference used in kernel benchmark harnesses |
+
+---
+
+## 5. REST API & Observability Endpoints (`http://127.0.0.1:8080`)
+
+| Endpoint | Method | Purpose |
+| :--- | :---: | :--- |
+| **`/`** | `GET` | Serves the modular Web Dashboard assembled from `frontend/components/*.html` |
+| **`/static/*`** | `GET` | Serves embedded static stylesheet (`/static/css/dashboard.css`) and JS modules (`/static/js/*.js`) |
+| **`/api/state`** | `GET` | Returns full GPU hardware specs, empirical DRAM/L2 ceilings, latest causal report, telemetry history, eBPF status, and discovered models |
+| **`/api/models`** | `GET` | Scans local directories (`?dir=/path`), Hugging Face cache, `llama-server`, and `Ollama` for available AI models |
+| **`/api/optimize`** | `POST` | Runs the live CUDA compilation, `compute-sanitizer`, occupancy, energy integration, and Bayesian/Grid autotuning loop |
+| **`/api/recompute`** | `POST` | Recomputes unit economics, Pareto recommendations, and fleet sizing under updated QPS/SLA/hourly rate parameters |
+| **`/api/workload`** | `POST` | Executes streaming LLM inference benchmarks (`baseline` vs. `optimized`) with concurrent client workers (`1..32`) |
+| **`/api/schedule`** | `GET`/`POST` | Evaluates VRAM-aware GPU pool placement, priority admission control (`HTTP 429` backpressure), Spot routing, and 3-strategy scheduling simulation |
+| **`/api/telemetry/history`** | `GET` | Returns the recent `10 ms` / background NVML telemetry ring buffer |
+| **`/api/stream/telemetry`** | `GET` | Live Server-Sent Events (`text/event-stream`) stream of GPU power, clocks, temperature, utilization, VRAM, and throttle reasons |
+| **`/api/trace/perfetto`** | `GET` | Exports a Chrome Trace Event / [ui.perfetto.dev](https://ui.perfetto.dev) JSON timeline of eBPF CUDA launches, sync stalls, and `sched_switch` intervals |
+| **`/metrics`** | `GET` | Exports live NVML, empirical bandwidth ceiling, and eBPF gauges in Prometheus exposition format |
+
+---
+
+## 6. Running Self-Hosted CUDA Hardware CI on GitHub Actions
+
+To execute the **`Live NVIDIA GPU Hardware Gate (Self-Hosted Runner)`** job in [`.github/workflows/cuda-hardware.yml`](../.github/workflows/cuda-hardware.yml) on your own Linux + NVIDIA GPU machine:
+
+```zsh
+# 1. Download and extract the GitHub Actions runner in a temporary directory
+mkdir -p /tmp/gpumode_gh_runner && cd /tmp/gpumode_gh_runner
+curl -fsSL -o actions-runner.tar.gz https://github.com/actions/runner/releases/download/v2.338.2/actions-runner-linux-x64-2.338.2.tar.gz
+tar xzf actions-runner.tar.gz
+
+# 2. Register an ephemeral runner with labels [self-hosted, linux, cuda] via GitHub CLI
+REG_TOKEN=$(gh api -X POST repos/Script-Kitty01/GPUmode/actions/runners/registration-token --jq .token)
+./config.sh --url https://github.com/Script-Kitty01/GPUmode --token "$REG_TOKEN" --name "cuda-gpu-runner" --labels "self-hosted,linux,cuda" --ephemeral --unattended --replace
+
+# 3. Trigger the workflow with run_self_hosted_gpu=true and start the runner
+gh workflow run cuda-hardware.yml -f run_self_hosted_gpu=true
+./run.sh
+```
+

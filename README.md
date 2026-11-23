@@ -52,14 +52,53 @@ All `gpuMode` measurements on **NVIDIA GeForce RTX 4050 Laptop GPU (`sm_89`)** w
 ## Quick Start
 
 ```zsh
-# Optional (one-time): enable rootless Linux eBPF tracing
+# 1. Clone and enter the repository
+git clone https://github.com/Script-Kitty01/GPUmode.git
+cd GPUmode
+
+# 2. (Optional, one-time) Enable rootless Linux eBPF tracing (libcuda.so.1 uprobes + sched_switch)
 ./run.sh setcap
 
-# Build (if needed) and launch the live Web Dashboard at http://127.0.0.1:8080
+# 3. (Optional) Create local .venv with PyTorch for live torch.profiler & load_inline CUDA extension verification
+python3 -m venv .venv && ./.venv/bin/pip install torch
+
+# 4. Build (if needed) and launch the live Web Dashboard at http://127.0.0.1:8080
 ./run.sh
 ```
 
-Requires Linux, an NVIDIA GPU with drivers (`nvidia-smi`), CUDA Toolkit (`nvcc` & `compute-sanitizer`), Go, Python 3, and Zsh.
+### Common CLI Commands
+
+```zsh
+# Live GPU hardware, clock, VRAM, and 10ms NVML power snapshot
+./run.sh monitor
+
+# Closed-loop CUDA kernel autotuning (rmsnorm_residual, rmsnorm, layernorm, softmax, swiglu, rope_qkv, qgemv_decode, gqa_attention)
+./run.sh optimize -op rope_qkv -batch 256 -hidden 4096 -iters 50
+
+# CI/CD hardware regression gate (verifies speedup >= threshold, 0 PTXAS register spills, compute-sanitizer, and 1027 FP64 parity)
+./run.sh check -op rope_qkv -batch 64 -hidden 2048 -iters 20 -min-speedup 1.15
+
+# End-to-end streaming LLM benchmark (TTFT, TPOT, tok/s, VRAM, Watts/Joules, $/1M tokens, eBPF)
+./run.sh workload -deepseek-model ~/AI/Models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf -llm-reqs 4 -llm-concurrency 2
+
+# Production GPU fleet cost, VRAM-aware pool placement, priority admission control & scheduling simulator
+./run.sh schedule -deepseek-model ~/AI/Models/Qwen3.5-4B/Qwen3.5-4B-Q4_K_M.gguf -llm-model Qwen3.5-4B-Q4_K_M
+
+# Run full unit, mocked-NVML (.so dlopen), failure-path, and live CUDA test suite
+./run.sh test
+```
+
+Requires Linux (`x86_64`), an NVIDIA GPU with drivers (`nvidia-smi`), CUDA Toolkit (`nvcc` & `compute-sanitizer`), Go (`1.24+`), Python 3, and Zsh.
+
+---
+
+## Automated CI/CD & Multi-Distro Verification
+
+| GitHub Actions Workflow | Target Environment | What It Verifies on Every Push |
+| :--- | :--- | :--- |
+| **[`ci.yml`](./.github/workflows/ci.yml)** | `ubuntu-latest` (`Go` + `Clang/BPF` + `GCC`) | `gofmt`, `go vet ./...`, eBPF C bytecode regeneration (`go generate ./internal/ebpftrace/...`), mocked `libnvidia-ml.so.1` C-ABI `dlopen` tests, failure-path tests, and `go test -v -race ./...` |
+| **[`cuda-hardware.yml`](./.github/workflows/cuda-hardware.yml)** | `nvidia/cuda:12.6.3-devel-ubuntu24.04` & `[self-hosted, linux, cuda]` | Compiles all 8 CUDA operations (`24` kernels) with `nvcc -O3 -arch=sm_89 -Xptxas -v` asserting `0` register spills in cloud CI, and runs `./gpumode check` on physical NVIDIA GPU silicon when a self-hosted runner is attached |
+| **[`linux-compat.yml`](./.github/workflows/linux-compat.yml)** | **Ubuntu 22.04**, **Ubuntu 24.04**, **Debian 12**, **Fedora 41**, **Arch Linux** | Verifies OS package installation, CGo/`dlopen` linker compatibility, modular `frontend/` embedding, and full unit/mocked-NVML test suites across 5 Linux distributions |
 
 ---
 

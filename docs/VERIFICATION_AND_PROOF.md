@@ -150,3 +150,16 @@ Observability: Telemetry: NVML | Host-CUDA eBPF: MEASURED_EBPF (76391 launches, 
    (1,587,162 → 3,210,559 Requests/GPU-hr).
 ================================================================================
 ```
+
+---
+
+## 4. Automated CI, Self-Hosted GPU Runner & Mocked NVML Verification
+
+Every push to `main` is verified across three GitHub Actions workflows:
+
+| Workflow | Verified GitHub Actions Run | Scope & Assertions |
+| :--- | :--- | :--- |
+| **`ci.yml`** | [Run `#45060762811` (`success`)](https://github.com/Script-Kitty01/GPUmode/actions/runs/45060762811) | `gofmt`, `go vet ./...`, eBPF C bytecode compilation (`go generate ./internal/ebpftrace/...`), mocked `libnvidia-ml.so.1` C-ABI `dlopen` tests, failure-path tests, and `go test -v -race ./...` |
+| **`cuda-hardware.yml`** | [Run `#45079974915` (`success` — Cloud + Self-Hosted RTX 4050)](https://github.com/Script-Kitty01/GPUmode/actions/runs/45079974915) | **Job 1 (Cloud):** Compiles all 8 CUDA operations (`24` kernels) with `nvcc -O3 -arch=sm_89 -Xptxas -v` inside `nvidia/cuda:12.6.3-devel-ubuntu24.04` (`0` spills). **Job 2 (Self-Hosted GPU):** Executes `./gpumode monitor`, `./gpumode check -op rmsnorm_residual`, `./gpumode check -op rope_qkv`, and live CUDA/NVML tests on physical RTX 4050 silicon |
+| **`linux-compat.yml`** | [Run `#45060762909` (`success`)](https://github.com/Script-Kitty01/GPUmode/actions/runs/45060762909) | 5-distro container matrix (**Ubuntu 22.04 LTS**, **Ubuntu 24.04 LTS**, **Debian 12 Bookworm**, **Fedora 41**, **Arch Linux**) testing CGo/`dlopen` compilation, binary build, and mocked-NVML/failure-path test suites |
+
