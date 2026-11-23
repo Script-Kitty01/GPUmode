@@ -3,9 +3,11 @@ package tui
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -94,18 +96,93 @@ func readProcCommandAndModel(pid uint32) (comm string, modelOrArgs string) {
 	}
 
 	rawCmd, err := os.ReadFile(filepath.Join(procDir, "cmdline"))
-	if err != nil || len(rawCmd) == 0 {
-		return comm, comm
-	}
-	parts := bytes.Split(rawCmd, []byte{0})
-	args := make([]string, 0, len(parts))
-	for _, part := range parts {
-		s := strings.TrimSpace(string(part))
-		if s != "" {
-			args = append(args, s)
+	var args []string
+	if err == nil && len(rawCmd) > 0 {
+		parts := bytes.Split(rawCmd, []byte{0})
+		args = make([]string, 0, len(parts))
+		for _, part := range parts {
+			s := strings.TrimSpace(string(part))
+			if s != "" {
+				args = append(args, s)
+			}
 		}
 	}
-	return comm, ExtractModelOrWorkloadFromArgs(comm, args)
+
+	desc := ExtractModelOrWorkloadFromArgs(comm, args)
+
+	// 1. If Ollama is running with a sha256 blob path, query Ollama /api/ps for the human-readable model tag (e.g. qwen2.5:7b)
+	if strings.Contains(strings.ToLower(comm), "ollama") || strings.Contains(desc, "sha256-") {
+		if ollamaModel := queryOllamaRunningModel(); ollamaModel != "" {
+			return comm, truncateStr("Model: "+ollamaModel, 38)
+		}
+	}
+
+	// 2. If the process is a Python/C++ process that opened a .gguf/.safetensors/.pt file in code (not CLI args),
+	// inspect /proc/<pid>/fd/* symlinks to auto-detect the open model file on disk!
+	if !strings.HasPrefix(desc, "Model:") {
+		if openModel := findOpenModelFileInProcFD(procDir); openModel != "" {
+			return comm, truncateStr("Model: "+openModel, 38)
+		}
+	}
+
+	return comm, desc
+}
+
+// findOpenModelFileInProcFD inspects /proc/<pid>/fd/* symlinks (and /proc/<pid>/maps) to find any
+// memory-mapped or open .gguf, .safetensors, or .bin model weights file even when loaded via Python code.
+func findOpenModelFileInProcFD(procDir string) string {
+	entries, err := os.ReadDir(filepath.Join(procDir, "fd"))
+	if err == nil {
+		limit := len(entries)
+		if limit > 128 {
+			limit = 128
+		}
+		for i := 0; i < limit; i++ {
+			target, lErr := os.Readlink(filepath.Join(procDir, "fd", entries[i].Name()))
+			if lErr != nil {
+				continue
+			}
+			base := filepath.Base(target)
+			lower := strings.ToLower(base)
+			if strings.HasSuffix(lower, ".gguf") || strings.HasSuffix(lower, ".safetensors") {
+				return base
+			}
+		}
+	}
+	if mapsRaw, mErr := os.ReadFile(filepath.Join(procDir, "maps")); mErr == nil {
+		for _, line := range strings.Split(string(mapsRaw), "\n") {
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, ".gguf") || strings.Contains(lower, ".safetensors") {
+				fields := strings.Fields(line)
+				if len(fields) >= 6 {
+					return filepath.Base(fields[len(fields)-1])
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func queryOllamaRunningModel() string {
+	client := &http.Client{Timeout: 120 * time.Millisecond}
+	resp, err := client.Get("http://127.0.0.1:11434/api/ps")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var payload struct {
+		Models []struct {
+			Name  string `json:"name"`
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil || len(payload.Models) == 0 {
+		return ""
+	}
+	if payload.Models[0].Name != "" {
+		return payload.Models[0].Name
+	}
+	return payload.Models[0].Model
 }
 
 // ExtractModelOrWorkloadFromArgs parses command-line tokens to highlight any active .gguf model,
