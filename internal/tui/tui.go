@@ -18,14 +18,18 @@ import (
 )
 
 const (
-	ansiReset  = "\033[0m"
-	ansiBold   = "\033[1m"
-	ansiCyan   = "\033[36m"
-	ansiGreen  = "\033[32m"
-	ansiYellow = "\033[33m"
-	ansiRed    = "\033[31m"
-	ansiDim    = "\033[2m"
-	ansiClear  = "\033[H\033[2J"
+	ansiReset        = "\033[0m"
+	ansiBold         = "\033[1m"
+	ansiCyan         = "\033[36m"
+	ansiGreen        = "\033[32m"
+	ansiYellow       = "\033[33m"
+	ansiRed          = "\033[31m"
+	ansiDim          = "\033[2m"
+	ansiHome         = "\033[H"
+	ansiClearLineEnd = "\033[K"
+	ansiClearBelow   = "\033[J"
+	ansiAltScreenOn  = "\033[?1049h\033[?25l\033[H\033[2J"
+	ansiAltScreenOff = "\033[?25h\033[?1049l"
 )
 
 var sparkBlocks = []rune{'▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
@@ -107,39 +111,45 @@ func readProcCommandAndModel(pid uint32) (comm string, modelOrArgs string) {
 // ExtractModelOrWorkloadFromArgs parses command-line tokens to highlight any active .gguf model,
 // --model/-m flag, or Python workload script running on the GPU.
 func ExtractModelOrWorkloadFromArgs(comm string, args []string) string {
+	const maxCol = 36
 	if len(args) == 0 {
-		return comm
+		return truncateStr(comm, maxCol)
 	}
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if (a == "-m" || a == "--model") && i+1 < len(args) {
 			modelBase := filepath.Base(args[i+1])
-			return fmt.Sprintf("Model: %s", modelBase)
+			return truncateStr(fmt.Sprintf("Model: %s", modelBase), maxCol)
 		}
 		if strings.HasPrefix(a, "--model=") {
-			return fmt.Sprintf("Model: %s", filepath.Base(strings.TrimPrefix(a, "--model=")))
+			return truncateStr(fmt.Sprintf("Model: %s", filepath.Base(strings.TrimPrefix(a, "--model="))), maxCol)
 		}
 		if strings.HasSuffix(strings.ToLower(a), ".gguf") || strings.HasSuffix(strings.ToLower(a), ".safetensors") {
-			return fmt.Sprintf("Model: %s", filepath.Base(a))
+			return truncateStr(fmt.Sprintf("Model: %s", filepath.Base(a)), maxCol)
 		}
 	}
 	for _, a := range args {
 		if strings.HasSuffix(strings.ToLower(a), ".py") {
-			return fmt.Sprintf("PyTorch/Script: %s", filepath.Base(a))
+			return truncateStr(fmt.Sprintf("PyTorch/Script: %s", filepath.Base(a)), maxCol)
 		}
+	}
+	fullJoined := strings.Join(args, " ")
+	lowerComm := strings.ToLower(comm)
+	if lowerComm == "code" || strings.Contains(fullJoined, "--gpu-preferences=") || strings.Contains(fullJoined, "--type=gpu-process") {
+		return "VS Code / Electron (GPU)"
+	}
+	if lowerComm == "xorg" || lowerComm == "gnome-shell" || lowerComm == "kwin_wayland" || lowerComm == "hyprland" {
+		return "Desktop Display Compositor"
 	}
 	baseBin := filepath.Base(args[0])
+	if idx := strings.IndexByte(baseBin, ' '); idx > 0 {
+		baseBin = baseBin[:idx]
+	}
 	if len(args) > 1 {
 		joined := baseBin + " " + strings.Join(args[1:], " ")
-		if len(joined) > 48 {
-			joined = joined[:45] + "..."
-		}
-		return joined
+		return truncateStr(joined, maxCol)
 	}
-	if len(baseBin) > 48 {
-		return baseBin[:45] + "..."
-	}
-	return baseBin
+	return truncateStr(baseBin, maxCol)
 }
 
 // RenderProgressBar renders a fixed-width Unicode bar [██████░░░░] with percentage.
@@ -327,7 +337,7 @@ func RenderSnapshotCard(st SnapshotState, useColor bool) string {
 	return b.String()
 }
 
-// RunLiveTUI runs the live refreshing terminal dashboard until ctx is canceled or cfg.MaxFrames is reached.
+// RunLiveTUI runs the live refreshing terminal dashboard in-place until ctx is canceled or cfg.MaxFrames is reached.
 func RunLiveTUI(ctx context.Context, out io.Writer, cfg LiveConfig) error {
 	if cfg.Monitor == nil {
 		return fmt.Errorf("telemetry monitor is nil")
@@ -337,12 +347,23 @@ func RunLiveTUI(ctx context.Context, out io.Writer, cfg LiveConfig) error {
 		interval = 200 * time.Millisecond
 	}
 
+	useInPlaceScreen := cfg.UseColor && cfg.MaxFrames != 1
+	if useInPlaceScreen {
+		// Enter Alternate Screen Buffer & hide cursor so updates happen 100% in-place without scrollback duplication
+		_, _ = io.WriteString(out, ansiAltScreenOn)
+		defer func() {
+			_, _ = io.WriteString(out, ansiAltScreenOff)
+		}()
+	}
+
 	start := time.Now()
 	prevTime := start
 	var prevPower float64
 	var cumulativeJoules float64
 	var peakPower float64
 	var powerHistory []float64
+	var lastRenderedCard string
+	var prevLineCount int
 
 	renderFrame := func(frameIdx int) error {
 		sample, err := cfg.Monitor.PollOnce(ctx)
@@ -363,8 +384,8 @@ func RunLiveTUI(ctx context.Context, out io.Writer, cfg LiveConfig) error {
 		}
 		if sample.PowerWatts > 0 {
 			powerHistory = append(powerHistory, sample.PowerWatts)
-			if len(powerHistory) > 40 {
-				powerHistory = powerHistory[len(powerHistory)-40:]
+			if len(powerHistory) > 36 {
+				powerHistory = powerHistory[len(powerHistory)-36:]
 			}
 		}
 
@@ -380,10 +401,30 @@ func RunLiveTUI(ctx context.Context, out io.Writer, cfg LiveConfig) error {
 			ActiveProcesses:      procs,
 			InteractiveFrameMode: cfg.MaxFrames == 0,
 		}
-		if cfg.UseColor && cfg.MaxFrames == 0 {
-			_, _ = io.WriteString(out, ansiClear)
+
+		card := RenderSnapshotCard(state, cfg.UseColor)
+		lastRenderedCard = card
+		lines := strings.Split(strings.TrimSuffix(card, "\n"), "\n")
+
+		if useInPlaceScreen {
+			var frameBuf strings.Builder
+			if prevLineCount > 0 {
+				// Rewind cursor up by exact line count of the previous frame AND home on alt screen
+				frameBuf.WriteString(fmt.Sprintf("\r\033[%dA", prevLineCount))
+			}
+			frameBuf.WriteString(ansiHome)
+			for _, line := range lines {
+				frameBuf.WriteString("\r\033[2K")
+				frameBuf.WriteString(line)
+				frameBuf.WriteByte('\n')
+			}
+			frameBuf.WriteString(ansiClearBelow)
+			prevLineCount = len(lines)
+			_, writeErr := io.WriteString(out, frameBuf.String())
+			return writeErr
 		}
-		_, writeErr := io.WriteString(out, RenderSnapshotCard(state, cfg.UseColor))
+		prevLineCount = len(lines)
+		_, writeErr := io.WriteString(out, card)
 		return writeErr
 	}
 
@@ -400,6 +441,12 @@ func RunLiveTUI(ctx context.Context, out io.Writer, cfg LiveConfig) error {
 	for {
 		select {
 		case <-ctx.Done():
+			if useInPlaceScreen && lastRenderedCard != "" {
+				// Leave final clean snapshot visible after exiting alternate screen
+				defer func(finalCard string) {
+					_, _ = io.WriteString(out, finalCard)
+				}(lastRenderedCard)
+			}
 			return nil
 		case <-ticker.C:
 			if err := renderFrame(frame); err != nil {
@@ -411,6 +458,16 @@ func RunLiveTUI(ctx context.Context, out io.Writer, cfg LiveConfig) error {
 			}
 		}
 	}
+}
+
+func truncateStr(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
 }
 
 func colorForPct(pct float64, highIsWarn bool) string {
@@ -430,11 +487,4 @@ func colorForPct(pct float64, highIsWarn bool) string {
 		return ansiYellow
 	}
 	return ansiGreen
-}
-
-func truncateStr(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen]
 }
