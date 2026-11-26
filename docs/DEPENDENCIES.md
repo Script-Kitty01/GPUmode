@@ -1,71 +1,69 @@
-# Dependencies & Libraries
+# Requirements & Setup
 
-[← Back to README](../README.md) • [Startup Guide](./STARTUP_GUIDE.md) • [Verification & Proof](./VERIFICATION_AND_PROOF.md)
+[← Back to README](../README.md) • [Startup Guide](./STARTUP_GUIDE.md) • [Real Results & Proof](./VERIFICATION_AND_PROOF.md)
 
-**gpuMode** is designed with minimal external dependencies: a zero-CGo Go backend, an embedded zero-NPM Web Dashboard, and direct runtime discovery of system CUDA/NVML libraries.
+> **Light by design — no Node.js, no heavy install, just your NVIDIA tools and Go.**
 
----
-
-## 1. Required System Dependencies
-
-| Dependency | Purpose | Resolution |
-| :--- | :--- | :--- |
-| **Linux (`x86_64`)** | Host OS & eBPF uprobe/tracepoint support | Kernel `5.8+` recommended for ringbuf/BPF features |
-| **NVIDIA Driver** | Provides `nvidia-smi`, `libnvidia-ml.so.1`, and `libcuda.so.1` | Loaded dynamically at runtime |
-| **CUDA Toolkit (`nvcc` & `compute-sanitizer`)** | Compiles parameterized CUDA C++ kernels (`-Xptxas -v`) and runs `memcheck` verification | Auto-resolved via `GPUMODE_*`, `PATH`, `CUDA_HOME`, `/opt/cuda/bin`, `/usr/local/cuda/bin` |
-| **Go Toolchain** | Builds the `gpumode` daemon and CLI (`go.mod` specifies Go `1.26` / `1.23+` compatible) | `go build -o ./gpumode ./cmd/gpumode` |
-| **Python 3 (`python3` / `.venv`)** | Executes `scripts/profile_pytorch.py` (`torch.profiler` + `torch.utils.cpp_extension.load_inline`) | Auto-discovers `.venv/bin/python3` first; falls back cleanly if `torch` is not installed |
-| **Zsh (`zsh`)** | Executes `./run.sh` wrapper script | `/usr/bin/env zsh` |
+**gpuMode** compiles into one small program with the entire Web Dashboard built right inside it. You do not need Node.js, NPM, or Docker to run it.
 
 ---
 
-## 2. Go Module Dependencies (`go.mod`)
+## 1. What You Need (Required)
 
-`gpumode` uses only **two** external Go packages (no CGo toolchain or Node/NPM build step required):
-
-| Module | Version | Role in `gpuMode` |
-| :--- | :--- | :--- |
-| `github.com/cilium/ebpf` | `v0.22.0` | Loads precompiled eBPF bytecode (`cudatrace_x86_bpfel.o`) and attaches `libcuda.so.1` uprobes/uretprobes and `sched_switch` tracepoints |
-| `golang.org/x/sys` | `v0.50.0` | Low-level Linux syscalls and capability/process inspection |
-
----
-
-## 3. Dynamically Loaded Shared Libraries (Runtime `dlopen` / Uprobes)
-
-| Shared Library | Package | Role |
-| :--- | :--- | :--- |
-| `libnvidia-ml.so.1` | `internal/nvml` | Direct `10 ms` GPU power, SM/memory clocks, utilization, VRAM, and compute PID polling without spawning subprocesses |
-| `libcuda.so.1` | `internal/ebpftrace` | Primary target for eBPF uprobes (`cuLaunchKernel*`, `cuMemcpyHtoD*`, `cuMemcpyDtoH*`, `cuMemAlloc*`, `cuStreamSynchronize*`, `cuCtxSynchronize*`) |
-| `libcudart.so` | `internal/ebpftrace` | Fallback CUDA Runtime symbol target when Driver API symbols are not directly invoked |
+| Requirement | Why It's Needed |
+| :--- | :--- |
+| **Linux (`x86_64`)** | Supports live GPU monitoring and optional deep Linux tracking |
+| **NVIDIA Graphics Card & Driver** | Provides live GPU stats (`nvidia-smi`) and lets GPU code run |
+| **NVIDIA CUDA Toolkit** | Compiles GPU speed-ups (`nvcc`) and checks them for memory bugs (`compute-sanitizer`) |
+| **Go** | Builds the `gpumode` app |
+| **Python 3** | Runs the optional PyTorch helper script (`scripts/profile_pytorch.py`) |
+| **Zsh** | Runs the `./run.sh` helper script |
 
 ---
 
-## 4. Optional Runtime & Verification Tools
+## 2. Optional Extras
 
-| Tool | Required For | Notes |
-| :--- | :--- | :--- |
-| **`setcap` / `getcap` (`libcap`)** | Rootless eBPF (`./run.sh setcap`) | Grants `cap_bpf,cap_perfmon,cap_sys_resource,cap_sys_admin+ep` to `./gpumode` |
-| **`llama-server` & `llama-cli` (`llama.cpp` CUDA)** | Local `.gguf` Before/After Runner & `deepseek` Proposer | Used to spawn Baseline vs. gpuMode Tuned `.gguf` inference benchmarks |
-| **`ollama`** | Benchmarking local Ollama models | Auto-detected via `http://127.0.0.1:11434/api/tags` |
-| **PyTorch (`torch` with CUDA)** | Live `torch.profiler` operator attribution | Optional; `scripts/profile_pytorch.py` uses analytical fallback when absent |
-| **`clang` + `llvm`** | `./run.sh bpf-gen` only | Only needed if modifying `internal/ebpftrace/bpf/cuda_trace.bpf.c` |
-| **`nvtop`, `nsight-systems` (`nsys`), `llama-bench`** | Independent external verification | Used to cross-check Watts, SM %, tok/s, and CUDA launch counts |
+You can use gpuMode without these, and add any of them later if you want their features:
+
+| Tool | What It Unlocks |
+| :--- | :--- |
+| **`llama-server` & `llama-cli`** | Lets you run **Before vs. After** benchmarks on local `.gguf` AI models |
+| **`ollama`** | Lets you benchmark models you already have in Ollama |
+| **PyTorch (with CUDA)** | Enables live PyTorch speed-up verification inside `.venv` |
+| **`libcap` (`setcap` / `getcap`)** | Lets you enable deeper Linux GPU tracking once so the app never needs root access |
+| **`nvtop` or NVIDIA Nsight (`nsys`)** | Lets you double-check gpuMode's numbers with independent tools |
+| **`clang` & `llvm`** | Only needed if you edit the low-level Linux tracker source code (`./run.sh bpf-gen`) |
 
 ---
 
-## 5. Installing Packages on Linux
+## 3. Built-In Libraries (Small Footprint)
 
-### Arch Linux / CachyOS (`pacman`)
-```zsh
-# Core toolchain & rootless capability helpers
-sudo pacman -S go cuda python zsh libcap
+- **Go packages (`go.mod`):** Only two lightweight packages are used — `github.com/cilium/ebpf` (for Linux GPU tracking) and `golang.org/x/sys` (for Linux system calls).
+- **NVIDIA driver libraries:** Loaded automatically from your system when gpuMode starts — no extra driver packages to install.
+- **Web Dashboard:** Embedded directly inside the `gpumode` binary — zero frontend build tools required.
 
-# Optional: local GGUF inference & independent hardware profilers
-sudo pacman -S nvtop nsight-systems
-```
+---
 
-### Ubuntu / Debian (`apt`)
+## 4. Copy-Paste Install Commands
+
+### Ubuntu / Debian
 ```zsh
 sudo apt update
 sudo apt install golang-go nvidia-cuda-toolkit python3 zsh libcap2-bin nvtop
 ```
+
+### Arch Linux / CachyOS
+```zsh
+# Core tools
+sudo pacman -S go cuda python zsh libcap
+
+# Optional: independent GPU monitors
+sudo pacman -S nvtop nsight-systems
+```
+
+### Fedora
+```zsh
+sudo dnf install golang python3 zsh libcap
+```
+*(Install the NVIDIA driver and CUDA Toolkit from NVIDIA's Fedora repository if not already installed.)*
+
